@@ -155,9 +155,36 @@ only removes it when it carries Unsloth's `.unsloth-studio-owned` marker (the de
 is also what a plain `git clone` of `leejet/stable-diffusion.cpp` produces). `zap` is
 documented as the aggressive, opt-in teardown, so it takes the directory unconditionally.
 
+## Validation in CI
+
+`.github/workflows/homebrew-cask-ci.yml` runs all of the below on an Apple Silicon
+`macos-15` runner whenever this directory, `tauri.conf.json`, `scripts/uninstall.sh` or the
+contract test changes. It stages the cask into a throwaway tap (so `brew audit --new` and
+`brew livecheck` resolve it by token, the way homebrew-cask will), then styles, audits,
+installs the published DMG for real, verifies the installed bundle, and zaps it.
+
+That run is the evidence a cask PR needs. From the first green run on
+`v0.1.800-beta`:
+
+```
+brew style                 no offenses
+brew audit --strict --online  passed
+brew audit --new --online     passed
+codesign --verify --deep --strict  valid
+xcrun stapler validate     The validate action worked!
+spctl --assess             /Applications/Unsloth.app: accepted
+                           source=Notarized Developer ID
+brew livecheck             unsloth-studio: 0.1.800-beta ==> 0.1.800-beta
+brew uninstall --zap       trashed all 16 paths; ~/.cache/huggingface preserved
+```
+
+The install step also proves the `url` the cask builds from `version` resolves and matches
+the pinned `sha256` — `brew audit --online` fetches it, and `brew install` would reject a
+mismatch.
+
 ## Local validation
 
-Run these on macOS with Homebrew installed, from this directory:
+The same checks, on macOS with Homebrew installed, from this directory:
 
 ```sh
 brew style ./unsloth-studio.rb
@@ -179,10 +206,11 @@ python3 -m pytest tests/security/test_homebrew_cask_contract.py -v
 
 ## Out of scope / cannot be done from this repo
 
-* **The homebrew-cask pull request itself.** It must be opened against
-  `Homebrew/homebrew-cask` by someone on macOS who can run `brew style` and
-  `brew audit --cask --new --online` and paste the output into the PR — homebrew-cask
-  requires that evidence, and this repository's CI is not macOS-with-Homebrew.
+* **The homebrew-cask pull request itself.** It has to be opened against
+  `Homebrew/homebrew-cask` by a person with a GitHub account; nothing here can do that.
+  The `brew style` / `brew audit --cask --new --online` evidence homebrew-cask asks for is
+  no longer the blocker it was — `homebrew-cask-ci.yml` produces it on every change, so
+  link that run in the PR.
 * **Notability.** homebrew-cask judges a new cask on the notability of the upstream
   project (stars, forks, activity on `unslothai/unsloth`), not on anything in this
   directory. Nothing here can change that verdict.
