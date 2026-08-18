@@ -129,6 +129,52 @@ DEFAULT_PUBLISHED_REPO = "unslothai/whisper.cpp"
 MANIFEST_ASSET_NAME = "whisper-prebuilt-manifest.json"
 SHA256_ASSET_NAME = "whisper-prebuilt-sha256.json"
 
+# Component key in studio/prebuilt_release_pins.json.
+RELEASE_PIN_COMPONENT = "whisper_cpp"
+RELEASE_TAG_ENV = "UNSLOTH_WHISPER_RELEASE_TAG"
+
+
+def default_published_release_tag(published_repo: str | None = None) -> str:
+    """Release tag installed when the caller names none.
+
+    Defaults to the tag pinned in ``prebuilt_release_pins.json`` so the same
+    installer lands the same whisper-server on any day; this used to be None and
+    resolved "the newest published release" at runtime. Precedence:
+    ``UNSLOTH_WHISPER_RELEASE_TAG`` > the pin > "" (resolve latest, only when
+    ``UNSLOTH_PREBUILT_ALLOW_LATEST=1`` or the caller aimed at another publisher).
+    A missing/malformed pins file raises rather than silently tracking latest.
+    """
+    return core.default_published_release_tag(
+        RELEASE_PIN_COMPONENT, RELEASE_TAG_ENV, published_repo = published_repo
+    )
+
+
+DEFAULT_PUBLISHED_TAG = default_published_release_tag()
+
+
+def pin_incompatibility_hint(exc: Exception, published_release_tag: str) -> PrebuiltFallback:
+    """Name the in-tree pin in a host-incompatibility error.
+
+    The compatibility walk deliberately does not fire for an explicit pin, so
+    when the pinned release cannot serve this host the failure has to say which
+    knob unsticks it. Preserves ReleaseCompatibilityError (it maps to exit 2).
+    """
+    try:
+        pinned = core.pinned_release_tag(
+            RELEASE_PIN_COMPONENT, published_repo = DEFAULT_PUBLISHED_REPO
+        )
+    except PrebuiltFallback:
+        pinned = ""
+    if not pinned or published_release_tag != pinned:
+        return exc if isinstance(exc, PrebuiltFallback) else PrebuiltFallback(str(exc))
+    message = (
+        f"{exc}. This is the release pinned in {core.RELEASE_PINS_FILENAME} "
+        f"({pinned}), which is installed as-is rather than walked past; set "
+        f"{core.ALLOW_LATEST_ENV}=1 to install the newest published release instead, "
+        f"or {RELEASE_TAG_ENV}=<tag> to choose a different one"
+    )
+    return type(exc)(message) if isinstance(exc, PrebuiltFallback) else PrebuiltFallback(message)
+
 METADATA_FILENAME = "UNSLOTH_WHISPER_PREBUILT_INFO.json"
 
 # Backends the installer can select: accelerator identities for the slim pairing
@@ -1202,7 +1248,10 @@ def _release_plan_for_host(
 
     if published_release_tag:
         assert first_error is not None
-        raise first_error
+        # An explicit pin (the in-tree default included) is never walked past --
+        # walking is exactly the version drift the pin removes -- so an
+        # incompatible pin has to name the knob that unsticks it.
+        raise pin_incompatibility_hint(first_error, published_release_tag)
 
     if not requested_specific_tag and not host.is_macos:
         assert first_error is not None
@@ -1401,8 +1450,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--published-release-tag",
-        default = os.environ.get("UNSLOTH_WHISPER_RELEASE_TAG") or None,
-        help = "explicit release tag to install (default: the newest published release)",
+        # None (not DEFAULT_PUBLISHED_TAG) so the pin can be scoped to
+        # --published-repo in main() without mistaking a flag for the default.
+        default = None,
+        help = (
+            "explicit release tag to install. Defaults to the tag pinned in "
+            f"{core.RELEASE_PINS_FILENAME} (currently {DEFAULT_PUBLISHED_TAG or 'unpinned'}); "
+            f"{RELEASE_TAG_ENV} overrides it, and {core.ALLOW_LATEST_ENV}=1 installs the newest "
+            "published release instead."
+        ),
     )
     parser.add_argument(
         "--backend",
@@ -1438,6 +1494,10 @@ def main(argv: list[str] | None = None) -> int:
     global _LOG_TO_STDOUT
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.published_release_tag is None:
+        # Resolved here rather than in add_argument so the pin can be dropped
+        # when --published-repo names a publisher the pin does not cover.
+        args.published_release_tag = default_published_release_tag(args.published_repo) or None
 
     if args.resolve_prebuilt is not None:
         # Read-only probe: stdout is only the JSON/asset line (setup.sh and

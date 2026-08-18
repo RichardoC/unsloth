@@ -252,7 +252,50 @@ DEFAULT_LLAMA_TAG = os.environ.get("UNSLOTH_LLAMA_TAG", "latest")
 # its prebuilt against the Unsloth fork; setup.sh/setup.ps1 pass it via
 # --published-repo. ggml-org is reachable only via an explicit override.
 DEFAULT_PUBLISHED_REPO = "unslothai/llama.cpp"
-DEFAULT_PUBLISHED_TAG = os.environ.get("UNSLOTH_LLAMA_RELEASE_TAG")
+# Component key in studio/prebuilt_release_pins.json.
+RELEASE_PIN_COMPONENT = "llama_cpp"
+RELEASE_TAG_ENV = "UNSLOTH_LLAMA_RELEASE_TAG"
+
+
+def default_published_release_tag(published_repo: str | None = None) -> str:
+    """Release tag installed when the caller names none.
+
+    Defaults to the tag pinned in ``prebuilt_release_pins.json`` so the same
+    installer lands the same artifacts on any day; before the pin this was None
+    and every install resolved "newest published release" at runtime. Precedence:
+    ``UNSLOTH_LLAMA_RELEASE_TAG`` > the pin > "" (resolve latest, only when
+    ``UNSLOTH_PREBUILT_ALLOW_LATEST=1`` or the caller aimed at another publisher).
+    A missing/malformed pins file raises rather than silently tracking latest.
+    """
+    return _core.default_published_release_tag(
+        RELEASE_PIN_COMPONENT, RELEASE_TAG_ENV, published_repo = published_repo
+    )
+
+
+DEFAULT_PUBLISHED_TAG = default_published_release_tag()
+
+
+def pin_incompatibility_hint(exc: Exception, published_release_tag: str) -> PrebuiltFallback:
+    """Name the in-tree pin in a host-incompatibility error.
+
+    An explicit pin is never walked past (that walk is what version drift looks
+    like), so when the pinned release has no asset for this host the failure has
+    to say which knob unsticks it instead of just "no compatible prebuilt asset".
+    """
+    try:
+        pinned = _core.pinned_release_tag(
+            RELEASE_PIN_COMPONENT, published_repo = DEFAULT_PUBLISHED_REPO
+        )
+    except PrebuiltFallback:
+        pinned = ""
+    if not pinned or published_release_tag != pinned:
+        return exc if isinstance(exc, PrebuiltFallback) else PrebuiltFallback(str(exc))
+    return PrebuiltFallback(
+        f"{exc}. This is the release pinned in {_core.RELEASE_PINS_FILENAME} "
+        f"({pinned}), which is installed as-is rather than walked past; set "
+        f"{_core.ALLOW_LATEST_ENV}=1 to install the newest published release instead, "
+        f"or {RELEASE_TAG_ENV}=<tag> to choose a different one"
+    )
 DEFAULT_PUBLISHED_MANIFEST_ASSET = os.environ.get(
     "UNSLOTH_LLAMA_RELEASE_MANIFEST_ASSET", "llama-prebuilt-manifest.json"
 )
@@ -1975,13 +2018,16 @@ def _fetch_download_host_json(url: str) -> Any:
     )
 
 
-def _download_host_resolved_release(repo: str) -> ResolvedPublishedRelease | None:
-    """Resolve the latest fork release from the download host with zero
-    api.github.com calls, reusing the API path's parsing and validation. The latest
-    tag is the authoritative /releases/latest redirect tag, and the checksum asset's
-    self-reported release_tag is cross-checked against it. Returns None (caller falls
-    back to the API) on a missing JSON asset or a tag mismatch."""
-    release_tag = _download_host_latest_release_tag(repo)
+def _download_host_resolved_release(
+    repo: str, release_tag: str | None = None
+) -> ResolvedPublishedRelease | None:
+    """Resolve a fork release from the download host with zero api.github.com
+    calls, reusing the API path's parsing and validation. ``release_tag`` pins an
+    exact release; without it the latest is the authoritative /releases/latest
+    redirect tag. Either way the checksum asset's self-reported release_tag is
+    cross-checked against it. Returns None (caller falls back to the API) on a
+    missing JSON asset or a tag mismatch."""
+    release_tag = (release_tag or "").strip() or _download_host_latest_release_tag(repo)
     if not release_tag:
         return None
     sha_url = _release_asset_download_url(repo, release_tag, DEFAULT_PUBLISHED_SHA256_ASSET)
@@ -2036,6 +2082,38 @@ def _download_host_resolved_release(repo: str) -> ResolvedPublishedRelease | Non
     return ResolvedPublishedRelease(bundle = bundle, checksums = checksums)
 
 
+def _resolve_pinned_published_release(
+    repo: str, published_release_tag: str, normalized_requested: str
+) -> ResolvedPublishedRelease:
+    """Resolve one explicitly named release (the in-tree pin, or an override).
+
+    Tries the download host first so a pinned install still costs zero
+    api.github.com calls: pinning made this the default code path, and that API
+    is rate-limited to 60 req/hour unauthenticated. Falls back to the API on any
+    download-host miss. An incompatible pin raises -- it is never walked past.
+    """
+    resolved: ResolvedPublishedRelease | None = None
+    if repo == DEFAULT_PUBLISHED_REPO and _download_host_resolve_enabled():
+        try:
+            resolved = _download_host_resolved_release(repo, published_release_tag)
+        except PrebuiltFallback as exc:
+            log(f"download-host resolve rejected for {repo}@{published_release_tag} ({exc}); trying GitHub API")
+        except Exception as exc:
+            log(f"download-host resolve unavailable for {repo}@{published_release_tag} ({exc}); trying GitHub API")
+    if resolved is None:
+        bundle = pinned_published_release_bundle(repo, published_release_tag)
+        resolved = ResolvedPublishedRelease(
+            bundle = bundle, checksums = validated_checksums_for_bundle(repo, bundle)
+        )
+    if not published_release_matches_request(resolved.bundle, normalized_requested):
+        raise PrebuiltFallback(
+            "published release "
+            f"{repo}@{published_release_tag} targeted upstream tag "
+            f"{resolved.bundle.upstream_tag}, but requested {normalized_requested}"
+        )
+    return resolved
+
+
 def published_release_matches_request(bundle: PublishedReleaseBundle, requested_ref: str) -> bool:
     if requested_ref == "latest":
         return True
@@ -2059,16 +2137,8 @@ def resolve_published_release(
     normalized_requested = normalized_requested_llama_tag(requested_tag)
 
     if published_release_tag:
-        bundle = pinned_published_release_bundle(repo, published_release_tag)
-        if not published_release_matches_request(bundle, normalized_requested):
-            raise PrebuiltFallback(
-                "published release "
-                f"{repo}@{published_release_tag} targeted upstream tag {bundle.upstream_tag}, "
-                f"but requested {normalized_requested}"
-            )
-        return ResolvedPublishedRelease(
-            bundle = bundle,
-            checksums = validated_checksums_for_bundle(repo, bundle),
+        return _resolve_pinned_published_release(
+            repo, published_release_tag, normalized_requested
         )
 
     skipped_invalid = 0
@@ -2109,17 +2179,10 @@ def iter_resolved_published_releases(
     normalized_requested = normalized_requested_llama_tag(requested_tag)
 
     if published_release_tag:
-        bundle = pinned_published_release_bundle(repo, published_release_tag)
-        if not published_release_matches_request(bundle, normalized_requested):
-            raise PrebuiltFallback(
-                "published release "
-                f"{repo}@{published_release_tag} targeted upstream tag {bundle.upstream_tag}, "
-                f"but requested {normalized_requested}"
-            )
-        yield ResolvedPublishedRelease(
-            bundle = bundle,
-            checksums = validated_checksums_for_bundle(repo, bundle),
-        )
+        # A named release (the in-tree pin or an override) yields exactly one
+        # candidate: the older-release walk below must never silently install a
+        # different version than the one that was pinned.
+        yield _resolve_pinned_published_release(repo, published_release_tag, normalized_requested)
         return
 
     # Fast path: resolve the fork's latest release from the download host (no
@@ -5933,7 +5996,7 @@ def _fork_manifest_release_plans(
         except PrebuiltFallback as exc:
             last_error = exc
             if not allow_older_release_fallback:
-                raise
+                raise pin_incompatibility_hint(exc, published_release_tag)
             log(
                 "published release skipped for install planning: "
                 f"{bundle.repo}@{bundle.release_tag} upstream_tag={resolved_tag} ({exc})"
@@ -5956,7 +6019,7 @@ def _fork_manifest_release_plans(
     if plans:
         return requested_tag, plans
     if last_error is not None:
-        raise last_error
+        raise pin_incompatibility_hint(last_error, published_release_tag)
     raise PrebuiltFallback("no installable published llama.cpp releases were found")
 
 
@@ -7730,10 +7793,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--published-release-tag",
-        default = DEFAULT_PUBLISHED_TAG,
+        # None (not DEFAULT_PUBLISHED_TAG) so the pin can be scoped to
+        # --published-repo below without mistaking an explicit flag for the default.
+        default = None,
         help = (
-            "Published GitHub release tag to pin. By default, scan releases "
-            "until a usable published llama.cpp release bundle is found."
+            "Published GitHub release tag to install. Defaults to the tag pinned in "
+            f"{_core.RELEASE_PINS_FILENAME} (currently {DEFAULT_PUBLISHED_TAG or 'unpinned'}); "
+            f"{RELEASE_TAG_ENV} overrides it, and {_core.ALLOW_LATEST_ENV}=1 scans releases "
+            "for the newest usable bundle instead."
         ),
     )
     parser.add_argument(
@@ -7859,7 +7926,12 @@ def parse_args() -> argparse.Namespace:
         default = "plain",
         help = "Resolver output format. Defaults to plain.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.published_release_tag is None:
+        # Resolve the default here rather than in add_argument so the pin can be
+        # dropped when --published-repo names a publisher the pin does not cover.
+        args.published_release_tag = default_published_release_tag(args.published_repo)
+    return args
 
 
 def emit_resolver_output(payload: dict[str, Any], *, output_format: str) -> None:

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "comment": "Determinism anchor for install_llama_prebuilt.py / install_whisper_prebuilt.py: the exact published release each installer installs by default, so one .dmg lands the same runtime on any day. Without it both installers resolved 'newest published release' at install time and drifted. NOTE: this pins WHICH artifacts are installed, not an independent trust anchor -- each archive is still verified against its release's own checksum index, fetched from the same GitHub release over the same TLS channel (unlike node_prebuilt_pins.json, which freezes per-asset sha256 in-tree). checksum_index_sha256 below is RECORDED FOR HUMAN VERIFICATION ONLY and is NOT enforced at install time; do not read it as digest pinning. To bump: pick the new release tag per component, re-record checksum_index_sha256 (curl -sL the checksum_index_asset from that release | sha256sum), update pinned_at_utc, and confirm the two components stay paired -- whisper's manifest carries paired_llama_tag, which must equal llama_cpp.release_tag. Env overrides still win (UNSLOTH_LLAMA_RELEASE_TAG / UNSLOTH_WHISPER_RELEASE_TAG); UNSLOTH_PREBUILT_ALLOW_LATEST=1 restores the old track-latest behaviour.",
+  "pinned_at_utc": "2026-08-18",
+  "components": {
+    "llama_cpp": {
+      "repo": "unslothai/llama.cpp",
+      "release_tag": "b10472-mix-4b653db",
+      "generated_at_utc": "2026-08-18T12:18:25Z",
+      "checksum_index_asset": "llama-prebuilt-sha256.json",
+      "checksum_index_sha256": "ae838db0a3f406716a37471661c213a9eefd18fb6c4afabfaba24b1e9805f46d"
+    },
+    "whisper_cpp": {
+      "repo": "unslothai/whisper.cpp",
+      "release_tag": "v1.9.2-unsloth.11",
+      "generated_at_utc": "2026-08-18T12:26:33Z",
+      "paired_llama_tag": "b10472-mix-4b653db",
+      "checksum_index_asset": "whisper-prebuilt-sha256.json",
+      "checksum_index_sha256": "fb9ea8e618cd6f84eeb94d516a39363b7add1320b188cc26f3682734381bb529"
+    }
+  }
+}

@@ -1668,6 +1668,102 @@ def resolve_backend(ops: ModuleOps, host: Any, requested: str | None, *, cpu_fal
     )
 
 
+# ── Pinned release tags (determinism anchor) ──
+# Both installers used to resolve "the newest published release" at install time,
+# so the same installer produced a different runtime on a different day. They now
+# default to the release tag frozen in prebuilt_release_pins.json (in-tree,
+# code-reviewed), which makes the installed artifact set deterministic.
+#
+# This is a DETERMINISM anchor, not an independent TRUST anchor: archives are
+# still verified against the checksum index published by the same GitHub release,
+# fetched over the same TLS channel as the archive itself. install_node_prebuilt.py
+# goes further and freezes per-asset sha256 in-tree; this file does not, and the
+# comments here must not claim otherwise.
+RELEASE_PINS_FILENAME = "prebuilt_release_pins.json"
+RELEASE_PINS_SCHEMA_VERSION = 1
+# Opt out of the pin and go back to resolving the newest published release at
+# install time. Named after install_node_prebuilt.py's UNSLOTH_NODE_ALLOW_UNVERIFIED.
+ALLOW_LATEST_ENV = "UNSLOTH_PREBUILT_ALLOW_LATEST"
+
+
+def release_pins_path() -> Path:
+    return Path(__file__).resolve().parent / RELEASE_PINS_FILENAME
+
+
+def load_release_pins() -> dict[str, Any]:
+    """Parse the in-tree release pins. Raises on a missing/malformed file rather
+    than falling back to "latest": a silent fallback is the exact version drift
+    this file exists to remove, and it would be invisible in production."""
+    path = release_pins_path()
+    try:
+        data = json.loads(path.read_text(encoding = "utf-8"))
+    except FileNotFoundError as exc:
+        raise PrebuiltFallback(
+            f"pinned prebuilt release manifest missing: {path}. It ships as package data with "
+            f"the unsloth wheel; reinstall unsloth, or set {ALLOW_LATEST_ENV}=1 to install the "
+            f"newest published release instead (non-deterministic)."
+        ) from exc
+    except (json.JSONDecodeError, OSError) as exc:
+        raise PrebuiltFallback(
+            f"pinned prebuilt release manifest unreadable ({path}): {exc}"
+        ) from exc
+    if not isinstance(data, dict) or data.get("schema_version") != RELEASE_PINS_SCHEMA_VERSION:
+        raise PrebuiltFallback(
+            f"pinned prebuilt release manifest has an unexpected schema "
+            f"(want schema_version={RELEASE_PINS_SCHEMA_VERSION}): {path}"
+        )
+    components = data.get("components")
+    if not isinstance(components, dict) or not components:
+        raise PrebuiltFallback(f"pinned prebuilt release manifest has no 'components': {path}")
+    return data
+
+
+def pinned_release(component: str) -> dict[str, Any]:
+    """The {repo, release_tag, ...} entry pinned for `component` (e.g. 'llama_cpp')."""
+    pins = load_release_pins()
+    entry = pins["components"].get(component)
+    if not isinstance(entry, dict):
+        raise PrebuiltFallback(
+            f"pinned prebuilt release manifest has no '{component}' entry: {release_pins_path()}"
+        )
+    repo = entry.get("repo")
+    release_tag = entry.get("release_tag")
+    if not isinstance(repo, str) or not repo.strip():
+        raise PrebuiltFallback(f"pinned release for {component} has no 'repo'")
+    if not isinstance(release_tag, str) or not release_tag.strip():
+        raise PrebuiltFallback(f"pinned release for {component} has no 'release_tag'")
+    return entry
+
+
+def allow_latest_prebuilt() -> bool:
+    return os.environ.get(ALLOW_LATEST_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def pinned_release_tag(component: str, *, published_repo: str | None = None) -> str:
+    """The release tag to install by default, or "" for the legacy resolve-latest
+    behaviour. Empty when the caller opted out via ALLOW_LATEST_ENV, or when it
+    aimed at a publisher other than the one the pin names (the pinned tag exists
+    only in the pinned repo, so applying it elsewhere would request a 404)."""
+    if allow_latest_prebuilt():
+        return ""
+    entry = pinned_release(component)
+    repo = (published_repo or "").strip()
+    if repo and repo.lower() != str(entry["repo"]).strip().lower():
+        return ""
+    return str(entry["release_tag"]).strip()
+
+
+def default_published_release_tag(
+    component: str, env_var: str, *, published_repo: str | None = None
+) -> str:
+    """Default for --published-release-tag: an explicit env override wins, else
+    the in-tree pin, else "" (resolve the newest published release)."""
+    override = (os.environ.get(env_var) or "").strip()
+    if override:
+        return override
+    return pinned_release_tag(component, published_repo = published_repo)
+
+
 # ── Release checksum index (trust anchor: the release's own sha256 asset) ──
 def valid_sha256(value: Any) -> str | None:
     if not isinstance(value, str):
