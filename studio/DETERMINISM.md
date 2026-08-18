@@ -113,14 +113,42 @@ no manual step — it follows `pypi_version` at release time.
 Changes to the pins file trigger `clean-machine-install-ci.yml`, which installs on a
 toolchain-stripped machine, so a bump is exercised rather than assumed.
 
-## On reproducible builds
+## On the build itself
 
-Question (2) above is unaddressed. The build is well pinned for supply-chain integrity —
-SHA-pinned actions, an exact Tauri CLI, digest-pinned packaging tools, committed lockfiles
-— but the Rust toolchain floats on `stable`, both npm installs use `npm install` rather
-than `npm ci`, and the Windows installer embeds a WebView2 bootstrapper fetched at build
-time. Signed artifacts can never be byte-identical anyway: `codesign` embeds a secure
-timestamp and Apple's stapled notarization ticket is per-submission. The realistic targets
-are the unsigned macOS payload compared via CodeDirectory page hashes, the Linux `.deb` and
-AppImage under `SOURCE_DATE_EPOCH`, and build provenance via
-`actions/attest-build-provenance`. None of that is implemented.
+Question (2) — same source, same bytes — is partly addressed.
+
+The build inputs are pinned: SHA-pinned actions, an exact Tauri CLI, digest-pinned
+packaging tools, committed lockfiles, and now an exact rustc (`rust-toolchain.toml`, with
+the release workflow passing the same version so targets install against it), an exact
+Node, and `npm ci` so neither npm lockfile can be rewritten mid-build. `fix-path-env` was
+a git dependency with no `rev`, held only by the lockfile; it is pinned to a commit. A
+guard snapshots all three lockfile digests and re-checks them after every platform build,
+so a build that rewrote one fails rather than shipping.
+
+Published assets carry provenance. `actions/attest-build-provenance` runs over the staged
+set after validation and before upload, so a third party can verify an artifact came from
+this source and this workflow:
+
+```sh
+gh attestation verify Unsloth-Desktop-<version>-MacOS.dmg -R unslothai/unsloth
+```
+
+A `build-inputs.json` asset records the commit, toolchain versions, lockfile digests,
+runner images and pinned tool digests — the things that otherwise exist only in run logs
+that expire. It asserts the running rustc matches `rust-toolchain.toml`, so a pin that
+silently failed to apply fails the release.
+
+**What is still not reproducible.** Signed artifacts can never be byte-identical:
+`codesign` embeds a secure timestamp, Apple's stapled notarization ticket is
+per-submission, and the minisign `.sig` files carry timestamps of their own. The Windows
+installer embeds a WebView2 bootstrapper fetched at build time and not digest-pinned.
+`SOURCE_DATE_EPOCH` is exported from the tag commit as groundwork, but nothing verifies
+byte reproducibility and tauri-bundler's handling of it is unconfirmed. The release
+workflow also rewrites `Cargo.toml`/`Cargo.lock` to the dispatched version before
+building, so a checkout of the tag does not reproduce the built tree without replaying
+that mutation — deterministic and recoverable (`tag.removeprefix('v')`, and
+`latest.json` carries both it and `pypi_version`), but not automatic.
+
+The realistic remaining targets are the unsigned macOS payload compared via CodeDirectory
+page hashes, and the Linux `.deb` and AppImage under `SOURCE_DATE_EPOCH`. Neither is
+implemented, and neither has been measured.
