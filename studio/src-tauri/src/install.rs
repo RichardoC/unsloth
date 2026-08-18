@@ -583,6 +583,22 @@ fn spawn_script(
     cmd.env_remove("UNSLOTH_STUDIO_HOME");
     cmd.env_remove("STUDIO_HOME");
 
+    // Pin the backend to the version this build shipped with, so one .dmg always
+    // installs one Python stack: install.sh reads setup.sh and every requirements
+    // and constraints file out of the installed unsloth wheel, so fixing the wheel
+    // fixes the whole pin set. Deliberately `option_env!` on its own and NOT
+    // preflight::version::expected_backend_version(), whose `.unwrap_or(
+    // MIN_DESKTOP_BACKEND_VERSION)` floor is the right answer for staleness checks
+    // and the wrong one here: an unstamped local or CI build would get pinned to a
+    // long-stale floor instead of keeping today's track-the-newest behavior. Only
+    // release builds are stamped (.github/workflows/release-desktop.yml), and only
+    // they set this; every other build sets nothing at all.
+    // Scrubbed first so an inherited value can never out-rank the stamp.
+    cmd.env_remove("UNSLOTH_BACKEND_VERSION");
+    if let Some(backend_version) = option_env!("UNSLOTH_DESKTOP_BACKEND_VERSION") {
+        cmd.env("UNSLOTH_BACKEND_VERSION", backend_version);
+    }
+
     // We decode this child as UTF-8 below, so its Python descendants must emit
     // UTF-8 or the log fills with U+FFFD. The .ps1 entry points set these too;
     // this covers any path reaching Python without them.
