@@ -87,8 +87,14 @@ jobs:
       - name: Run the cask contract test
         run: |
           set -euxo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check pytest
-          python3 -m pytest tests/security/test_homebrew_cask_contract.py -v
+          # A venv, not a bare pip install: the runner's python3 is Homebrew's
+          # and is PEP 668 externally-managed, so installing into it fails (and
+          # --break-system-packages risks the Homebrew we are about to test).
+          # pytest is the only dependency; the test and both conftests are
+          # otherwise stdlib.
+          python3 -m venv "$RUNNER_TEMP/cask-venv"
+          "$RUNNER_TEMP/cask-venv/bin/python" -m pip install --quiet --disable-pip-version-check pytest
+          "$RUNNER_TEMP/cask-venv/bin/python" -m pytest tests/security/test_homebrew_cask_contract.py -v
 
       # brew audit --new and brew livecheck resolve a cask by token out of a
       # tap, which is also how homebrew-cask will see this file. Auditing a
