@@ -1612,7 +1612,17 @@ def load_approved_release_checksums(repo: str, release_tag: str) -> ApprovedRele
             f"approved prebuilt release {repo}@{release_tag} did not expose {DEFAULT_PUBLISHED_SHA256_ASSET}"
         )
     try:
-        payload = fetch_json(checksum_url)
+        # The index is the authority for every archive's sha256, so when the tree
+        # pins this exact release its raw bytes are checked against the reviewed
+        # digest in prebuilt_release_pins.json first. Otherwise nothing but TLS
+        # separates a tampered index from a real one.
+        payload = _core.load_verified_checksum_index(
+            repo,
+            release_tag,
+            checksum_index_asset = DEFAULT_PUBLISHED_SHA256_ASSET,
+            fetch_json = lambda: fetch_json(checksum_url),
+            fetch_bytes = lambda: download_bytes(checksum_url, timeout = 30),
+        )
         checksums = parse_approved_release_checksums(repo, release_tag, payload)
     except PrebuiltFallback:
         raise
@@ -2032,7 +2042,18 @@ def _download_host_resolved_release(
         return None
     sha_url = _release_asset_download_url(repo, release_tag, DEFAULT_PUBLISHED_SHA256_ASSET)
     try:
-        sha_payload = _fetch_download_host_json(sha_url)
+        # Same enforcement as the API path above: the fast path reaches the very
+        # same asset, so it must not be the way around the in-tree digest.
+        sha_payload = _core.load_verified_checksum_index(
+            repo,
+            release_tag,
+            checksum_index_asset = DEFAULT_PUBLISHED_SHA256_ASSET,
+            fetch_json = lambda: _fetch_download_host_json(sha_url),
+            # Plain unauthenticated GET, exactly as _fetch_download_host_json does.
+            fetch_bytes = lambda: download_bytes(
+                sha_url, timeout = 30, headers = {"User-Agent": USER_AGENT}
+            ),
+        )
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None

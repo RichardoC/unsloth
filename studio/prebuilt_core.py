@@ -1668,22 +1668,35 @@ def resolve_backend(ops: ModuleOps, host: Any, requested: str | None, *, cpu_fal
     )
 
 
-# ── Pinned release tags (determinism anchor) ──
+# ── Pinned release tags (determinism anchor) + pinned checksum index (trust anchor) ──
 # Both installers used to resolve "the newest published release" at install time,
 # so the same installer produced a different runtime on a different day. They now
 # default to the release tag frozen in prebuilt_release_pins.json (in-tree,
 # code-reviewed), which makes the installed artifact set deterministic.
 #
-# This is a DETERMINISM anchor, not an independent TRUST anchor: archives are
-# still verified against the checksum index published by the same GitHub release,
-# fetched over the same TLS channel as the archive itself. install_node_prebuilt.py
-# goes further and freezes per-asset sha256 in-tree; this file does not, and the
-# comments here must not claim otherwise.
+# The pins file is BOTH anchors now. The release_tag decides WHICH release is
+# installed (determinism); checksum_index_sha256 decides whether that release's
+# checksum index is the reviewed one (trust). Verifying an archive against an
+# index fetched from the same release over the same TLS channel only proves the
+# release is self-consistent -- an attacker who can serve the archive can serve
+# the index. Pinning the index digest in-tree breaks that circle:
+#
+#     reviewed in-tree sha256  ->  the release's checksum index
+#                              ->  per-archive sha256  ->  the archive on disk
+#
+# so every byte installed traces back to a digest that went through code review.
+# install_node_prebuilt.py freezes per-asset sha256 directly; this is the same
+# guarantee one hop removed, and it is enforced (see verify_pinned_checksum_index).
 RELEASE_PINS_FILENAME = "prebuilt_release_pins.json"
 RELEASE_PINS_SCHEMA_VERSION = 1
 # Opt out of the pin and go back to resolving the newest published release at
 # install time. Named after install_node_prebuilt.py's UNSLOTH_NODE_ALLOW_UNVERIFIED.
 ALLOW_LATEST_ENV = "UNSLOTH_PREBUILT_ALLOW_LATEST"
+# Opt out of digest verification itself: install what the release serves without
+# checking it against the in-tree digest. Deliberately separate from
+# ALLOW_LATEST_ENV -- that one says "I accept a different version", this one says
+# "I accept unverified bytes" -- and named to match UNSLOTH_NODE_ALLOW_UNVERIFIED.
+ALLOW_UNVERIFIED_ENV = "UNSLOTH_PREBUILT_ALLOW_UNVERIFIED"
 
 
 def release_pins_path() -> Path:
@@ -1739,6 +1752,10 @@ def allow_latest_prebuilt() -> bool:
     return os.environ.get(ALLOW_LATEST_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def allow_unverified_prebuilt() -> bool:
+    return os.environ.get(ALLOW_UNVERIFIED_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def pinned_release_tag(component: str, *, published_repo: str | None = None) -> str:
     """The release tag to install by default, or "" for the legacy resolve-latest
     behaviour. Empty when the caller opted out via ALLOW_LATEST_ENV, or when it
@@ -1774,6 +1791,140 @@ def valid_sha256(value: Any) -> str | None:
     if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
         return digest
     return None
+
+
+def pinned_checksum_index_digest(
+    repo: str, release_tag: str, *, checksum_index_asset: str | None = None
+) -> str | None:
+    """The in-tree sha256 of the checksum index for ``repo@release_tag``, or None
+    when no in-tree pin covers that release.
+
+    Lookup is by (repo, release_tag) rather than by component name, so any caller
+    holding a resolved release can ask "is this the release the tree pinned?"
+    without knowing which component it is. Returning None is how enforcement is
+    SCOPED: there is simply no reviewed digest for a release the tree does not
+    name, and inventing one would break every legitimate override --
+
+    - ``UNSLOTH_*_RELEASE_TAG=<tag>`` selects a release the pins file does not
+      name, so no entry matches;
+    - ``--published-repo someone/else`` likewise (the repo has to match too);
+    - ``UNSLOTH_PREBUILT_ALLOW_LATEST=1`` means the caller accepts drift, so the
+      pin is off wholesale -- including for the case where "latest" happens to
+      resolve to the pinned tag today;
+    - ``UNSLOTH_PREBUILT_ALLOW_UNVERIFIED=1`` is the explicit "install unverified
+      bytes" hatch.
+
+    An unreadable pins file is also "no pin covers this", NOT a failure: the
+    default install path already fails closed on it much earlier (see
+    ``pinned_release_tag``), so this cannot silently downgrade a default install,
+    while raising here would break an install that legitimately overrode the tag.
+
+    A pinned release whose entry records no usable digest DOES raise: a pin bump
+    that forgot to re-record the digest must not quietly install unverified.
+    """
+    if allow_latest_prebuilt() or allow_unverified_prebuilt():
+        return None
+    repo_key = (repo or "").strip().lower()
+    tag_key = (release_tag or "").strip()
+    if not repo_key or not tag_key:
+        return None
+    try:
+        pins = load_release_pins()
+    except PrebuiltFallback:
+        return None
+    wanted_asset = (checksum_index_asset or "").strip()
+    for component, entry in pins["components"].items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("repo") or "").strip().lower() != repo_key:
+            continue
+        if str(entry.get("release_tag") or "").strip() != tag_key:
+            continue
+        entry_asset = str(entry.get("checksum_index_asset") or "").strip()
+        if wanted_asset and entry_asset and entry_asset != wanted_asset:
+            # Same repo+tag but a different index asset: this pin does not
+            # describe the file in hand, so it is not evidence about it.
+            continue
+        digest = valid_sha256(entry.get("checksum_index_sha256"))
+        if digest is None:
+            label = entry_asset or wanted_asset or "its checksum index"
+            raise PrebuiltFallback(
+                f"{release_pins_path()} pins {component} at {repo}@{release_tag} but records no "
+                f"usable checksum_index_sha256, so {label} cannot be verified. Re-record it "
+                f"(curl -sL the checksum index from that release | sha256sum), or set "
+                f"{ALLOW_UNVERIFIED_ENV}=1 to install without verifying it."
+            )
+        return digest
+    return None
+
+
+def verify_pinned_checksum_index(
+    repo: str,
+    release_tag: str,
+    raw: bytes,
+    *,
+    checksum_index_asset: str | None = None,
+    expected: str | None = None,
+) -> None:
+    """Fail closed when ``raw`` is not the checksum index the tree reviewed.
+
+    This is the point where the trust chain starts: everything downstream (each
+    archive's sha256) is only as trustworthy as this index, and the index arrives
+    over the same TLS channel as the archives it vouches for. Checking it against
+    a digest frozen in reviewed, committed code is the only step here that does
+    not depend on the release host. A no-op when no pin covers the release --
+    see ``pinned_checksum_index_digest`` for exactly when that is."""
+    if expected is None:
+        expected = pinned_checksum_index_digest(
+            repo, release_tag, checksum_index_asset = checksum_index_asset
+        )
+    if expected is None:
+        return
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual == expected:
+        return
+    label = checksum_index_asset or "checksum index"
+    raise PrebuiltFallback(
+        f"{label} from {repo}@{release_tag} does not match the digest pinned in "
+        f"{RELEASE_PINS_FILENAME}: expected sha256={expected}, got sha256={actual}. "
+        f"That file is the trust anchor for every archive this release publishes, so the "
+        f"install stops rather than trusting checksums it cannot vouch for. If the release "
+        f"was legitimately republished, re-record checksum_index_sha256 in "
+        f"{RELEASE_PINS_FILENAME}; to install anyway, set {ALLOW_UNVERIFIED_ENV}=1 (skips "
+        f"verification) or {ALLOW_LATEST_ENV}=1 (drops the pin entirely)."
+    )
+
+
+def load_verified_checksum_index(
+    repo: str,
+    release_tag: str,
+    *,
+    checksum_index_asset: str,
+    fetch_json: Callable[[], Any],
+    fetch_bytes: Callable[[], bytes],
+) -> Any:
+    """The checksum index for ``repo@release_tag`` as parsed JSON, digest-checked
+    against the in-tree pin when one covers that release.
+
+    Two fetchers because a digest is over bytes, not over a re-serialized object.
+    When no pin covers the release there is nothing in-tree to compare against,
+    so the caller's ordinary JSON fetch (its own memoized/injectable seam) is used
+    unchanged and behaviour is exactly as before; only the pinned release pays for
+    the raw read."""
+    expected = pinned_checksum_index_digest(
+        repo, release_tag, checksum_index_asset = checksum_index_asset
+    )
+    if expected is None:
+        return fetch_json()
+    raw = fetch_bytes()
+    verify_pinned_checksum_index(
+        repo,
+        release_tag,
+        raw,
+        checksum_index_asset = checksum_index_asset,
+        expected = expected,
+    )
+    return json.loads(raw.decode("utf-8"))
 
 
 def parse_release_checksums(
@@ -1825,11 +1976,21 @@ def fetch_release_checksums(ops: ModuleOps, bundle: "ReleaseBundle") -> dict[str
         )
     try:
         raw = ops.download_bytes(url, timeout = 30, headers = ops.auth_headers(url))
-        payload = json.loads(raw.decode("utf-8"))
     except (urllib.error.URLError, OSError, socket.timeout) as exc:
         raise PrebuiltFallback(
             f"could not fetch {sha_asset} from {bundle.repo}@{bundle.release_tag}: {exc}"
         ) from exc
+    # Digest-check the index BEFORE parsing it. Parsing already cross-checks the
+    # index's own schema/component/release_tag, but all of that is self-reported
+    # by the same release that served the archives; this compares the raw bytes
+    # against a sha256 that lives in the tree and went through review, which is
+    # the one link in the chain the release host cannot forge. No-op unless the
+    # release actually being installed is the pinned one.
+    verify_pinned_checksum_index(
+        bundle.repo, bundle.release_tag, raw, checksum_index_asset = sha_asset
+    )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PrebuiltFallback(
             f"{sha_asset} in {bundle.repo}@{bundle.release_tag} was not valid JSON"
@@ -1975,7 +2136,17 @@ def resolve_release_via_download_host(
         return None
     sha_url = ops.release_asset_download_url(repo, release_tag, sha_asset)
     try:
-        sha_payload = ops._download_host_json(sha_url)
+        # Same enforcement as the API path: this is the faster route to the very
+        # same file, so it must not be the way around the in-tree digest.
+        sha_payload = load_verified_checksum_index(
+            repo,
+            release_tag,
+            checksum_index_asset = sha_asset,
+            fetch_json = lambda: ops._download_host_json(sha_url),
+            fetch_bytes = lambda: ops.download_bytes(
+                sha_url, timeout = 30, headers = {"User-Agent": ops.USER_AGENT}
+            ),
+        )
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None

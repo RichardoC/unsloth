@@ -59,18 +59,30 @@ guarantee. Closing the rest means a real lockfile with hashes.
 Pinning decides *which* artifact is fetched. It is not by itself a trust anchor.
 
 - `node_prebuilt_pins.json` freezes per-asset sha256 **in-tree**, so the digest is
-  reviewed code. It refuses unpinned versions outright. This is the strongest anchor and
-  the model the others should follow.
+  reviewed code. It refuses unpinned versions outright. This is the strongest anchor.
 - llama.cpp and whisper.cpp archives are checked against their release's own checksum
-  index, fetched from the same release over the same TLS channel. That is
-  tamper-*consistency* between index, manifest and archive — not independent attestation.
-  `checksum_index_sha256` in the pins file is recorded for human verification and is **not
-  enforced**; do not read it as digest pinning.
-- stable-diffusion.cpp is the weakest: it verifies against the `digest` field of the same
-  GitHub API response that supplied the URL, warns and proceeds when absent, and silently
-  falls back to `latest` if its pinned tag 404s.
+  index — and that index is now checked against `checksum_index_sha256` in
+  `prebuilt_release_pins.json`, which **is enforced** at install time. The chain is
+  reviewed in-tree digest → checksum index → per-archive sha256 → archive on disk, so
+  every installed byte traces back to a digest that went through code review. Without
+  that first link the index and the archives it vouches for arrive over the same TLS
+  channel from the same release, which is tamper-*consistency*, not attestation.
+  Enforcement covers both routes to the index (the GitHub API path and the download-host
+  fast path), and applies **only to the release the pins file names**: an env-overridden
+  tag, a different `--published-repo`, or either escape hatch means no in-tree digest
+  exists for that release, so verification is skipped rather than failed. A pin bump that
+  forgets to re-record the digest fails closed.
+- stable-diffusion.cpp verifies against the `digest` field of the same GitHub API
+  response that supplied the URL, and now **fails closed**: a missing digest and an
+  unrecognised algorithm are errors, not warnings, and a pinned tag that no longer
+  resolves is an error rather than a silent install of `latest`. Its remaining weakness
+  is the one this cannot fix from here: the digest is still same-origin, so it is
+  tamper-consistency only. It has no in-tree digest of its own, because it publishes no
+  checksum-index asset to pin. Because sd.cpp installs lazily at the first image
+  generation, these failures surface there rather than during bootstrap.
 
-No component verifies a signature.
+No component verifies a signature, and only Node and (one hop removed) llama.cpp /
+whisper.cpp verify anything against a digest that lives in this repository.
 
 ## Escape hatches
 
@@ -79,12 +91,18 @@ together so the update banner never offers what the installer would refuse:
 
 | Variable | Effect |
 | --- | --- |
-| `UNSLOTH_PREBUILT_ALLOW_LATEST=1` | llama.cpp and whisper.cpp track newest again |
+| `UNSLOTH_PREBUILT_ALLOW_LATEST=1` | llama.cpp, whisper.cpp and sd.cpp track newest again — and with the pin off, the in-tree checksum-index digest no longer applies |
+| `UNSLOTH_PREBUILT_ALLOW_UNVERIFIED=1` | keep the pinned versions but install without checking the llama/whisper checksum index against its in-tree digest, and let sd.cpp install an asset that publishes no usable digest |
 | `UNSLOTH_LLAMA_RELEASE_TAG=<tag>` | install that llama release instead |
 | `UNSLOTH_WHISPER_RELEASE_TAG=<tag>` | install that whisper release instead |
 | `UNSLOTH_SD_CPP_TAG=<tag>` | override sd.cpp (empty tracks latest) |
 | `UNSLOTH_NODE_ALLOW_UNVERIFIED=1` | allow a Node version with no in-tree digest |
 | `UNSLOTH_BACKEND_VERSION=<ver>` / `--backend-version` | pin the backend by hand |
+
+The two `ALLOW_` variables say different things and are deliberately separate:
+`ALLOW_LATEST` is "I accept a different version", `ALLOW_UNVERIFIED` is "I accept bytes
+nothing checked". Neither excuses a digest that *was* checked and disagreed — a real
+mismatch always stops the install.
 
 A `curl | sh` CLI install sets none of these and none of the pins, so it tracks latest
 exactly as it always has. Only release-stamped desktop builds pin the backend; an
@@ -102,13 +120,20 @@ rather than the `MIN_DESKTOP_BACKEND_VERSION` floor.
 - **A broken upstream release is no longer auto-healed.** Tracking latest meant the next
   launch could repair itself past a bad release. Pinning trades that for determinism: a
   bad pinned release needs a new desktop build.
+- **A release that is retagged or republished now breaks the install rather than
+  changing it.** Re-uploading assets under a pinned tag changes the checksum index, which
+  no longer matches the in-tree digest; for sd.cpp, deleting a pinned tag no longer
+  resolves to `latest`. Both are deliberate: a pin that quietly moved is the failure mode
+  worth catching, and the errors name the pin, the file and the hatch.
 
 ## Bumping the pins
 
 `prebuilt_release_pins.json` carries the procedure in its own `comment`. In short: pick the
 new tag per component, re-record `checksum_index_sha256`, update `pinned_at_utc`, and
-confirm whisper's `paired_llama_tag` still equals the llama tag. The backend version needs
-no manual step — it follows `pypi_version` at release time.
+confirm whisper's `paired_llama_tag` still equals the llama tag. Re-recording the digest is
+no longer optional bookkeeping: it is enforced, so a bump that skips it fails every install
+closed until it is corrected. The backend version needs no manual step — it follows
+`pypi_version` at release time.
 
 Changes to the pins file trigger `clean-machine-install-ci.yml`, which installs on a
 toolchain-stripped machine, so a bump is exercised rather than assumed.
