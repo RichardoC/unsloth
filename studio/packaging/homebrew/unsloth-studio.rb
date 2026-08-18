@@ -55,8 +55,11 @@ cask "unsloth-studio" do
   # The published Mach-O is arm64 only; the Intel matrix leg in release-desktop.yml
   # is commented out. Info.plist still carries Tauri's default LSMinimumSystemVersion
   # of 10.13, but an arm64-only binary cannot run before Big Sur.
+  # The bare symbol is Homebrew's minimum-version form -- Big Sur or newer, not
+  # Big Sur exactly. `">= :big_sur"` means the same thing, but brew style's
+  # Homebrew/OSDependsOn cop rejects the long form.
   depends_on arch: :arm64
-  depends_on macos: ">= :big_sur"
+  depends_on macos: :big_sur
 
   app "Unsloth.app"
 

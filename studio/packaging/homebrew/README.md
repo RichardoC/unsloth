@@ -102,7 +102,10 @@ The published Mach-O is arm64-only — the Intel matrix leg is commented out at
 
 `Info.plist` still carries Tauri's default `LSMinimumSystemVersion` of `10.13`, which is
 not the real floor: an arm64-only binary cannot run on anything before Big Sur. The cask
-therefore declares `depends_on macos: ">= :big_sur"` rather than trusting the plist.
+therefore declares `depends_on macos: :big_sur` rather than trusting the plist. The bare
+symbol is Homebrew's minimum-version form, so that reads "Big Sur or newer"; the
+equivalent `">= :big_sur"` is rejected by `brew style`'s `Homebrew/OSDependsOn` cop, and
+only the `"== :big_sur"` string form would pin one exact release.
 
 If an Intel or universal build is ever enabled, drop `depends_on arch: :arm64` and split
 the `sha256`/`url` per arch with an `on_arm` / `on_intel` block (or a `sha256` +
