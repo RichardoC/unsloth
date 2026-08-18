@@ -160,6 +160,10 @@ def _clean_state(monkeypatch, tmp_path):
     wupd._resolve_memo.clear()
     monkeypatch.setattr(freshness, "_cache_dir", lambda: tmp_path / ".llama_cache")
     monkeypatch.setattr(wfresh, "_cache_dir", lambda: tmp_path / ".whisper_cache")
+    # Exercise the unpinned (track-latest) policy these cases were written
+    # against; see the same note in test_llama_cpp_freshness.py. The pinned
+    # policy is covered by tests/studio/install/test_prebuilt_pin_freshness.py.
+    monkeypatch.setenv("UNSLOTH_PREBUILT_ALLOW_LATEST", "1")
     for var in (
         "LLAMA_SERVER_PATH",
         "UNSLOTH_LLAMA_CPP_PATH",

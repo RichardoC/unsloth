@@ -41,6 +41,7 @@ from utils.prebuilt.whisper_layout import canonical_install_root
 from utils.whisper_cpp_freshness import (
     _INSTALL_MARKER_NAME,
     check_prebuilt_freshness,
+    install_target_tag,
     is_behind,
     latest_published_release,
     latest_release_assets,
@@ -235,8 +236,12 @@ def get_update_status(*, force_refresh: bool = False) -> dict:
 
     repo = (marker or {}).get("published_repo") or DEFAULT_PUBLISHED_REPO
 
-    if force_refresh and repo:
-        # Prime the cache so the freshness read below sees the newest tag.
+    if force_refresh and repo and not install_target_tag(repo):
+        # Prime the cache so the freshness read below sees the newest tag. Under
+        # the release pin there is nothing to prime -- the target is the pinned
+        # tag and the freshness read makes no GitHub call at all -- so an
+        # explicit "check now" must not spend a network round trip on an answer
+        # it will not use.
         try:
             latest_published_release(repo, force_refresh = True)
         except Exception as exc:  # pragma: no cover - network defensive
@@ -575,9 +580,15 @@ def chained_phase_plan(
         plan["skip_reason"] = "no_install_dir"
         return plan
     plan["update_available"] = True
+    phase_repo = marker.get("published_repo") or DEFAULT_PUBLISHED_REPO
+    # Same clamp as the llama phase: a user-initiated update installs the pinned
+    # release and never past it, so a stale status cannot take whisper off the
+    # baseline (see llama_cpp_update._plan_llama_phase for the full reasoning).
+    # None when no pin is in force -- the offered tag is then used, as before.
+    pinned_target = install_target_tag(phase_repo)
     plan["phase"] = {
         "install_dir": install_dir,
-        "repo": marker.get("published_repo") or DEFAULT_PUBLISHED_REPO,
+        "repo": phase_repo,
         "asset": marker.get("asset"),
         "backend": marker.get("backend"),
         "script": script,
@@ -589,7 +600,9 @@ def chained_phase_plan(
         # (walk-back to an os-compatible release), so pinning whisper to the
         # newest tag could be an impossible pairing (min_os / requires_llama_tag)
         # on every retry.
-        "pin_release_tag": None if sys.platform == "darwin" else status.get("latest_tag"),
+        "pin_release_tag": (
+            None if sys.platform == "darwin" else (pinned_target or status.get("latest_tag"))
+        ),
     }
     return plan
 

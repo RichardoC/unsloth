@@ -12,6 +12,11 @@ misleading banner.
 The mechanics (marker walk-up, GitHub fetch, memo + disk cache, report skeleton)
 live in utils.prebuilt.freshness_flow; this module keeps the whisper version
 policy and the per-module caches its tests patch.
+
+"Latest" is what the installer would install, not what GitHub published last:
+under the in-tree release pin those differ on purpose, and comparing against
+GitHub's newest is what produced a permanent, unfixable "update available"
+banner on a correctly pinned install (see target_release_tag).
 """
 
 from __future__ import annotations
@@ -24,12 +29,18 @@ from typing import Optional
 import structlog
 
 from utils.prebuilt import freshness_flow as _flow
+from utils.prebuilt import release_pin as _pin
 from utils.prebuilt.whisper_layout import lookup_marker
 
 logger = structlog.get_logger(__name__)
 
 # 3 days matches Unsloth's typical whisper.cpp release cadence.
 STALENESS_THRESHOLD_DAYS = 3
+
+# Component key in studio/prebuilt_release_pins.json and the env override that
+# outranks it, both mirrored from install_whisper_prebuilt.py.
+RELEASE_PIN_COMPONENT = "whisper_cpp"
+RELEASE_TAG_ENV = "UNSLOTH_WHISPER_RELEASE_TAG"
 
 _INSTALL_MARKER_NAME = "UNSLOTH_WHISPER_PREBUILT_INFO.json"
 
@@ -90,6 +101,38 @@ def latest_published_release(repo: str, *, force_refresh: bool = False) -> Optio
         fetch = lambda r: _fetch_latest_release_tag(r),
         save = lambda r, tag: _save_disk_cache(r, tag),
     )
+
+
+def install_target_tag(repo: Optional[str]) -> Optional[str]:
+    """The release tag install_whisper_prebuilt.py would install for `repo`, or
+    None when no pin is in force (opt-out set, or a publisher the pin does not
+    name). See utils.prebuilt.release_pin."""
+    return _pin.install_target_tag(
+        RELEASE_PIN_COMPONENT, env_var = RELEASE_TAG_ENV, published_repo = repo
+    )
+
+
+def target_release_tag(repo: str, *, force_refresh: bool = False) -> Optional[str]:
+    """The release this install can actually move to -- what every freshness
+    comparison must use as "latest".
+
+    Under the in-tree pin that is the pinned tag, NOT GitHub's newest: the
+    installer installs the pin, so comparing against a newer published release
+    reports an update the apply half would never perform, and the banner can
+    never be cleared by updating. No network call is made in that case, which
+    also makes the verdict correct offline.
+
+    Without a pin in force (UNSLOTH_PREBUILT_ALLOW_LATEST=1, or a custom
+    --published-repo the pin does not name) this is exactly the pre-pin
+    behaviour: GitHub's newest published release.
+
+    The macOS path in whisper_cpp_update re-asks the installer's own host-aware
+    resolver instead, which now answers with the same pin; this keeps the two
+    from disagreeing everywhere else."""
+    pinned = install_target_tag(repo)
+    if pinned:
+        return pinned
+    return latest_published_release(repo, force_refresh = force_refresh)
 
 
 def _fetch_latest_release_assets(repo: str, timeout: float = 5.0) -> Optional[dict[str, int]]:
@@ -231,7 +274,7 @@ def check_prebuilt_freshness(
         threshold_days = threshold_days,
         now = now,
         read_marker = lambda p: read_install_marker(p),
-        latest_release = lambda repo: latest_published_release(repo),
+        latest_release = lambda repo: target_release_tag(repo),
         behind = lambda installed, latest: is_behind(installed, latest),
         display_tag = lambda marker: marker.get("release_tag"),
         compare_tag = lambda marker: marker.get("release_tag"),

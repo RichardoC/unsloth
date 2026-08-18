@@ -97,6 +97,15 @@ def _fake_binary(install_dir: Path, *, layout: str = "cmake") -> Path:
 def _reset(monkeypatch, tmp_path):
     # Isolate disk cache per-test; never touch the real cache.
     monkeypatch.setattr(fr, "_cache_dir", lambda: tmp_path / ".freshness")
+    # Exercise the unpinned (track-latest) policy. Every case in this file was
+    # written before studio/prebuilt_release_pins.json and encodes the contract
+    # it replaced: "latest" is whatever GitHub published last, stubbed per test.
+    # Under the pin the comparison target is the pinned tag instead
+    # (utils.prebuilt.release_pin), so the stubbed tags would be ignored and the
+    # mechanics these tests actually cover -- caches, is_behind, marker parsing --
+    # would never be reached. The pinned policy has its own coverage in
+    # tests/studio/install/test_prebuilt_pin_freshness.py.
+    monkeypatch.setenv("UNSLOTH_PREBUILT_ALLOW_LATEST", "1")
     fr.reset_caches()
     yield
     fr.reset_caches()

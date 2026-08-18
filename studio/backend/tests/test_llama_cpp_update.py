@@ -122,6 +122,10 @@ def _clean_state(monkeypatch, tmp_path):
     # Isolate the freshness disk cache so the suite never writes the real
     # ~/.unsloth cache (the default when storage_roots can't be imported).
     monkeypatch.setattr(freshness, "_cache_dir", lambda: tmp_path / ".freshness_cache")
+    # Exercise the unpinned (track-latest) policy these cases were written
+    # against; see the same note in test_llama_cpp_freshness.py. The pinned
+    # policy is covered by tests/studio/install/test_prebuilt_pin_freshness.py.
+    monkeypatch.setenv("UNSLOTH_PREBUILT_ALLOW_LATEST", "1")
     # Deterministic markerless paths: no host-pinned binary, no custom dir.
     monkeypatch.delenv("LLAMA_SERVER_PATH", raising = False)
     monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising = False)
