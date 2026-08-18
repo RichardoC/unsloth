@@ -551,6 +551,33 @@ jobs:
           ref: ${{ needs.prepare-version.outputs.desktop_release_tag }}
           persist-credentials: false
 
+      # SOURCE_DATE_EPOCH is the tag commit's committer timestamp, so it is a
+      # property of the source rather than of the runner clock. It cannot live
+      # in the job-level `env:` block, which is evaluated before the checkout
+      # exists, so it is exported into the job environment here and every later
+      # step in this job sees it.
+      #
+      # This is groundwork, not a reproducibility claim: nothing in this
+      # workflow verifies that two builds of the same tag produce identical
+      # bytes, and whether tauri-bundler honours SOURCE_DATE_EPOCH for the
+      # timestamps it stamps into deb/NSIS/dmg payloads is unconfirmed. What it
+      # does today is remove the wall clock from any tool that already respects
+      # the convention, and record the value in build-inputs.json so a future
+      # rebuild can be attempted with the same input.
+      - name: Export SOURCE_DATE_EPOCH from the tag commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(git log -1 --format=%ct)"
+          case "$epoch" in
+            ''|*[!0-9]*)
+              echo "git log did not return a numeric committer timestamp: '$epoch'" >&2
+              exit 1
+              ;;
+          esac
+          echo "SOURCE_DATE_EPOCH=$epoch" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$epoch ($(date -u -d "@$epoch" 2>/dev/null || true))"
+
       # ── Linux dependencies ──
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -562,16 +589,29 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
-          node-version: 24
+          # Exact, not `24`. A major-only request resolves to whatever 24.x the
+          # setup-node manifest holds that day, so the Node that runs `vite
+          # build` and the Tauri CLI was a floating input of the release. There
+          # is no .nvmrc convention in this repo (every other workflow names the
+          # version inline), so the pin lives here and is recorded in
+          # build-inputs.json alongside the toolchain it built with.
+          node-version: '24.19.0'
 
       - name: Install pinned Tauri CLI
+        # `npm ci`, not `npm install`: studio/package.json exists only to hold
+        # this lockfile ("Lockfile holder for @tauri-apps/cli", see its
+        # description), and @tauri-apps/cli 2.10.1 is already pinned in its
+        # devDependencies and resolved in studio/package-lock.json. `npm install
+        # --save-dev @tauri-apps/cli@2.10.1` re-resolved the transitive tree on
+        # every run and could rewrite the lockfile in the working tree; `npm ci`
+        # installs exactly what the lockfile says and fails if the two disagree.
         # Lifecycle scripts (esbuild native-binary postinstall, etc.) are
         # required for `vite build`. The pre-install lockfile structural
         # audit (lockfile_supply_chain_audit.py) is the practical defence
         # against the npm postinstall-dropper class -- it fires BEFORE any
         # tarball runs, on the injection pattern itself rather than an
         # advisory-DB lookup.
-        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+        run: npm ci --prefix studio --no-fund --no-audit
 
       - name: Verify pinned Tauri CLI
         shell: bash
@@ -697,18 +737,30 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: studio/frontend
+        # `npm ci`, not `npm install`: the release must install exactly the tree
+        # in studio/frontend/package-lock.json, and `npm install` is free to
+        # re-resolve a range and rewrite that lockfile in the working tree.
         # Lifecycle scripts (esbuild native-binary postinstall, etc.) are
         # required for `vite build`. The pre-install lockfile structural
         # audit (lockfile_supply_chain_audit.py) is the practical defence
         # against the npm postinstall-dropper class -- it fires BEFORE any
         # tarball runs, on the injection pattern itself rather than an
         # advisory-DB lookup.
-        run: npm install --no-fund --no-audit
+        run: npm ci --no-fund --no-audit
 
       # ── Rust ──
-      - name: Install Rust stable
+      # `toolchain:` is passed explicitly and must stay byte-identical to
+      # `channel` in studio/src-tauri/rust-toolchain.toml. The action's
+      # `toolchain` input defaults to `stable`, so without this the requested
+      # cross-compilation targets would be installed against stable while
+      # rust-toolchain.toml forces every cargo invocation onto 1.94.1 -- the
+      # aarch64/x86_64 Apple std would be missing from the toolchain that
+      # actually builds, and the macOS leg would fail on a missing target.
+      # Change both files together.
+      - name: Install Rust 1.94.1
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-03-27
         with:
+          toolchain: '1.94.1'
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Patch desktop app version
@@ -777,6 +829,83 @@ jobs:
           PY
 
           git diff -- Cargo.toml Cargo.lock
+
+      # ── Lockfile immutability, part 1 of 2 ──
+      # A build that rewrites a lockfile built something other than what was
+      # reviewed, and today that would pass silently. The obvious check --
+      # `git diff --exit-code` over the three lockfiles after the build -- is
+      # only correct for two of them: the step above deliberately rewrites the
+      # `unsloth-studio` entry in Cargo.lock, so its baseline is the post-patch
+      # state, not HEAD.
+      #
+      # So the check is split. The two npm lockfiles are never touched by this
+      # workflow, and `npm ci` (unlike `npm install`) does not rewrite one, so
+      # HEAD stays their baseline and that is asserted here -- after both
+      # installs have already run, which is the point at which a rewriting
+      # install would have shown up. Cargo.lock is checked against HEAD too, but
+      # for confinement: the only difference may be the one version line the
+      # patch step wrote. Digests of all three are then snapshotted for part 2.
+      - name: Snapshot lockfile digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          # Both npm installs have run by now, so a lockfile-rewriting install
+          # fails here rather than shipping a tree nobody reviewed.
+          git diff --exit-code -- studio/package-lock.json studio/frontend/package-lock.json
+          "$PYTHON" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          LOCKFILES = (
+              'studio/src-tauri/Cargo.lock',
+              'studio/package-lock.json',
+              'studio/frontend/package-lock.json',
+          )
+
+          # Windows runners check out with core.autocrlf, so the bytes on disk
+          # differ from the LF-canonical source for any file .gitattributes does
+          # not pin. Normalise CRLF to LF before hashing: the digest is then a
+          # property of the source, identical on all three matrix legs, and on a
+          # Linux/macOS checkout it equals a plain sha256sum of the file.
+          def digest(path: pathlib.Path) -> str:
+              return hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+
+          diff = subprocess.run(
+              ['git', 'diff', '-U0', '--', 'studio/src-tauri/Cargo.lock'],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout
+          changed = [
+              line for line in diff.splitlines()
+              if re.fullmatch(r'[-+](?!(?:\+\+|--)).*', line)
+          ]
+          # Zero changed lines is the patch step finding the release version
+          # already in place; two is the version line it rewrote. Anything else
+          # means something other than the patch touched the lockfile.
+          if len(changed) not in (0, 2) or not all(
+              re.fullmatch(r'[-+]version = "[^"]+"', line) for line in changed
+          ):
+              sys.exit(
+                  'Cargo.lock differs from the tag by more than the release version '
+                  f'patch, so the build would use a dependency set nobody reviewed:\n{diff}'
+              )
+
+          snapshot = {path: digest(pathlib.Path(path)) for path in LOCKFILES}
+          out = pathlib.Path(os.environ['RUNNER_TEMP'], 'lockfile-digests.json')
+          out.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(out.read_text(encoding='utf-8'))
+          PY
 
       - name: Rust cache
         uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
@@ -1545,6 +1674,181 @@ jobs:
           $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           Write-Host ($md -join "`n")
 
+      # ── Lockfile immutability, part 2 of 2 ──
+      # The bundles are built by now, so any lockfile rewrite the build itself
+      # performed (a cargo invocation without --locked, a stray `npm install`
+      # inside a build script) has already happened. Fail the release loudly
+      # rather than shipping binaries whose dependency set no longer matches the
+      # reviewed one. Baselines: HEAD for the two npm lockfiles, and the
+      # post-patch snapshot from part 1 for Cargo.lock.
+      - name: Verify the build rewrote no lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          git diff --exit-code -- studio/package-lock.json studio/frontend/package-lock.json
+          "$PYTHON" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          def digest(path: pathlib.Path) -> str:
+              return hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+
+          snapshot_path = pathlib.Path(os.environ['RUNNER_TEMP'], 'lockfile-digests.json')
+          if not snapshot_path.is_file():
+              sys.exit('No lockfile digest snapshot; "Snapshot lockfile digests" did not run')
+          snapshot = json.loads(snapshot_path.read_text(encoding='utf-8'))
+
+          drifted = {
+              path: (recorded, digest(pathlib.Path(path)))
+              for path, recorded in sorted(snapshot.items())
+              if digest(pathlib.Path(path)) != recorded
+          }
+          if drifted:
+              for path, (recorded, actual) in drifted.items():
+                  print(f'{path}: {recorded} -> {actual}', file=sys.stderr)
+              sys.exit(
+                  'The build rewrote a lockfile, so these bundles were not built '
+                  'from the reviewed dependency set.'
+              )
+          print('lockfiles unchanged since the release version patch')
+          PY
+
+      # ── Build provenance: what this leg actually built with ──
+      # Every version below exists only in the runner log today, and logs
+      # expire. publish-release merges the three legs' records into one
+      # build-inputs.json release asset, which outlives them.
+      - name: Record build inputs
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARTIFACT_KEY: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          # Collected in the shell rather than from Python's subprocess: `npx`
+          # and `npm` are .cmd shims on Windows and are only reliably resolvable
+          # through a shell. rustc/cargo are read from studio/src-tauri so
+          # rust-toolchain.toml governs which toolchain answers.
+          RUSTC_VERSION="$(cd studio/src-tauri && rustc -V)"
+          CARGO_VERSION="$(cd studio/src-tauri && cargo -V)"
+          NODE_VERSION="$(node -v)"
+          NPM_VERSION="$(npm -v)"
+          TAURI_CLI_VERSION="$(npx --prefix studio tauri --version)"
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          export RUSTC_VERSION CARGO_VERSION NODE_VERSION NPM_VERSION TAURI_CLI_VERSION COMMIT_SHA
+          "$PYTHON" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import platform
+          import re
+          import sys
+
+          workflow = pathlib.Path('.github/workflows/release-desktop.yml').read_text(encoding='utf-8')
+
+          # Read the pins out of the workflow itself rather than restating them:
+          # a copy here would silently go stale the next time one is bumped.
+          pinned_actions = sorted({
+              match.group(1)
+              for match in re.finditer(r'^\s*-?\s*uses:\s*(\S+@[0-9a-f]{40})', workflow, re.M)
+          })
+          pinned_downloads = {
+              match.group(1): match.group(2)
+              for match in re.finditer(
+                  r'^\s*([A-Z][A-Z0-9_]*(?:_URL|_SHA256)):\s*"([^"]+)"', workflow, re.M
+              )
+          }
+
+          toolchain = pathlib.Path('studio/src-tauri/rust-toolchain.toml').read_text(encoding='utf-8')
+          channel = re.search(r'^\s*channel\s*=\s*"([^"]+)"', toolchain, re.M)
+          if not channel:
+              sys.exit('studio/src-tauri/rust-toolchain.toml declares no channel')
+          channel = channel.group(1)
+          if not re.fullmatch(r'\d+\.\d+(?:\.\d+)?', channel):
+              sys.exit(
+                  'Desktop releases must build on an exact rustc, not a moving channel: '
+                  f'rust-toolchain.toml channel = "{channel}"'
+              )
+          rustc_version = os.environ['RUSTC_VERSION']
+          # Proves the pin took effect on this runner. Without it a
+          # rust-toolchain.toml that failed to apply would only show up as a
+          # version string nobody read.
+          if not rustc_version.startswith(f'rustc {channel} '):
+              sys.exit(
+                  f'rustc is {rustc_version!r}, not the pinned {channel} from '
+                  'studio/src-tauri/rust-toolchain.toml'
+              )
+
+          def digest(path: str) -> str:
+              return hashlib.sha256(
+                  pathlib.Path(path).read_bytes().replace(b'\r\n', b'\n')
+              ).hexdigest()
+
+          record = {
+              'artifact': os.environ['ARTIFACT_KEY'],
+              'runner_label': os.environ['PLATFORM'],
+              'runner': {
+                  'os': os.environ.get('RUNNER_OS', ''),
+                  'arch': os.environ.get('RUNNER_ARCH', ''),
+                  'image_os': os.environ.get('ImageOS', ''),
+                  'image_version': os.environ.get('ImageVersion', ''),
+                  'platform': platform.platform(),
+                  'machine': platform.machine(),
+              },
+              'commit': os.environ['COMMIT_SHA'],
+              'source_date_epoch': os.environ.get('SOURCE_DATE_EPOCH', ''),
+              'toolchain': {
+                  'rust_toolchain_toml_channel': channel,
+                  'rustc': rustc_version,
+                  'cargo': os.environ['CARGO_VERSION'],
+                  'node': os.environ['NODE_VERSION'],
+                  'npm': os.environ['NPM_VERSION'],
+                  'tauri_cli': os.environ['TAURI_CLI_VERSION'],
+              },
+              'lockfiles': {
+                  path: digest(path)
+                  for path in (
+                      'studio/src-tauri/Cargo.lock',
+                      'studio/package-lock.json',
+                      'studio/frontend/package-lock.json',
+                  )
+              },
+              'pinned_actions': pinned_actions,
+              'pinned_downloads': pinned_downloads,
+          }
+
+          out_dir = pathlib.Path(os.environ['RUNNER_TEMP'], 'build-inputs')
+          out_dir.mkdir(parents=True, exist_ok=True)
+          out = out_dir / f'build-inputs-{record["artifact"]}.json'
+          out.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(out.read_text(encoding='utf-8'))
+          PY
+
+      - name: Upload build input record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          # Deliberately not `desktop-release-*`: publish-release and
+          # virustotal-scan both merge that pattern into the bundle directory,
+          # and a stray JSON there would fail the asset-set contract.
+          name: desktop-build-inputs-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/build-inputs/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
       - name: Stage release assets
         shell: bash
         env:
@@ -1632,8 +1936,15 @@ jobs:
     # publish steps themselves are 17-40s.
     timeout-minutes: 90
     permissions:
-      contents: write  # create the versioned Release and replace updater-channel metadata
-      actions: read    # the waiter reads this run's job list
+      contents: write      # create the versioned Release and replace updater-channel metadata
+      actions: read        # the waiter reads this run's job list
+      # Build provenance, and only here: the workflow-level default stays
+      # `contents: read` and the build matrix keeps no permissions block at all,
+      # so the job that already holds write scope is the one that signs for what
+      # it publishes. `id-token: write` mints the short-lived OIDC token Sigstore
+      # binds the attestation to; `attestations: write` stores the result.
+      id-token: write
+      attestations: write
     env:
       GH_REPO: ${{ github.repository }}
       APP_VERSION: ${{ needs.prepare-version.outputs.app_version }}
@@ -1733,6 +2044,114 @@ jobs:
           path: ${{ runner.temp }}/desktop-release-assets
           merge-multiple: true
 
+      - name: Download build input records
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: desktop-build-inputs-*
+          path: ${{ runner.temp }}/build-inputs
+          merge-multiple: true
+
+      # What the bundles were built from, as a release asset rather than a log
+      # line: the toolchain versions, lockfile digests and pinned tool digests
+      # currently exist only in runner logs, which expire while the binaries stay
+      # downloadable forever. Deliberately not in the release notes -- those are
+      # the maintainer's changelog and the updater popup renders them.
+      #
+      # The merge is also a check. All three legs report the commit they built
+      # and the lockfiles they built with; a leg that disagrees built something
+      # else, and that fails the release here rather than shipping a mixed set.
+      - name: Assemble build-inputs.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          # The matrix legs by `artifact`, same hardcoded list as "Wait for the
+          # build matrix" keeps by `label`. A record short of one leg would
+          # describe a release only partly, and silently.
+          EXPECTED_LEGS = {'macos-aarch64', 'linux-x64', 'windows-x64'}
+
+          record_dir = pathlib.Path(os.environ['RUNNER_TEMP'], 'build-inputs')
+          records = sorted(record_dir.glob('build-inputs-*.json'))
+          if not records:
+              sys.exit('No per-leg build input records were downloaded')
+
+          platforms = {}
+          for path in records:
+              record = json.loads(path.read_text(encoding='utf-8'))
+              key = record.pop('artifact')
+              if key in platforms:
+                  sys.exit(f'Duplicate build input record for {key}')
+              platforms[key] = record
+
+          if set(platforms) != EXPECTED_LEGS:
+              sys.exit(
+                  'Build input records do not cover the build matrix: '
+                  f'missing={sorted(EXPECTED_LEGS - set(platforms))}, '
+                  f'unexpected={sorted(set(platforms) - EXPECTED_LEGS)}'
+              )
+
+          commits = {key: record['commit'] for key, record in platforms.items()}
+          if len(set(commits.values())) != 1:
+              sys.exit(f'Build legs did not all build the same commit: {commits}')
+          lockfiles = {key: record['lockfiles'] for key, record in platforms.items()}
+          if len({json.dumps(value, sort_keys=True) for value in lockfiles.values()}) != 1:
+              sys.exit(f'Build legs did not all build from the same lockfiles: {lockfiles}')
+
+          # Every leg reads these out of its own checkout of this workflow, so
+          # disagreement means the legs were not running the same file.
+          HOISTED = ('commit', 'source_date_epoch', 'lockfiles', 'pinned_actions', 'pinned_downloads')
+          for field in HOISTED:
+              values = {json.dumps(record[field], sort_keys=True) for record in platforms.values()}
+              if len(values) != 1:
+                  sys.exit(f'Build legs did not all agree on {field}: {sorted(values)}')
+
+          shared = next(iter(platforms.values()))
+          build_inputs = {
+              'schema': 'unsloth-desktop-build-inputs/1',
+              'studio_version': os.environ['STUDIO_VERSION'],
+              'app_version': os.environ['APP_VERSION'],
+              'pypi_version': os.environ['PYPI_VERSION'],
+              'release_tag': os.environ['DESKTOP_RELEASE_TAG'],
+              'commit': shared['commit'],
+              'source_date_epoch': shared['source_date_epoch'],
+              'lockfiles': shared['lockfiles'],
+              'pinned_actions': shared['pinned_actions'],
+              'pinned_downloads': shared['pinned_downloads'],
+              'lockfile_digest_note': (
+                  'SHA-256 over each file with CRLF normalised to LF, so the digest is the '
+                  'same on all three runner platforms; on an LF checkout it equals sha256sum. '
+                  'Cargo.lock is hashed after the release version patch, which rewrites the '
+                  'unsloth-studio [[package]] version to app_version and nothing else.'
+              ),
+              'workflow': {
+                  'repository': os.environ['GITHUB_REPOSITORY'],
+                  'ref': os.environ.get('GITHUB_WORKFLOW_REF', ''),
+                  'run_id': os.environ['GITHUB_RUN_ID'],
+                  'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT', ''),
+              },
+              'platforms': {
+                  key: {
+                      name: value
+                      for name, value in record.items()
+                      # Hoisted above; per-leg copies are identical by the checks
+                      # right up there and would only invite them to drift.
+                      if name not in HOISTED
+                  }
+                  for key, record in sorted(platforms.items())
+              },
+          }
+
+          asset_dir = pathlib.Path(os.environ['RUNNER_TEMP'], 'desktop-release-assets')
+          out = asset_dir / 'build-inputs.json'
+          out.write_text(json.dumps(build_inputs, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(out.read_text(encoding='utf-8'))
+          PY
+
       - name: Validate release asset set
         shell: bash
         run: |
@@ -1754,6 +2173,10 @@ jobs:
               f'{base_name}-Ubuntu.deb',
               f'{base_name}-Windows.exe',
               f'{base_name}-Windows.exe.sig',
+              # Not prefixed Unsloth-Desktop-: that prefix is the republish
+              # guard's namespace for bundles, and this is a per-release record,
+              # not a bundle. It is validated, attested and uploaded with them.
+              'build-inputs.json',
           }
           actual_names = {path.name for path in files}
           if actual_names != expected_names:
@@ -1765,6 +2188,28 @@ jobs:
               )
           print('\n'.join(sorted(actual_names)))
           PY
+
+      # ── Build provenance attestation ──
+      # Signs a SLSA provenance statement for every staged asset, binding each
+      # file's digest to this repository, this workflow file, this commit and
+      # this run, via a short-lived Sigstore certificate. Anyone can then check a
+      # downloaded bundle against it:
+      #
+      #   gh attestation verify Unsloth-Desktop-...-MacOS.dmg --repo unslothai/unsloth
+      #
+      # which is the part code signing does not give: an Apple/Azure signature
+      # says Unsloth signed this binary, this says which source and which
+      # workflow run produced it. Runs after the asset set is validated, so
+      # exactly the reviewed set is attested, and before the upload, so nothing
+      # is published without one.
+      #
+      # Gated on a real publish: an attestation is a write to the repository's
+      # attestation store, and a validation-only run must leave no trace.
+      - name: Attest build provenance for the release assets
+        if: ${{ !inputs.draft }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/desktop-release-assets/*
 
       # Validation runs before the scan so an already-used version is rejected
       # before any bundle is disclosed to VirusTotal. Creation remains deferred

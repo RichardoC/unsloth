@@ -105,7 +105,12 @@ jobs:
         # against the npm postinstall-dropper class -- it fires BEFORE any
         # tarball runs, on the injection pattern itself rather than an
         # advisory-DB lookup.
-        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+        # `npm ci`, like release-desktop.yml: it installs strictly from
+        # studio/package-lock.json and cannot rewrite it, where `npm install`
+        # re-resolves and may. Lifecycle scripts still run, so the esbuild
+        # postinstall above is unaffected. studio/package.json exists purely to
+        # hold this pin, so there is nothing else to install.
+        run: npm ci --prefix studio --no-fund --no-audit
 
       - name: Verify pinned Tauri CLI version
         run: |

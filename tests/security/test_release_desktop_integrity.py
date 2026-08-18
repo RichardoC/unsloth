@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -35,6 +37,304 @@ def _step_index(workflow, job, name):
 
 def _step(workflow, job, name):
     return _steps(workflow, job)[_step_index(workflow, job, name)]
+
+
+LOCKFILES = (
+    "studio/src-tauri/Cargo.lock",
+    "studio/package-lock.json",
+    "studio/frontend/package-lock.json",
+)
+
+
+def _lockfile_digest(path: Path) -> str:
+    """Mirror the workflow: hash the source, not the checkout's line endings."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def _fake_lockfile_repo(tmp_path: Path) -> None:
+    """A throwaway checkout carrying the three lockfiles, committed."""
+    contents = {
+        "studio/src-tauri/Cargo.lock": (
+            '[[package]]\nname = "unsloth-studio"\nversion = "0.0.0"\n'
+            '\n[[package]]\nname = "serde"\nversion = "1.0.0"\n'
+        ),
+        "studio/package-lock.json": '{"name": "unsloth-studio-tauri-cli"}\n',
+        "studio/frontend/package-lock.json": '{"name": "unsloth-frontend"}\n',
+    }
+    for relative, text in contents.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents = True, exist_ok = True)
+        path.write_text(text, encoding = "utf-8")
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "add", "-A"],
+        [
+            "git",
+            "-c", "user.email=release@example.invalid",
+            "-c", "user.name=release",
+            "commit", "-qm", "lockfiles",
+        ],
+    ):
+        subprocess.run(command, cwd = tmp_path, check = True, capture_output = True)
+
+
+def test_the_release_installs_from_lockfiles_rather_than_resolving_afresh():
+    """`npm install` re-resolves and may rewrite a lockfile; `npm ci` cannot.
+
+    studio/package.json exists only to hold the Tauri CLI pin, so installing it
+    by name (`npm install --save-dev @tauri-apps/cli@2.10.1`) both ignored that
+    lockfile and mutated the tree it is supposed to reproduce.
+    """
+    build = _workflow()["jobs"]["build"]
+    installs = [
+        line.strip()
+        for step in build["steps"]
+        for line in str(step.get("run", "")).splitlines()
+        if line.strip().startswith(("npm install", "npm ci"))
+    ]
+    assert installs, "the build job installs no npm dependencies at all"
+    for command in installs:
+        assert command.startswith("npm ci"), command
+
+    package = json.loads((REPO_ROOT / "studio" / "package.json").read_text(encoding = "utf-8"))
+    lock = json.loads(
+        (REPO_ROOT / "studio" / "package-lock.json").read_text(encoding = "utf-8")
+    )
+    # `npm ci` installs what the lockfile says, so the pin has to be in both.
+    assert package["devDependencies"]["@tauri-apps/cli"] == "2.10.1"
+    assert lock["packages"]["node_modules/@tauri-apps/cli"]["version"] == "2.10.1"
+    verify = _step(_workflow(), "build", "Verify pinned Tauri CLI")
+    assert "tauri-cli 2.10.1" in verify["run"]
+
+
+def test_the_release_pins_an_exact_node_and_an_exact_rustc():
+    """A major-only pin still floats; the release must name the build.
+
+    The toolchain version is the one that has to agree with
+    studio/src-tauri/rust-toolchain.toml: the action's `toolchain` input
+    defaults to `stable`, so leaving it out installs the cross-compilation
+    targets against stable while rust-toolchain.toml forces the build itself
+    onto the pinned compiler, and the macOS leg loses its Apple std.
+    """
+    steps = _workflow()["jobs"]["build"]["steps"]
+
+    node = next(
+        step for step in steps if str(step.get("uses", "")).startswith("actions/setup-node@")
+    )
+    assert re.fullmatch(r"\d+\.\d+\.\d+", str(node["with"]["node-version"])), node["with"]
+
+    rust = next(
+        step for step in steps if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+    )
+    toolchain = re.search(
+        r'^\s*channel\s*=\s*"([^"]+)"',
+        (REPO_ROOT / "studio" / "src-tauri" / "rust-toolchain.toml").read_text(encoding = "utf-8"),
+        re.M,
+    )
+    assert toolchain, "rust-toolchain.toml declares no channel"
+    assert re.fullmatch(r"\d+\.\d+(?:\.\d+)?", toolchain.group(1)), toolchain.group(1)
+    assert str(rust["with"]["toolchain"]) == toolchain.group(1)
+
+
+def test_the_build_records_the_tag_commit_time_as_source_date_epoch():
+    steps = _workflow()["jobs"]["build"]["steps"]
+    names = [step.get("name") or str(step.get("uses")) for step in steps]
+    export = _step(_workflow(), "build", "Export SOURCE_DATE_EPOCH from the tag commit")
+
+    # The tag commit's committer timestamp: a property of the source, not of
+    # when the runner happened to start.
+    assert "git log -1 --format=%ct" in export["run"]
+    assert 'echo "SOURCE_DATE_EPOCH=$epoch" >> "$GITHUB_ENV"' in export["run"]
+
+    checkout = next(
+        index for index, step in enumerate(steps) if "actions/checkout" in str(step.get("uses", ""))
+    )
+    # After the checkout it reads from, and before anything it could influence.
+    assert checkout < names.index("Export SOURCE_DATE_EPOCH from the tag commit")
+    first_build = min(
+        index
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("tauri-apps/tauri-action@")
+    )
+    assert names.index("Export SOURCE_DATE_EPOCH from the tag commit") < first_build
+
+
+def test_a_lockfile_the_build_rewrote_fails_the_release():
+    """Both halves of the check, and where they sit.
+
+    The snapshot has to be taken after both npm installs (so an install that
+    rewrote a lockfile is caught) and after the version patch (the one
+    sanctioned Cargo.lock mutation, so it is not mistaken for drift). The
+    verification has to run after every bundle is built and before anything is
+    staged for release.
+    """
+    workflow = _workflow()
+    steps = workflow["jobs"]["build"]["steps"]
+    names = [step.get("name") or str(step.get("uses")) for step in steps]
+
+    snapshot = names.index("Snapshot lockfile digests")
+    verify = names.index("Verify the build rewrote no lockfile")
+    assert names.index("Install pinned Tauri CLI") < snapshot
+    assert names.index("Install frontend dependencies") < snapshot
+    assert names.index("Patch desktop app version") < snapshot
+    build_steps = [
+        index
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("tauri-apps/tauri-action@")
+        or step.get("name") == "Build and sign thin Linux AppImage"
+    ]
+    assert snapshot < min(build_steps)
+    assert max(build_steps) < verify
+    assert verify < names.index("Stage release assets")
+
+    snapshot_run = _step(workflow, "build", "Snapshot lockfile digests")["run"]
+    verify_run = _step(workflow, "build", "Verify the build rewrote no lockfile")["run"]
+    for run in (snapshot_run, verify_run):
+        # The two npm lockfiles are never patched, so HEAD stays their baseline.
+        assert (
+            "git diff --exit-code -- studio/package-lock.json studio/frontend/package-lock.json"
+            in run
+        )
+    for lockfile in LOCKFILES:
+        assert lockfile in snapshot_run, lockfile
+    # Cargo.lock's baseline is the snapshot the patch step's successor wrote,
+    # which is also what makes the check fail closed when it is missing.
+    assert "lockfile-digests.json" in snapshot_run
+    assert "lockfile-digests.json" in verify_run
+
+
+def test_the_lockfile_snapshot_only_tolerates_the_release_version_patch(tmp_path):
+    workflow = _workflow()
+    _fake_lockfile_repo(tmp_path)
+    cargo_lock = tmp_path / "studio" / "src-tauri" / "Cargo.lock"
+
+    # Unpatched: the version already matches, so there is nothing to allow.
+    result, _ = _run_step(workflow, "build", "Snapshot lockfile digests", tmp_path)
+    assert result.returncode == 0, result.stderr
+    snapshot = json.loads((tmp_path / "lockfile-digests.json").read_text(encoding = "utf-8"))
+    assert set(snapshot) == set(LOCKFILES)
+    assert snapshot["studio/src-tauri/Cargo.lock"] == _lockfile_digest(cargo_lock)
+
+    # Patched exactly as "Patch desktop app version" does it.
+    cargo_lock.write_text(
+        cargo_lock.read_text(encoding = "utf-8").replace(
+            'name = "unsloth-studio"\nversion = "0.0.0"',
+            'name = "unsloth-studio"\nversion = "0.1.50"',
+        ),
+        encoding = "utf-8",
+    )
+    result, _ = _run_step(workflow, "build", "Snapshot lockfile digests", tmp_path)
+    assert result.returncode == 0, result.stderr
+
+    # A dependency swapped in beside it is not the version patch.
+    cargo_lock.write_text(
+        cargo_lock.read_text(encoding = "utf-8").replace(
+            'name = "serde"\nversion = "1.0.0"',
+            'name = "serde"\nversion = "9.9.9"',
+        ),
+        encoding = "utf-8",
+    )
+    result, _ = _run_step(workflow, "build", "Snapshot lockfile digests", tmp_path)
+    assert result.returncode == 1
+    assert "more than the release version patch" in result.stderr
+
+    # And an npm lockfile the install rewrote fails before Cargo.lock is read.
+    _fake_lockfile_repo_reset = tmp_path / "studio" / "package-lock.json"
+    _fake_lockfile_repo_reset.write_text('{"name": "rewritten"}\n', encoding = "utf-8")
+    result, _ = _run_step(workflow, "build", "Snapshot lockfile digests", tmp_path)
+    assert result.returncode == 1
+
+
+def test_the_post_build_check_catches_a_rewritten_lockfile(tmp_path):
+    workflow = _workflow()
+    _fake_lockfile_repo(tmp_path)
+    snapshot = {
+        lockfile: _lockfile_digest(tmp_path / lockfile) for lockfile in LOCKFILES
+    }
+    digests = tmp_path / "lockfile-digests.json"
+    digests.write_text(json.dumps(snapshot), encoding = "utf-8")
+
+    result, _ = _run_step(workflow, "build", "Verify the build rewrote no lockfile", tmp_path)
+    assert result.returncode == 0, result.stderr
+
+    # Cargo.lock is measured against the post-patch snapshot, not HEAD, so a
+    # build that re-resolved it is caught even though the patch step made it
+    # differ from the tag.
+    cargo_lock = tmp_path / "studio" / "src-tauri" / "Cargo.lock"
+    cargo_lock.write_text(
+        cargo_lock.read_text(encoding = "utf-8").replace('version = "1.0.0"', 'version = "9.9.9"'),
+        encoding = "utf-8",
+    )
+    result, _ = _run_step(workflow, "build", "Verify the build rewrote no lockfile", tmp_path)
+    assert result.returncode == 1
+    assert "The build rewrote a lockfile" in result.stderr
+
+    # A missing snapshot must fail closed rather than read as "nothing changed".
+    digests.unlink()
+    result, _ = _run_step(workflow, "build", "Verify the build rewrote no lockfile", tmp_path)
+    assert result.returncode == 1
+    assert "No lockfile digest snapshot" in result.stderr
+
+
+def test_the_build_inputs_record_never_joins_the_release_asset_artifacts():
+    """publish-release and virustotal-scan both merge `desktop-release-*`.
+
+    A per-leg JSON landing in that namespace would be merged into the bundle
+    directory and fail the exact-set contract, so it travels under its own name.
+    """
+    workflow = _workflow()
+    upload = _step(workflow, "build", "Upload build input record")
+    assert upload["with"]["name"] == "desktop-build-inputs-${{ matrix.artifact }}"
+    assert not upload["with"]["name"].startswith("desktop-release-")
+    assert upload["with"]["if-no-files-found"] == "error"
+
+    download = _step(workflow, "publish-release", "Download build input records")
+    assert download["with"]["pattern"] == "desktop-build-inputs-*"
+
+    # Assembled into the asset directory before the set is validated, so the
+    # exact-set check covers the record too.
+    names = [step.get("name") for step in _steps(workflow, "publish-release")]
+    assert names.index("Download build input records") < names.index("Assemble build-inputs.json")
+    assert names.index("Assemble build-inputs.json") < names.index("Validate release asset set")
+
+    assemble = _step(workflow, "publish-release", "Assemble build-inputs.json")["run"]
+    # Every leg has to agree on what it built, or the release is a mixed set.
+    assert "did not all build the same commit" in assemble
+    assert "did not all build from the same lockfiles" in assemble
+
+    # And every leg has to be represented, or the record describes the release
+    # only partly. The list is hardcoded, like the wait step's, so tie it to the
+    # matrix here: enabling a leg must not be discoverable an hour into a run.
+    legs = {
+        entry["artifact"]
+        for entry in workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
+    }
+    declared = re.search(r"EXPECTED_LEGS = \{([^}]*)\}", assemble)
+    assert declared, assemble
+    assert {
+        value.strip().strip("'") for value in declared.group(1).split(",") if value.strip()
+    } == legs
+    for field in ("pypi_version", "commit", "source_date_epoch", "lockfiles"):
+        assert field in assemble, field
+
+    # Everything the release was built with, in the one place that outlives the
+    # runner logs: toolchain versions, lockfile digests and the pinned tool
+    # digests and action SHAs, read out of the workflow itself so a bumped pin
+    # cannot be recorded as the old one.
+    record = _step(workflow, "build", "Record build inputs")["run"]
+    for probe in (
+        "rustc -V",
+        "cargo -V",
+        "node -v",
+        "npm -v",
+        "tauri --version",
+        "git rev-parse HEAD",
+        "pinned_actions",
+        "pinned_downloads",
+        "_SHA256",
+        "ImageVersion",
+    ):
+        assert probe in record, probe
 
 
 def test_windows_release_build_restores_but_does_not_save_rust_cache():
@@ -167,6 +467,11 @@ def _stage_assets(tmp_path: Path) -> dict[str, str]:
         ("Unsloth-Desktop-0_1_50_beta-Linux.AppImage.sig", signature),
         ("Unsloth-Desktop-0_1_50_beta-Windows.exe", b"installer"),
         ("Unsloth-Desktop-0_1_50_beta-Windows.exe.sig", signature),
+        # Assembled from the three legs' records before the asset set is
+        # validated, so it is on disk for every step that follows. Mirrors
+        # "Validate release asset set" -- see the test below, which runs that
+        # step against exactly this directory.
+        ("build-inputs.json", b'{"schema": "unsloth-desktop-build-inputs/1"}'),
     ):
         (asset_dir / name).write_bytes(payload)
         if not name.endswith(".sig"):
@@ -379,6 +684,11 @@ def test_a_validation_only_run_touches_nothing_public():
     steps = _workflow()["jobs"]["publish-release"]["steps"]
     names = [step.get("name") for step in steps]
     mutating = (
+        # An attestation is a write too: it publishes a signed statement about
+        # these files into the repository's attestation store, where `gh
+        # attestation verify` finds it. A validation-only run must leave no
+        # record that a release happened, so it is gated like the uploads.
+        "Attest build provenance for the release assets",
         "Publish versioned release assets",
         "Publish versioned updater metadata",
         "Promote normal release to GitHub latest",
@@ -389,8 +699,58 @@ def test_a_validation_only_run_touches_nothing_public():
 
     # Promotion last, so latest only moves once the assets are actually on the
     # release and a partial upload cannot leave latest pointing at an empty one.
-    for upload in mutating[:2]:
-        assert names.index(upload) < names.index(mutating[2])
+    for earlier in mutating[:-1]:
+        assert names.index(earlier) < names.index(mutating[-1])
+
+
+def test_every_published_asset_is_attested_before_it_is_uploaded():
+    """The attestation is what lets a third party check where a bundle came from.
+
+    It has to cover the validated set and nothing else, so it runs after
+    "Validate release asset set" (which is an exact-set check, so an extra file
+    cannot ride along) and before the upload, so no file reaches the release
+    without one.
+    """
+    workflow = _workflow()
+    names = [step.get("name") for step in _steps(workflow, "publish-release")]
+    attest = names.index("Attest build provenance for the release assets")
+    assert names.index("Validate release asset set") < attest
+    assert attest < names.index("Publish versioned release assets")
+
+    # Same directory the upload reads from, so the subjects are the files that
+    # are published rather than a separately assembled list.
+    step = _step(workflow, "publish-release", "Attest build provenance for the release assets")
+    assert step["with"]["subject-path"] == "${{ runner.temp }}/desktop-release-assets/*"
+    upload = _step(workflow, "publish-release", "Publish versioned release assets")
+    assert '"$RUNNER_TEMP/desktop-release-assets"/*' in upload["run"]
+
+
+def test_the_asset_set_validator_accepts_exactly_the_staged_set(tmp_path):
+    """The exact-set check and the fixture above must not drift apart.
+
+    "Validate release asset set" is the gate that stops an unexpected file being
+    published beside the bundles, so run the real step against the staged
+    directory: it passes on exactly that set, and fails on one file more or one
+    file fewer.
+    """
+    workflow = _workflow()
+
+    _stage_assets(tmp_path)
+    result, _ = _run_step(workflow, "publish-release", "Validate release asset set", tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "build-inputs.json" in result.stdout
+
+    assets = tmp_path / "desktop-release-assets"
+    (assets / "unexpected.txt").write_text("stowaway", encoding = "utf-8")
+    result, _ = _run_step(workflow, "publish-release", "Validate release asset set", tmp_path)
+    assert result.returncode == 1
+    assert "unexpected=['unexpected.txt']" in result.stderr
+    (assets / "unexpected.txt").unlink()
+
+    (assets / "build-inputs.json").unlink()
+    result, _ = _run_step(workflow, "publish-release", "Validate release asset set", tmp_path)
+    assert result.returncode == 1
+    assert "missing=['build-inputs.json']" in result.stderr
 
 
 def test_the_guard_rejects_a_prerelease_target_before_anything_is_built():
