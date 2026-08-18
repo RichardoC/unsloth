@@ -3393,6 +3393,51 @@ if not _TORCH_BACKEND:
         _TORCH_BACKEND = "cuda"
 
 
+# -- Backend version pin --------------------------------------------------------
+# UNSLOTH_BACKEND_VERSION is the same input install.sh reads: a desktop release
+# build stamps its backend version (release-desktop.yml -> install.rs ->
+# update.rs) so one .dmg only ever installs one Python stack. install.sh already
+# pins the FRESH install, but it hands this script SKIP_STUDIO_BASE=1, so the
+# core-package installs below are the ones the UPDATE path takes -- and
+# `unsloth studio update` pops SKIP_STUDIO_BASE (unsloth_cli/commands/studio.py).
+# Without this, the desktop's own update button walks a pinned install forward to
+# whatever PyPI serves that day, which is exactly the drift the pin exists to stop.
+# Empty (the `curl | sh` CLI user, CI, and unstamped dev builds) = today's
+# floating "track the newest" behavior, unchanged.
+_BACKEND_VERSION_ENV = "UNSLOTH_BACKEND_VERSION"
+# release[pre][post][dev], the PEP 440 subset install.sh's grep accepts. Used with
+# re.fullmatch, never `$`: `$` also matches just before a trailing newline, which
+# would let "2026.8.18\n--index-url http://evil" through as a "valid" version.
+_BACKEND_VERSION_RE = re.compile(r"[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?")
+
+
+def _backend_version_pin(raw: "str | None" = None) -> str:
+    """Return the validated exact backend version to pin to, or "" for unpinned.
+
+    Two gates, mirroring install.sh: a character allow-list that rejects anything
+    outside [0-9a-z.] -- whitespace, newlines, `=`, `-` and `/` included, so the
+    value cannot smuggle a second argument (`--index-url ...`) or a second
+    requirement into the argv it is concatenated into -- and then the shape check.
+    The value is NOT stripped, for the same reason install.sh does not strip it:
+    a version that needs trimming is a version that came from somewhere unexpected.
+
+    Raises ValueError on a malformed value rather than falling back to unpinned:
+    silently ignoring it would turn a typo'd pin into a floating install, which is
+    the failure this whole mechanism exists to prevent.
+    """
+    value = os.environ.get(_BACKEND_VERSION_ENV, "") if raw is None else raw
+    if not value:
+        return ""
+    if not _BACKEND_VERSION_RE.fullmatch(value) or any(
+        char not in "0123456789abcdefghijklmnopqrstuvwxyz." for char in value
+    ):
+        raise ValueError(
+            f"{_BACKEND_VERSION_ENV} must be a PEP 440 release version "
+            f"(e.g. 2026.8.18); got: {value!r}"
+        )
+    return value
+
+
 def _torch_step_label(suffix: str) -> str:
     """Return a progress label like 'torch check (cuda)' using the known backend.
 
@@ -4280,6 +4325,28 @@ def install_python_stack() -> int:
     package_name = os.environ.get("STUDIO_PACKAGE_NAME", "unsloth")
     # --local overlays a local repo checkout after updating deps.
     local_repo = os.environ.get("STUDIO_LOCAL_REPO", "")
+    # Exact backend version to install, or "" for today's floating behavior. Read
+    # (and validated) before anything mutates the venv, so a malformed pin stops
+    # the run instead of half-installing behind a spec nobody meant to write.
+    try:
+        backend_version = _backend_version_pin()
+    except ValueError as error:
+        _safe_print(f"error: {error}", file = sys.stderr)
+        return 1
+    # The two spellings the core-package sites below need. Built once so the pinned
+    # and unpinned shapes cannot drift apart across the branches.
+    #   unsloth_spec        -- the requirement to install (honors STUDIO_PACKAGE_NAME)
+    #   unsloth_upgrade_args-- the `--upgrade-package` pair, or nothing when pinned.
+    # --upgrade-package exists to tell uv "ignore what is installed, take the
+    # newest"; an exact ==requirement already admits exactly one version, so the
+    # flag decides nothing and would leave a command reading as "upgrade" and
+    # "hold" at once. Dropped for unsloth exactly as install.sh drops it -- and
+    # NOT for unsloth-zoo, which stays a floor because no zoo version is stamped
+    # anywhere. The exact unsloth constrains zoo through its own metadata.
+    unsloth_spec = f"{package_name}=={backend_version}" if backend_version else package_name
+    unsloth_upgrade_args: tuple[str, ...] = (
+        () if backend_version else ("--upgrade-package", package_name)
+    )
     # +1 for the anyio repair check (step 8b), +1 for the diffusers pin (step 11b, every platform)
     base_total = 12 if IS_WINDOWS else 13
     if IS_MACOS:
@@ -4387,11 +4454,10 @@ def install_python_stack() -> int:
             f"Updating {package_name} + unsloth-zoo (no-torch mode)",
             "--no-cache-dir",
             "--no-deps",
-            "--upgrade-package",
-            package_name,
+            *unsloth_upgrade_args,
             "--upgrade-package",
             "unsloth-zoo",
-            package_name,
+            unsloth_spec,
             "unsloth-zoo",
         )
         # Resolve pydantic WITH deps so pip pins pydantic-core to the exact version
@@ -4430,6 +4496,9 @@ def install_python_stack() -> int:
     elif local_repo:
         # Local dev install: update the released core packages, then overlay the
         # checkout as an editable install (--no-deps so torch is not re-resolved).
+        # Deliberately ignores the backend pin, as install.sh's --local branch does:
+        # the editable overlay two calls down is the version the developer asked
+        # for, so an ==pin here would only decide which wheel gets thrown away.
         _progress("base packages")
         pip_install(
             "Updating core packages",
@@ -4465,7 +4534,7 @@ def install_python_stack() -> int:
         pip_install(
             f"Installing {package_name}",
             "--no-cache-dir",
-            package_name,
+            unsloth_spec,
         )
     else:
         # Update path: upgrade only unsloth + unsloth-zoo, preserving existing
@@ -4475,11 +4544,10 @@ def install_python_stack() -> int:
         pip_install(
             "Updating core packages",
             "--no-cache-dir",
-            "--upgrade-package",
-            "unsloth",
+            *unsloth_upgrade_args,
             "--upgrade-package",
             "unsloth-zoo",
-            "unsloth",
+            unsloth_spec,
             "unsloth-zoo",
         )
 

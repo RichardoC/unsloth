@@ -55,6 +55,26 @@ fn configure_tauri_update_environment(cmd: &mut Command) {
     cmd.env_remove("STUDIO_HOME");
     cmd.env("UNSLOTH_TAURI_UPDATE", "1");
     cmd.env("SKIP_STUDIO_FRONTEND", "1");
+
+    // Same pin install.rs hands the fresh install, for the same reason: one .dmg
+    // must install one Python stack. install.sh pins the FIRST install and then
+    // hands install_python_stack.py SKIP_STUDIO_BASE=1, but `unsloth studio update`
+    // -- which is exactly what this command runs -- pops that variable, so the
+    // update takes the core-package branch that reinstalls unsloth + unsloth-zoo.
+    // Left unset, the desktop's own Update and Repair buttons would walk a pinned
+    // install forward to whatever PyPI serves that day.
+    //
+    // Deliberately `option_env!` on its own and NOT
+    // preflight::version::expected_backend_version(), whose `.unwrap_or(
+    // MIN_DESKTOP_BACKEND_VERSION)` floor is right for staleness checks and wrong
+    // here: an unstamped local or CI build would be pinned to a long-stale floor
+    // instead of keeping today's track-the-newest behavior. Only release builds
+    // are stamped (.github/workflows/release-desktop.yml).
+    // Scrubbed first so an inherited value can never out-rank the stamp.
+    cmd.env_remove("UNSLOTH_BACKEND_VERSION");
+    if let Some(backend_version) = option_env!("UNSLOTH_DESKTOP_BACKEND_VERSION") {
+        cmd.env("UNSLOTH_BACKEND_VERSION", backend_version);
+    }
 }
 
 fn spawn_update(
@@ -492,6 +512,32 @@ mod tests {
             assert!(cmd.get_envs().any(|(key, value)| {
                 key == OsStr::new(name) && value == Some(OsStr::new(expected))
             }));
+        }
+    }
+
+    #[test]
+    fn tauri_backend_update_carries_the_build_time_backend_pin() {
+        // `unsloth studio update` pops SKIP_STUDIO_BASE, so this command is the one
+        // that reinstalls unsloth + unsloth-zoo. Unpinned it would undo the pin
+        // install.sh applied at install time.
+        use std::ffi::OsStr;
+
+        let mut cmd = Command::new("unused");
+        configure_tauri_update_environment(&mut cmd);
+
+        let pin = cmd
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("UNSLOTH_BACKEND_VERSION"))
+            .map(|(_, value)| value);
+        assert!(
+            pin.is_some(),
+            "the update command must decide UNSLOTH_BACKEND_VERSION rather than inherit it"
+        );
+        // Stamped builds pin; every other build scrubs and pins nothing, keeping
+        // today's track-the-newest update. Never the MIN_DESKTOP_BACKEND_VERSION floor.
+        match option_env!("UNSLOTH_DESKTOP_BACKEND_VERSION") {
+            Some(stamped) => assert_eq!(pin.unwrap(), Some(OsStr::new(stamped))),
+            None => assert_eq!(pin.unwrap(), None),
         }
     }
 
