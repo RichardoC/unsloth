@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Validates the Homebrew cask draft in studio/packaging/homebrew/ the same way
+# Homebrew/homebrew-cask will validate it, on the only platform that can: an
+# Apple Silicon macOS runner with Homebrew already installed.
+#
+# tests/security/test_homebrew_cask_contract.py checks that the cask still
+# agrees with tauri.conf.json, release-desktop.yml and scripts/uninstall.sh.
+# It cannot check the things that need Homebrew and a real download:
+#
+#   - brew style / brew audit acceptance (the evidence a cask PR must carry)
+#   - that the url the cask builds actually resolves and matches its sha256
+#   - that the installed bundle really is Unsloth.app, arm64, signed, and
+#     notarized well enough for Gatekeeper to admit it
+#   - that livecheck reads a version out of latest.json
+#   - that `brew uninstall --zap` removes what we claim and leaves the
+#     Hugging Face model cache alone
+#
+# So this workflow installs the shipped DMG for real and then zaps it.
+#
+# Trigger notes: no `branches:` filter on `push`. The paths below change about
+# once per desktop release, so the cost is negligible, and a topic branch
+# preparing a cask bump needs this evidence before a PR exists -- that evidence
+# is the whole point of the workflow. The macOS leg is a single job to stay
+# clear of the account-wide five-concurrent-macOS-job cap.
+
+name: Homebrew cask CI
+
+on:
+  pull_request:
+    paths:
+      - 'studio/packaging/homebrew/**'
+      - '.github/workflows/homebrew-cask-ci.yml'
+      - 'tests/security/test_homebrew_cask_contract.py'
+      # The cask mirrors facts owned by these three files, so a change to any
+      # of them can invalidate it.
+      - 'studio/src-tauri/tauri.conf.json'
+      - 'scripts/uninstall.sh'
+  push:
+    paths:
+      - 'studio/packaging/homebrew/**'
+      - '.github/workflows/homebrew-cask-ci.yml'
+      - 'tests/security/test_homebrew_cask_contract.py'
+      - 'studio/src-tauri/tauri.conf.json'
+      - 'scripts/uninstall.sh'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  cask:
+    name: brew audit, install and zap (Apple Silicon)
+    # macos-15 is arm64, which is what the cask's `depends_on arch: :arm64`
+    # requires. An Intel runner would correctly refuse to install.
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      CASK_FILE: studio/packaging/homebrew/unsloth-studio.rb
+      CASK_TOKEN: unsloth-studio
+      TAP: unsloth/cask-ci
+      # Keep Homebrew quiet and non-interactive, and stop it reading the
+      # published cask of the same name out of the API instead of ours.
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+      HOMEBREW_NO_INSTALL_FROM_API: 1
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Report the environment under test
+        run: |
+          set -euxo pipefail
+          sw_vers
+          uname -m
+          brew --version
+
+      # Cheap, and it is the gate that keeps the cask honest about the rest of
+      # the tree. Running it here means one red check covers both halves.
+      - name: Run the cask contract test
+        run: |
+          set -euxo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pytest
+          python3 -m pytest tests/security/test_homebrew_cask_contract.py -v
+
+      # brew audit --new and brew livecheck resolve a cask by token out of a
+      # tap, which is also how homebrew-cask will see this file. Auditing a
+      # bare path skips some of those checks, so build a throwaway tap.
+      - name: Stage the cask in a throwaway tap
+        run: |
+          set -euxo pipefail
+          brew tap-new "$TAP" --no-git
+          tap_dir="$(brew --repository "$TAP")"
+          mkdir -p "$tap_dir/Casks"
+          # Mirroring drops the license header, exactly as the runbook says.
+          grep -v '^#' "$CASK_FILE" | sed '/./,$!d' > "$tap_dir/Casks/$CASK_TOKEN.rb"
+          # A tap must be a git repo for Homebrew to treat it as one, and
+          # `brew audit --new` diffs against HEAD to find the new cask.
+          git -C "$tap_dir" init --quiet --initial-branch=main
+          git -C "$tap_dir" -c user.name=ci -c user.email=ci@local add -A
+          git -C "$tap_dir" -c user.name=ci -c user.email=ci@local commit --quiet -m "cask under test"
+          echo "TAP_DIR=$tap_dir" >> "$GITHUB_ENV"
+          cat "$tap_dir/Casks/$CASK_TOKEN.rb"
+
+      - name: brew style
+        run: brew style "$TAP_DIR/Casks/$CASK_TOKEN.rb"
+
+      - name: brew audit (strict, online)
+        run: brew audit --cask --strict --online "$TAP/$CASK_TOKEN"
+
+      # The acceptance gate for a brand-new cask. Kept required: if this cannot
+      # pass, the cask is not submittable and this workflow should say so.
+      - name: brew audit --new
+        run: brew audit --cask --new --online "$TAP/$CASK_TOKEN"
+
+      # Proves the url the cask builds from `version` actually resolves and
+      # hashes to the pinned sha256. A bad checksum fails here.
+      - name: brew install --cask
+        run: brew install --cask --verbose "$TAP/$CASK_TOKEN"
+
+      - name: Verify the installed bundle is what the cask promises
+        run: |
+          set -euxo pipefail
+          app="/Applications/Unsloth.app"
+          test -d "$app"
+
+          exe="$app/Contents/MacOS/unsloth-studio"
+          test -x "$exe"
+          # arm64 only: the release matrix builds no Intel leg, which is why the
+          # cask declares `depends_on arch: :arm64`.
+          file "$exe" | tee /dev/stderr | grep -q 'arm64'
+          if lipo -archs "$exe" | grep -qw x86_64; then
+            echo "::error::binary carries an x86_64 slice; revisit depends_on arch:" >&2
+            exit 1
+          fi
+
+          plist="$app/Contents/Info.plist"
+          for key in CFBundleIdentifier CFBundleName CFBundleShortVersionString; do
+            echo "$key = $(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")"
+          done
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = 'ai.unsloth.studio'
+
+          # The bundle version must equal the cask's `version`, or the cask is
+          # advertising something other than what it installs.
+          cask_version="$(brew info --cask --json=v2 "$TAP/$CASK_TOKEN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["casks"][0]["version"])')"
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+          test "$cask_version" = "$bundle_version"
+
+      # release-desktop.yml signs, notarizes and staples. Verify that held for
+      # the artifact users actually download: a stapled ticket is what lets
+      # Gatekeeper admit the app on a machine that has never seen it.
+      - name: Verify signature, notarization and Gatekeeper acceptance
+        run: |
+          set -euxo pipefail
+          app="/Applications/Unsloth.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --verbose=4 "$app" 2>&1 | grep -E 'Authority|TeamIdentifier|Timestamp'
+          # Fails unless a notarization ticket is stapled into the bundle.
+          xcrun stapler validate -v "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+
+      - name: brew livecheck
+        run: |
+          set -euxo pipefail
+          # Reads latest.json, not the releases atom feed. Prints the newest
+          # version the updater manifest is advertising.
+          brew livecheck --cask --verbose "$TAP/$CASK_TOKEN" | tee livecheck.txt
+          grep -Eq '[0-9]+\.[0-9]+\.[0-9]+' livecheck.txt
+
+      - name: brew uninstall --zap
+        run: |
+          set -euxo pipefail
+          # Seed a model cache and a stray file under ~/.unsloth so we can prove
+          # zap takes the app's state and leaves the shared cache alone.
+          mkdir -p "$HOME/.cache/huggingface/hub" "$HOME/.unsloth/studio"
+          date > "$HOME/.cache/huggingface/hub/sentinel"
+          date > "$HOME/.unsloth/studio/sentinel"
+
+          brew uninstall --zap --cask --verbose "$TAP/$CASK_TOKEN"
+
+          test ! -d /Applications/Unsloth.app
+          test ! -e "$HOME/.unsloth/studio/sentinel"
+          # The cask deliberately never zaps the Hugging Face cache: it is
+          # shared with every other Hugging Face tool and is usually many GB.
+          test -f "$HOME/.cache/huggingface/hub/sentinel"
+
+      - name: Re-audit after uninstall
+        if: always()
+        run: brew list --cask || true
