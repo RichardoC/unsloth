@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# Python lock freshness.
+#
+# studio/backend/requirements/locks/ holds machine-generated, fully-hashed
+# resolutions of every torch-independent install step. install_python_stack.py
+# installs them with `--require-hashes`, so those wheels are checked against
+# digests that went through code review instead of being re-resolved from PyPI on
+# the user's machine.
+#
+# That property survives exactly as long as the locks match the requirements files
+# they were generated from. A pin bumped in studio.txt with the lock left alone is
+# the failure mode: the lock still verifies, cleanly, against the OLD version, so
+# the edit silently does nothing and nothing looks wrong. This lane closes that by
+# regenerating every lock from scratch and failing if the result differs from what
+# is committed.
+#
+# It is a pure re-run of scripts/gen_python_locks.sh --check, which:
+#   * refuses to run on any uv but install.sh's UV_PINNED_VERSION, so the diff can
+#     never be "a different resolver";
+#   * pins the index with --exclude-newer, so a new upstream release cannot turn
+#     this job red on a day nobody touched the repo -- only an actual requirements
+#     edit, or a deliberate cutoff bump, moves a lock;
+#   * writes to a temp directory and diffs, so it never mutates the checkout.
+#
+# Deliberately separate from studio-backend-ci.yml and security-audit.yml: this
+# needs network access to PyPI's metadata (it re-resolves ~290 packages) and it is
+# the only job here that does, so it carries its own narrow egress allowlist rather
+# than widening a broader job's.
+#
+# Not a substitute for review of the diff itself. This proves the lock matches the
+# requirements file; a human still has to look at which versions and digests moved.
+
+name: Python lock freshness
+
+on:
+  pull_request:
+    paths:
+      - 'studio/backend/requirements/**'
+      - 'scripts/gen_python_locks.sh'
+      - 'studio/install_python_stack.py'
+      - 'install.sh'
+      - '.github/workflows/python-lock-freshness.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'studio/backend/requirements/**'
+      - 'scripts/gen_python_locks.sh'
+      - 'studio/install_python_stack.py'
+      - 'install.sh'
+      - '.github/workflows/python-lock-freshness.yml'
+  workflow_dispatch:
+
+concurrency:
+  # The event is part of the group so a push to main and a PR run cannot coalesce,
+  # matching lockfile-audit.yml: both resolve to refs/heads/main on a merge, and the
+  # default single-slot pending queue would otherwise drop one of them.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  # Latest-only on a PR branch; on main a running job is protected (GitHub still
+  # drops PENDING runs in the group when a newer one queues).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lock-freshness:
+    name: locks match their requirements files
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden runner (egress block)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: block
+          disable-sudo: true
+          # PyPI, plus what checkout itself needs. The locks cover the
+          # torch-independent steps, whose closures resolve entirely from PyPI:
+          # nothing here fetches a git ref or a source archive, and every locked
+          # closure resolves under `--only-binary :all:`, so no sdist gets built and
+          # no interpreter gets downloaded either (verified: the full regeneration
+          # reproduces byte-identically with UV_PYTHON_DOWNLOADS=never and a cold
+          # cache). The step below sets that variable so this stays true rather than
+          # merely being true today.
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # From PyPI rather than a setup action, at exactly install.sh's
+      # UV_PINNED_VERSION, read out of install.sh so this file cannot drift from it.
+      # gen_python_locks.sh re-checks the version and refuses to generate under any
+      # other, so a wrong pin here fails loudly rather than producing a wrong diff.
+      - name: Install the pinned uv
+        run: |
+          set -euo pipefail
+          uv_version="$(sed -n 's/^UV_PINNED_VERSION="\([^"]*\)".*/\1/p' install.sh | head -n 1)"
+          if [ -z "$uv_version" ]; then
+            echo "could not read UV_PINNED_VERSION out of install.sh" >&2
+            exit 1
+          fi
+          echo "installing uv $uv_version"
+          python3 -m pip install --disable-pip-version-check "uv==$uv_version"
+
+      - name: Regenerate the locks and diff against the tree
+        env:
+          # A managed-CPython download would reach a GitHub release host the egress
+          # policy above does not allow, and would mean a locked closure had acquired
+          # an sdist that needs building to resolve. Fail on that rather than let the
+          # lane quietly grow a second network dependency.
+          UV_PYTHON_DOWNLOADS: never
+        run: bash scripts/gen_python_locks.sh --check

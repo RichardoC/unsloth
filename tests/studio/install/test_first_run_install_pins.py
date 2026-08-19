@@ -380,7 +380,21 @@ class TestInstallerAppliesThePins:
     def test_pip_is_bootstrapped_at_the_pinned_version(self):
         runs, _ = _mac_arm_install({})
         argv = _pip_bootstrap_argv(runs)
-        assert f"pip=={ips._PIP_BOOTSTRAP_VERSION}" in argv, argv
+        want = f"pip=={ips._PIP_BOOTSTRAP_VERSION}"
+        if want in argv:
+            pass  # the pre-lock shape: the spec itself is on the command line
+        else:
+            # The hash-verified shape. The pin still has to reach pip, so the lock the
+            # step installs from must name exactly this version -- and, being a lock,
+            # back it with a digest. A lock naming a different version is a stale lock
+            # silently overriding the bump; _pip_bootstrap_lock() refuses one, and this
+            # asserts the same thing from the argv end.
+            assert "--require-hashes" in argv, argv
+            lock = Path(argv[argv.index("-r") + 1])
+            assert lock.name == "pip-bootstrap.lock.txt", argv
+            text = lock.read_text(encoding = "utf-8")
+            assert want in text, f"{lock} does not pin {want}"
+            assert re.search(r"--hash=sha256:[0-9a-f]{64}", text), f"{lock} has no digest"
         assert argv[-1] != "pip", f"bootstrap still installs unpinned pip: {argv}"
 
     def test_mlx_step_installs_the_bounded_specs(self):

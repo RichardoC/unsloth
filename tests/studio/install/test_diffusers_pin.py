@@ -116,7 +116,11 @@ def test_the_pin_step_runs_after_every_other_requirements_install():
     """Ordering matters: a later `uv pip install -r ...` can re-resolve diffusers back to a
     release. Keeping the pin last means nothing is left that could walk it forward."""
     source = STACK.read_text(encoding = "utf-8")
-    pin_at = source.index("diffusers-pin.txt")
+    # The install SITE, not the first mention of the name. install_python_stack.py also
+    # names diffusers-pin.txt in UNLOCKED_REQUIREMENTS (recording why it has no
+    # hash-verified lock), which sits above pip_install and so above every step -- an
+    # `index("diffusers-pin.txt")` would anchor there and read every step as later.
+    pin_at = source.index('REQ_ROOT / "diffusers-pin.txt"')
     later = [
         name
         for name in (
