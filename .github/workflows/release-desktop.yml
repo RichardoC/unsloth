@@ -720,6 +720,97 @@ jobs:
           if (chmodIdx !== -1 && Math.max(...sha256Indexes) > chmodIdx) {
             throw new Error('Desktop Linux release must verify the AppImage toolchain before chmod +x');
           }
+
+          // ── The WebView2 bootstrapper the NSIS installer embeds ──
+          // Same shape as the AppImage toolchain check above: the mode has to
+          // stay the one the pin was designed for, the digest has to be pinned in
+          // every step that claims to, and the download has to be verified before
+          // the file reaches the path tauri-bundler treats as "already cached".
+          const expectedWebview2Digest = 'be695eb3732a94e181f008ab5cf6ee650f8644676e87f9e02b6ab0d02f2ea08e';
+          const webviewMode = config.bundle?.windows?.webviewInstallMode;
+          if (webviewMode?.type !== 'embedBootstrapper') {
+            throw new Error(
+              'bundle.windows.webviewInstallMode must stay {type: embedBootstrapper}; the release '
+              + 'pins the bootstrapper bytes and proves the installer embedded them. '
+              + 'downloadBootstrapper moves the unverified fetch to the user\'s machine and '
+              + 'fixedRuntime pins the WebView2 runtime version, cutting users off from Evergreen '
+              + 'security updates. Got: ' + JSON.stringify(webviewMode)
+            );
+          }
+          const windowsOverride = JSON.parse(readFileSync('studio/src-tauri/tauri.windows.conf.json', 'utf8'));
+          if (windowsOverride.bundle?.windows?.webviewInstallMode !== undefined) {
+            throw new Error(
+              'tauri.windows.conf.json must not override bundle.windows.webviewInstallMode; the '
+              + 'Windows leg merges it over tauri.conf.json, so an override here would silently '
+              + 'defeat the check above'
+            );
+          }
+          const stepBlock = (name) => {
+            const start = lines.findIndex((line) => new RegExp(`^\\s*- name: ${name}\\s*$`).test(line));
+            if (start === -1) {
+              throw new Error(`Desktop Windows release must keep the "${name}" step`);
+            }
+            const indent = lines[start].search(/\S/);
+            let end = lines.length;
+            for (let i = start + 1; i < lines.length; i += 1) {
+              if (lines[i].trim() === '') continue;
+              const lineIndent = lines[i].search(/\S/);
+              if (lineIndent < indent || (lineIndent === indent && /^\s*-\s/.test(lines[i]))) {
+                end = i;
+                break;
+              }
+            }
+            return lines.slice(start, end);
+          };
+          const digestIn = (block, name) => {
+            const pattern = new RegExp(`^\\s*${name}:\\s*["']([0-9a-f]{64})["']\\s*$`);
+            const line = block.find((candidate) => pattern.test(candidate));
+            return line?.match(pattern)?.[1];
+          };
+          const webviewPinLines = stepBlock('Pin Windows WebView2 bootstrapper');
+          const webviewVerifyLines = stepBlock('Verify the embedded WebView2 bootstrapper');
+          for (const [label, block] of [['pin', webviewPinLines], ['verify', webviewVerifyLines]]) {
+            if (digestIn(block, 'WEBVIEW2_BOOTSTRAPPER_SHA256') !== expectedWebview2Digest) {
+              throw new Error(
+                `Desktop Windows release must pin the WebView2 bootstrapper SHA-256 digest in the ${label} step, `
+                + 'and both steps must pin the same one'
+              );
+            }
+          }
+          const webviewUrl = webviewPinLines.find((line) => /^\s*WEBVIEW2_BOOTSTRAPPER_URL:/.test(line));
+          if (!webviewUrl || !/msedge\.sf\.dl\.delivery\.mp\.microsoft\.com\/filestreamingservice\/files\/[0-9a-f-]{36}\/MicrosoftEdgeWebview2Setup\.exe/.test(webviewUrl)) {
+            throw new Error(
+              'Desktop Windows release must pin the WebView2 bootstrapper to the immutable '
+              + 'per-version download URL, not the rotating go.microsoft.com/fwlink redirect'
+            );
+          }
+          const hashIdx = webviewPinLines.findIndex((line) => !isComment(line) && /Get-FileHash/.test(line));
+          const seedIdx = webviewPinLines.findIndex((line) => !isComment(line) && /Move-Item/.test(line));
+          if (hashIdx === -1 || seedIdx === -1 || hashIdx > seedIdx) {
+            throw new Error(
+              'Desktop Windows release must verify the WebView2 bootstrapper digest before moving it '
+              + 'into the tauri-bundler tools directory'
+            );
+          }
+          if (!webviewPinLines.some((line) => !isComment(line) && /exit 1/.test(line))) {
+            throw new Error('The WebView2 bootstrapper digest check must fail closed');
+          }
+          if (!webviewVerifyLines.some((line) => !isComment(line) && /WEBVIEW2BOOTSTRAPPERPATH/.test(line))) {
+            throw new Error(
+              'Desktop Windows release must read WEBVIEW2BOOTSTRAPPERPATH back out of the rendered '
+              + 'NSIS script, so the check covers what the installer embedded rather than what the '
+              + 'pin step intended'
+            );
+          }
+          const buildIdx = lines.findIndex((line) => /^\s*- name: Build Windows app\s*$/.test(line));
+          const pinIdx = lines.findIndex((line) => /^\s*- name: Pin Windows WebView2 bootstrapper\s*$/.test(line));
+          const verifyIdx = lines.findIndex((line) => /^\s*- name: Verify the embedded WebView2 bootstrapper\s*$/.test(line));
+          if (!(pinIdx < buildIdx && buildIdx < verifyIdx)) {
+            throw new Error(
+              'The WebView2 bootstrapper must be pinned before the Windows build and verified after it'
+            );
+          }
+
           const releaseBody = process.env.DESKTOP_RELEASE_NOTES;
           if (!releaseBody) {
             throw new Error('DESKTOP_RELEASE_NOTES must not be empty');
@@ -1335,6 +1426,93 @@ jobs:
           Write-Host "install.ps1 -> $($sig.Status) $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { Write-Host "::error::install.ps1 is $($sig.Status) after signing"; exit 1 }
 
+      # ── Windows: pin the WebView2 bootstrapper the installer embeds ──
+      # `bundle > windows > webviewInstallMode: embedBootstrapper` makes
+      # tauri-bundler embed Microsoft's Evergreen WebView2 bootstrapper in the
+      # NSIS installer. The bundler fetched it from
+      # https://go.microsoft.com/fwlink/p/?LinkId=2124703 -- a link whose target
+      # Microsoft rotates -- and, unlike every other file it downloads (NSIS 3.11
+      # and nsis_tauri_utils.dll are both hash-verified), it verified nothing. So
+      # the last unpinned build input ended up inside a signed installer that is
+      # also the auto-updater payload, trusted purely on TLS, and differing
+      # between two builds of the same commit.
+      #
+      # tauri-bundler 2.8.1 (the bundler in the pinned tauri-cli 2.10.1) resolves
+      # it in bundle/windows/util.rs as:
+      #
+      #   let file_path = base_path.join("MicrosoftEdgeWebview2Setup.exe");
+      #   if !file_path.exists() { fs::write(&file_path, download(URL)?)?; }
+      #
+      # so seeding that path with a verified copy makes the bundler use ours and
+      # download nothing. `base_path` is the bundler's tools directory:
+      # `dirs::cache_dir()/tauri`, i.e. %LOCALAPPDATA%\tauri, because
+      # `bundle > useLocalToolsDir` is false. Nothing in the config can hand the
+      # bundler a local bootstrapper -- the five webviewInstallMode variants are
+      # skip / downloadBootstrapper / embedBootstrapper / offlineInstaller /
+      # fixedRuntime{path} -- so the cache seed is the supported seam, and
+      # "Verify the embedded WebView2 bootstrapper" below proves it was taken.
+      #
+      # The URL is the immutable per-version target the fwlink redirects to, so
+      # the pin only moves when we move it. The SHA-256 is the integrity gate and
+      # fails closed, same shape as the AppImage toolchain and trusted-signing-cli
+      # pins above.
+      #
+      # This pins the ~1.8MB *bootstrapper*, not the WebView2 runtime. The file is
+      # Microsoft Edge Update Setup 1.3.257.13, whose only job is to fetch the
+      # current Evergreen runtime at install time, so users still receive WebView2
+      # security updates. (`fixedRuntime` would pin the runtime itself and take
+      # that away; deliberately not used.)
+      #
+      # To bump, re-record the digest from the artifact itself:
+      #   curl -sSIL 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' | grep -i '^location'
+      #   curl -fsSL '<resolved url>' | sha256sum
+      # then update WEBVIEW2_BOOTSTRAPPER_URL / WEBVIEW2_BOOTSTRAPPER_SHA256 in
+      # both Windows steps here (they must agree), the copies in the "Verify
+      # desktop updater and Linux package config" guard, and
+      # tests/security/test_release_desktop_webview2.py.
+      - name: Pin Windows WebView2 bootstrapper
+        if: matrix.platform == 'windows-latest'
+        # Explicit, like every other Windows step here; -MaximumRetryCount is
+        # PowerShell 6+ only and must not come from a runner default.
+        shell: pwsh
+        env:
+          WEBVIEW2_BOOTSTRAPPER_URL: "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/09d01e8e-f1ac-43a6-b5a0-282e0778a4b6/MicrosoftEdgeWebview2Setup.exe"
+          WEBVIEW2_BOOTSTRAPPER_SHA256: "be695eb3732a94e181f008ab5cf6ee650f8644676e87f9e02b6ab0d02f2ea08e"
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:LOCALAPPDATA) {
+            Write-Output "::error::LOCALAPPDATA is unset, so the tauri-bundler tools directory cannot be located. Refusing to build an installer that would embed an unverified WebView2 bootstrapper."
+            exit 1
+          }
+          $toolsDir = Join-Path $env:LOCALAPPDATA "tauri"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          $seeded = Join-Path $toolsDir "MicrosoftEdgeWebview2Setup.exe"
+
+          # Download to a staging path, verify there, and only then move it into
+          # the bundler's cache. A partial or substituted download must never
+          # exist at $seeded even briefly, because that is the exact path the
+          # bundler treats as "already have it, no need to fetch".
+          $stage = Join-Path $env:RUNNER_TEMP "webview2"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $dest = Join-Path $stage "MicrosoftEdgeWebview2Setup.exe"
+          Invoke-WebRequest -Uri $env:WEBVIEW2_BOOTSTRAPPER_URL -OutFile $dest -MaximumRetryCount 3 -RetryIntervalSec 5
+
+          $actual = (Get-FileHash -Path $dest -Algorithm SHA256).Hash.ToLower()
+          $expected = $env:WEBVIEW2_BOOTSTRAPPER_SHA256.ToLower()
+          if ($actual -ne $expected) {
+            Remove-Item -Force $dest
+            Write-Output "::error::WebView2 bootstrapper digest mismatch, refusing to embed an unverified Microsoft binary in the installer. Expected $expected, got $actual. Re-pin WEBVIEW2_BOOTSTRAPPER_URL and WEBVIEW2_BOOTSTRAPPER_SHA256 deliberately if Microsoft rotated the Evergreen bootstrapper."
+            exit 1
+          }
+
+          # -Force overwrites: a warm runner image (or a restored cache) could
+          # already hold an unverified copy at this path, and that copy would win
+          # the bundler's existence check.
+          Move-Item -Force -Path $dest -Destination $seeded
+          Write-Output "verified WebView2 bootstrapper sha256=$actual"
+          Write-Output "seeded tauri-bundler tools directory: $seeded"
+          "WEBVIEW2_BOOTSTRAPPER_PATH=$seeded" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build Windows app
         id: build_windows
         if: matrix.platform == 'windows-latest'
@@ -1358,6 +1536,81 @@ jobs:
           projectPath: studio
           tauriScript: npx --prefix . tauri
           args: -v ${{ matrix.args }}
+
+      # ── Windows: prove the installer embedded the pinned bootstrapper ──
+      # Seeding the bundler's cache is only as good as the assumption that the
+      # bundler read it, and that assumption is a tauri-bundler implementation
+      # detail that a CLI bump could change silently. So check the result rather
+      # than the intent: tauri-bundler renders the NSIS script it hands to
+      # makensis into target/<profile>/nsis/<arch>/installer.nsi, and the
+      # embedBootstrapper branch of that script embeds the file named by
+      #
+      #   !define WEBVIEW2BOOTSTRAPPERPATH "<absolute path>"
+      #
+      # with `File "/oname=$TEMP\MicrosoftEdgeWebview2Setup.exe" ...`. Reading
+      # that path back out and hashing it is direct evidence of which bytes went
+      # into the installer, independent of where the bundler chose to cache them.
+      # Runs before the 20-minute Defender scan so a miss fails fast.
+      - name: Verify the embedded WebView2 bootstrapper
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          WEBVIEW2_BOOTSTRAPPER_SHA256: "be695eb3732a94e181f008ab5cf6ee650f8644676e87f9e02b6ab0d02f2ea08e"
+        run: |
+          $ErrorActionPreference = "Stop"
+          # target/<profile>/nsis/<arch>/ without --target, target/<triple>/<profile>/...
+          # with one. Globbed rather than -Recurse: the target directory holds
+          # hundreds of thousands of build artifacts.
+          $scripts = @(Get-ChildItem -File -ErrorAction SilentlyContinue -Path @(
+            "studio/src-tauri/target/*/nsis/*/installer.nsi",
+            "studio/src-tauri/target/*/*/nsis/*/installer.nsi"
+          ))
+          if ($scripts.Count -ne 1) {
+            Write-Output "::error::Expected exactly one rendered NSIS script under studio/src-tauri/target, found $($scripts.Count). Cannot prove which WebView2 bootstrapper the installer embedded."
+            exit 1
+          }
+          $nsi = $scripts[0].FullName
+          $text = Get-Content -Raw -Path $nsi
+
+          $modeMatch = [regex]::Match($text, '(?m)^!define\s+INSTALLWEBVIEW2MODE\s+"([^"]*)"')
+          if (-not $modeMatch.Success -or $modeMatch.Groups[1].Value -ne "embedBootstrapper") {
+            Write-Output "::error::Rendered NSIS script does not install WebView2 via embedBootstrapper (got '$($modeMatch.Groups[1].Value)'), so this check cannot vouch for the embedded bootstrapper. Re-review the pin if webviewInstallMode changed."
+            exit 1
+          }
+
+          $pathMatch = [regex]::Match($text, '(?m)^!define\s+WEBVIEW2BOOTSTRAPPERPATH\s+"([^"]*)"')
+          if (-not $pathMatch.Success) {
+            Write-Output "::error::Rendered NSIS script declares no WEBVIEW2BOOTSTRAPPERPATH; refusing to publish an installer whose WebView2 bootstrapper cannot be identified."
+            exit 1
+          }
+          # tauri-bundler escapes NSIS metacharacters when rendering the template
+          # ('"' -> '$\"', '$' -> '$$'); undo the two a Windows path can contain.
+          $embedded = $pathMatch.Groups[1].Value.Replace('$\"', '"').Replace('$$', '$')
+          if (-not (Test-Path -LiteralPath $embedded)) {
+            Write-Output "::error::Rendered NSIS script embedded '$embedded', which no longer exists, so its digest cannot be checked."
+            exit 1
+          }
+
+          # The seeded path is where the pinned copy was placed. A different path
+          # means the bundler cached elsewhere and fetched its own copy.
+          if (-not $env:WEBVIEW2_BOOTSTRAPPER_PATH) {
+            Write-Output "::error::WEBVIEW2_BOOTSTRAPPER_PATH is unset; 'Pin Windows WebView2 bootstrapper' did not run."
+            exit 1
+          }
+          $seeded = (Resolve-Path -LiteralPath $env:WEBVIEW2_BOOTSTRAPPER_PATH).Path
+          $embeddedResolved = (Resolve-Path -LiteralPath $embedded).Path
+          if ($embeddedResolved -ne $seeded) {
+            Write-Output "::error::The installer embedded '$embeddedResolved' but the pinned bootstrapper was seeded at '$seeded'. tauri-bundler fetched its own unverified copy; re-check bundle/windows/util.rs for the tauri-cli version in studio/package-lock.json."
+            exit 1
+          }
+
+          $actual = (Get-FileHash -Path $embeddedResolved -Algorithm SHA256).Hash.ToLower()
+          $expected = $env:WEBVIEW2_BOOTSTRAPPER_SHA256.ToLower()
+          if ($actual -ne $expected) {
+            Write-Output "::error::The WebView2 bootstrapper embedded in the installer is not the pinned one. Expected $expected, got $actual."
+            exit 1
+          }
+          Write-Output "installer embedded the pinned WebView2 bootstrapper sha256=$actual from $embeddedResolved"
 
       # ── Windows: scan the signed bundles with Defender before publishing ──
       # 0.1.512-beta shipped a "Trojan:Win32/Wacatac.B!ml" false positive nothing
