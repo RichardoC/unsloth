@@ -288,9 +288,38 @@ def _active_install_is_local_link(binary: Optional[str]) -> bool:
     return _flow.active_install_is_local_link(binary, dir_name = "llama.cpp")
 
 
+def _active_install_is_immutable_runtime(binary: Optional[str]) -> bool:
+    """True when the active llama-server is the copy that ships inside the macOS
+    app bundle, so no update or backend switch may write to it.
+
+    Asked of exactly the root an apply would install into -- ``_llama_install_root``
+    is the marker's own directory when there is one and the discovery root
+    otherwise -- because "may we write here?" has to be answered about the
+    directory that would actually be written, not about the binary that led us to
+    it. The bundled copy carries a normal UNSLOTH_PREBUILT_INFO.json marker (the
+    payload build writes one) and UNSLOTH_LLAMA_CPP_PATH points at it, so every
+    existing check says "managed" and means it; see
+    update_flow.immutable_runtime_root for what that leaves out.
+    """
+    return _flow.immutable_runtime_root(_llama_install_root(binary))
+
+
 def _local_link_status() -> dict:
     """Status payload for a local-link install: unmanaged, no update offered."""
     return _flow.local_link_status(_job, _job_lock)
+
+
+def _immutable_runtime_status(binary: Optional[str]) -> dict:
+    """Status payload for the bundled llama.cpp: no update ever offered.
+
+    Offering one would be the same bug the release pin already had -- a button
+    whose only possible outcome is a failed install -- except worse, because the
+    install that "worked" would have broken the app's code signature.
+    """
+    marker = read_install_marker(binary) or {}
+    return _flow.immutable_runtime_status(
+        _job, _job_lock, installed_tag = marker.get("release_tag") or marker.get("tag")
+    )
 
 
 def _whisper_chain_status(
@@ -365,6 +394,11 @@ def _llama_only_status(
     # replace it. Bail before any network/freshness work.
     if _active_install_is_local_link(binary):
         return _local_link_status()
+    # Same for the copy inside the app bundle: read-only and signed, so there is
+    # nothing to offer. Also before any network work -- a release check whose
+    # answer can never be acted on is a wasted round trip.
+    if _active_install_is_immutable_runtime(binary):
+        return _immutable_runtime_status(binary)
     marker = read_install_marker(binary)
 
     with _job_lock:
@@ -469,6 +503,11 @@ def _switch_support(binary: Optional[str], marker: Optional[dict]) -> Optional[s
         return "not_installed"
     if _active_install_is_local_link(binary):
         return "local_link"
+    # A switch reinstalls the bundle in place, so the picker must not offer one for
+    # a tree that cannot be written. Reported as a reason rather than left to fail
+    # at apply time: the frontend disables the picker and says why.
+    if _active_install_is_immutable_runtime(binary):
+        return _flow.IMMUTABLE_RUNTIME_REASON
     if marker is None:
         return "source_build"
     if _install_dir_for(binary) is None:
@@ -790,6 +829,14 @@ def _plan_llama_phase(backend_request: Optional[str] = None) -> dict:
                     "Unsloth won't replace it. Update your own llama.cpp checkout instead."
                 ),
             },
+        }
+    # Refuse to write into the runtime that ships inside the app bundle. Checked
+    # here as well as in the status above, because a direct POST reaches this
+    # planner without ever reading the status that would have withheld the button.
+    if _active_install_is_immutable_runtime(binary):
+        return {
+            "skip_reason": _flow.IMMUTABLE_RUNTIME_REASON,
+            "refusal": _flow.immutable_runtime_refusal("llama.cpp"),
         }
     marker = read_install_marker(binary)
     script = _installer_script()

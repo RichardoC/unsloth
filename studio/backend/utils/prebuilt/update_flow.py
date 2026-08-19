@@ -24,6 +24,7 @@ from typing import Callable, Optional
 
 import structlog
 
+from utils.bundled_runtime import path_is_inside_bundled_runtime
 from utils.child_stdio import utf8_child_env
 from utils.process_lifetime import adopt_pid, child_popen_kwargs, forget_pid, terminate_pid
 
@@ -267,6 +268,79 @@ def local_link_status(job: dict, job_lock: threading.Lock) -> dict:
         "age_days": None,
         "source_build": False,
         "local_link": True,
+        "update_size_bytes": None,
+        "job": snapshot,
+    }
+
+
+# ── the runtime that ships inside the app ─────────────────────────────────────
+#
+# The macOS app carries its own llama.cpp and whisper.cpp under
+# ``Unsloth.app/Contents/Resources/runtime/`` and points UNSLOTH_LLAMA_CPP_PATH /
+# UNSLOTH_WHISPER_CPP_PATH at them. managed_install_root() above therefore calls
+# them "managed" -- correctly, in the sense it means: the active binary really is
+# the one Unsloth put there and discovery really does resolve through it. What it
+# cannot see is that the tree is code-signed and, once the app sits in
+# /Applications, root-owned. Installing over it either fails outright or succeeds
+# and breaks the signature, which is worse: Gatekeeper then refuses to launch the
+# app the user just "updated".
+#
+# So one more question stands between a managed root and an install, and it is the
+# same shape as the local-link refusal right above: not "is this ours?" but "may we
+# write here?". Nothing below weakens managed_install_root; it narrows what may be
+# done with its answer.
+IMMUTABLE_RUNTIME_REASON = "immutable_runtime"
+
+
+def immutable_runtime_root(root: Optional[Path]) -> bool:
+    """True when *root* is inside the runtime that ships inside the app bundle,
+    so no install may write there. False for every ordinary install, including
+    every non-macOS one -- see utils.bundled_runtime for why an environment
+    variable alone can never make this true."""
+    return path_is_inside_bundled_runtime(root)
+
+
+def immutable_runtime_refusal(component: str) -> dict:
+    """The refusal an update or backend switch answers with for such a root.
+
+    Same shape and tone as the local-link and release-pin refusals: name what the
+    install is, say Unsloth will not write to it, and name the one action that
+    does change it.
+    """
+    return {
+        "started": False,
+        "reason": IMMUTABLE_RUNTIME_REASON,
+        "message": (
+            f"{component} ships inside the Unsloth app, which is read-only and "
+            f"code-signed; Unsloth won't write there. Updating the app is how this "
+            f"{component} changes."
+        ),
+    }
+
+
+def immutable_runtime_status(
+    job: dict, job_lock: threading.Lock, *, installed_tag: Optional[str] = None
+) -> dict:
+    """Status payload for a bundled component: nothing to offer, ever.
+
+    Mirrors local_link_status -- an update the user cannot apply must not be
+    advertised, which is the same reason the release pin stopped being offered --
+    but keeps ``installed_tag`` so the About panel can still say which build is
+    running.
+    """
+    with job_lock:
+        snapshot = dict(job)
+    return {
+        "supported": False,
+        "update_available": False,
+        "stale": False,
+        "installed_tag": installed_tag,
+        "latest_tag": None,
+        "published_repo": None,
+        "installed_at_utc": None,
+        "age_days": None,
+        "source_build": False,
+        "immutable_runtime": True,
         "update_size_bytes": None,
         "job": snapshot,
     }

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from loggers import get_logger
+from utils.bundled_runtime import bundled_oxc_node_modules
 from utils.node_runtime import resolve_node_executable
 from utils.paths import ensure_dir, oxc_validator_tmp_root
 
@@ -251,7 +252,24 @@ def _run_oxc_batch(
         node_bin_dir = os.path.dirname(node_executable)
         if node_bin_dir:
             env["PATH"] = node_bin_dir + os.pathsep + env.get("PATH", "")
-        env.pop("NODE_PATH", None)
+        # NODE_PATH decides where `import "oxc-parser"` resolves from, i.e. what code
+        # this subprocess executes, so an inherited value is never trusted: the
+        # caller's environment must not be able to substitute the parser. Normally
+        # that means dropping it entirely and letting Node walk up from
+        # _OXC_TOOL_DIR to the node_modules installed beside the validator.
+        #
+        # Inside the macOS app bundle those node_modules are not there to walk up to:
+        # the payload keeps them at runtime/oxc-node-modules, one level above
+        # site-packages, deliberately (they are npm's tree, not a Python
+        # distribution, and the interpreter's own prefix is a sibling). So the value
+        # is REPLACED rather than kept -- an inherited NODE_PATH is still discarded,
+        # which is the whole point of the pop; it is just overwritten with the one
+        # directory inside the signed bundle instead of with nothing.
+        bundled_modules = bundled_oxc_node_modules()
+        if bundled_modules is None:
+            env.pop("NODE_PATH", None)
+        else:
+            env["NODE_PATH"] = str(bundled_modules)
         proc = subprocess.run(
             [node_executable, str(_OXC_RUNNER_PATH)],
             cwd = str(_OXC_TOOL_DIR),

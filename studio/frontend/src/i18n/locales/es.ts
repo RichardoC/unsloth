@@ -847,6 +847,7 @@ export const es = {
           notInstalled: "No se encontró una instalación de llama.cpp gestionada, así que no hay backend que cambiar.",
           localLink: "llama.cpp es un directorio local que enlazaste tú, así que Unsloth no lo reemplazará.",
           sourceBuild: "Este llama.cpp se compiló desde el código fuente, así que su backend no se puede cambiar desde aquí.",
+          immutableRuntime: "llama.cpp viene incluido en la aplicación de Unsloth, así que es de solo lectura. Actualiza la aplicación para cambiarlo.",
           unresolved: "No se pudieron consultar los backends disponibles. Revisa tu conexión e inténtalo de nuevo.",
         },
         // No se muestra: términos adicionales para la búsqueda de ajustes.

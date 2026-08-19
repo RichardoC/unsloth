@@ -210,9 +210,30 @@ def _active_install_is_local_link(binary: Optional[str]) -> bool:
     return _flow.active_install_is_local_link(binary, dir_name = "whisper.cpp")
 
 
+def _active_install_is_immutable_runtime(binary: Optional[str]) -> bool:
+    """True when the active whisper-server is the copy that ships inside the macOS
+    app bundle, so no update may write to it.
+
+    Same shape and same reasoning as llama_cpp_update's namesake: asked of the root
+    an apply would install into (``_whisper_install_root``), because the bundled
+    copy carries a normal marker and UNSLOTH_WHISPER_CPP_PATH points at it, so
+    every existing check calls it managed -- truthfully, and without noticing that
+    the directory is code-signed and read-only.
+    """
+    return _flow.immutable_runtime_root(_whisper_install_root(binary))
+
+
 def _local_link_status() -> dict:
     """Status payload for a local-link install: unmanaged, no update offered."""
     return _flow.local_link_status(_job, _job_lock)
+
+
+def _immutable_runtime_status(binary: Optional[str]) -> dict:
+    """Status payload for the bundled whisper.cpp: no update ever offered."""
+    marker = read_install_marker(binary) or {}
+    return _flow.immutable_runtime_status(
+        _job, _job_lock, installed_tag = marker.get("release_tag") or marker.get("tag")
+    )
 
 
 def get_update_status(*, force_refresh: bool = False) -> dict:
@@ -225,6 +246,10 @@ def get_update_status(*, force_refresh: bool = False) -> dict:
     # replace it. Bail before any network/freshness work.
     if _active_install_is_local_link(binary):
         return _local_link_status()
+    # Same for the copy inside the app bundle: read-only, signed, and changed only
+    # by updating the app. Also before any network work.
+    if _active_install_is_immutable_runtime(binary):
+        return _immutable_runtime_status(binary)
     marker = read_install_marker(binary)
 
     # No marker = source build / custom path. Offer the official prebuilt if one
@@ -449,6 +474,12 @@ def repair_pairing_plan() -> dict:
     if _active_install_is_local_link(binary):
         plan["skip_reason"] = "local_link"
         return plan
+    # Unreachable today (the llama switch that would call this is refused first for
+    # the same root), and still checked: this is the other door into an installer
+    # run against the install directory, and it must not be the one left open.
+    if _active_install_is_immutable_runtime(binary):
+        plan["skip_reason"] = _flow.IMMUTABLE_RUNTIME_REASON
+        return plan
     marker = read_install_marker(binary)
     if marker is None:
         plan["skip_reason"] = "source_build" if binary else "not_installed"
@@ -536,6 +567,16 @@ def chained_phase_plan(
             "status": _local_link_status(),
             "update_available": False,
             "skip_reason": "local_link",
+            "phase": None,
+        }
+    # The bundled copy is signed and read-only. Skipped like a local link rather
+    # than refused, because whisper is the piggyback phase and must never be the
+    # reason a llama update cannot run.
+    if _active_install_is_immutable_runtime(binary):
+        return {
+            "status": _immutable_runtime_status(binary),
+            "update_available": False,
+            "skip_reason": _flow.IMMUTABLE_RUNTIME_REASON,
             "phase": None,
         }
     marker = read_install_marker(binary)

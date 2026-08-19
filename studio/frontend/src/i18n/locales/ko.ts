@@ -823,6 +823,7 @@ export const ko = {
           notInstalled: "관리되는 llama.cpp 설치를 찾을 수 없어 전환할 백엔드가 없습니다.",
           localLink: "llama.cpp는 직접 연결한 로컬 디렉터리이므로 Unsloth가 교체하지 않습니다.",
           sourceBuild: "이 llama.cpp는 소스에서 빌드되어 여기서 백엔드를 전환할 수 없습니다.",
+          immutableRuntime: "llama.cpp는 Unsloth 앱에 포함되어 있어 읽기 전용입니다. 변경하려면 앱을 업데이트하세요.",
           unresolved: "사용 가능한 백엔드를 확인하지 못했습니다. 연결을 확인한 뒤 다시 시도하세요.",
         },
         // 표시되지 않음: 설정 검색용 추가 키워드.
