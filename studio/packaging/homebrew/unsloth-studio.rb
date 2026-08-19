@@ -58,6 +58,17 @@ cask "unsloth-studio" do
   # The bare symbol is Homebrew's minimum-version form -- Big Sur or newer, not
   # Big Sur exactly. `">= :big_sur"` means the same thing, but brew style's
   # Homebrew/OSDependsOn cop rejects the long form.
+  #
+  # RAISE THIS TO :sonoma WHEN BUMPING TO A BUNDLED RELEASE. It stays :big_sur
+  # only because `version` above still names 0.1.800-beta, which installs its
+  # Python stack on first run and therefore genuinely runs on Big Sur. Builds
+  # from this tree now ship the runtime inside the app, and that payload requires
+  # macOS 14: every macOS arm64 bitsandbytes wheel from 0.49.0 is macosx_14_0, so
+  # a 13.0 deployment target has none installable and the resolver silently
+  # backtracks unsloth to a year-old release. tauri.macos.conf.json therefore sets
+  # minimumSystemVersion 14.0, and a cask pointing at such a build must say
+  # :sonoma or Homebrew will hand macOS 11-13 users an app that cannot launch.
+  # studio/DETERMINISM.md and studio/macos_runtime_pins.json record the reasoning.
   depends_on arch: :arm64
   depends_on macos: :big_sur
 

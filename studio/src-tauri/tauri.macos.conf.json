@@ -4,6 +4,7 @@
       "../../install.sh": "install.sh"
     },
     "macOS": {
+      "minimumSystemVersion": "14.0",
       "entitlements": "./Entitlements.plist",
       "infoPlist": "./Info.plist",
       "dmg": {
