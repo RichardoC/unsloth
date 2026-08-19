@@ -87,13 +87,15 @@ jobs:
           # Never the real key. A dev build signed with the release key would be
           # accepted as an update by shipped apps.
           npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/dev-updater.key" -p ""
-          {
-            echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/dev-updater.key")"
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
-          } >> "$GITHUB_ENV"
 
       - name: Build the .dmg
         env:
+          # The PATH form, not the key contents. Writing key material into
+          # $GITHUB_ENV would have the runner echo it in plaintext in the env
+          # block of every later step -- harmless for a per-run throwaway, but a
+          # pattern nobody should copy with a real key.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/dev-updater.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
           # Empty unless dispatched with a value, in which case the build pins
           # the backend exactly as a release does.
           UNSLOTH_DESKTOP_BACKEND_VERSION: ${{ inputs.backend_version }}
