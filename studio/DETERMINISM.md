@@ -57,20 +57,68 @@ minor after the release it was resolved against.
 llama.cpp and whisper.cpp must stay paired: whisper's slim bundles need the ggml runtime
 from the llama release its manifest names in `paired_llama_tag`. A test enforces this.
 
+## The torch-independent stack installs from hash-verified locks
+
+`studio/backend/requirements/locks/` holds six machine-generated locks — **289 pinned
+requirements carrying 6,157 sha256 digests** — and `install_python_stack.py` installs those
+steps with `--require-hashes`. Every wheel they cover is verified against a digest that was
+reviewed in this repository, so transitive drift stops for that part of the closure.
+
+| lock | source | packages | digests |
+| --- | --- | --- | --- |
+| `studio.lock.txt` | `studio.txt` | 144 | 3,343 |
+| `data-designer-deps.lock.txt` | `single-env/data-designer-deps.txt` | 81 | 1,868 |
+| `no-torch-runtime.lock.txt` | `no-torch-runtime.txt` (`--no-deps`) | 47 | 831 |
+| `extras-no-deps.lock.txt` | `extras-no-deps.txt` (`--no-deps`) | 12 | 105 |
+| `data-designer.lock.txt` | `single-env/data-designer.txt` (`--no-deps`) | 4 | 8 |
+| `pip-bootstrap.lock.txt` | the pinned bootstrap `pip` | 1 | 2 |
+
+Regenerate with `bash scripts/gen_python_locks.sh`. It reads the uv version `install.sh`
+pins and **refuses any other uv**, because a lock built by a different resolver is not the
+lock users get. `--exclude-newer` freezes the index, so regeneration reproduces the same
+resolution rather than drifting; bumping that cutoff is the deliberate act of taking
+upstream releases. Each compile also passes the other shipped requirements files as
+constraints — without that, independent locks silently overrode pins from other files in
+the same environment.
+
+`UNSLOTH_PYTHON_NO_LOCK=1` reverts to unlocked installs. A missing lock warns loudly and
+falls back, so a wheel built before the locks existed still installs. A lock is skipped
+below its recorded Python floor, so a 3.9 host stays on today's path rather than being
+handed a 3.10 resolution.
+
+Two guards, because neither alone is enough: `tests/security/test_python_locks.py` catches
+a missing, malformed or ranged requirement, and `.github/workflows/python-lock-freshness.yml`
+regenerates and diffs, which is the only thing that catches a digest that is well-formed
+but *wrong*.
+
 ## What still floats
 
-Pinning `unsloth==X` fixes *which* pin set applies. It does not make that set a lockfile,
-and there is no lockfile for the Python stack — no `uv.lock`, no hashes, and
-`install_python_stack.py` deliberately clears `PIP_REQUIRE_HASHES`/`UV_REQUIRE_HASHES`
-because the shipped requirements files carry no hashes to satisfy them.
+The locks above cover the torch-independent steps. They are not a whole-stack lockfile,
+and these still resolve fresh at install time:
 
-So these still resolve fresh at install time:
-
-- **Every transitive dependency** of any step not installed with `--no-deps`.
+- **Everything torch-bound.** `extras.txt` is deliberately unlocked: a with-deps universal
+  resolution pins torch, torchvision, torchaudio, triton and fifteen `nvidia-*` packages
+  from PyPI, which would override the index chosen from detected hardware. Locking it means
+  a per-family lock matrix — roughly 23 files — and that carries its own costs: each family
+  collapses to one exact torch version, which ends the keep-previous-torch self-healing, and
+  the AMD per-arch indexes give no immutability guarantee, so those locks hard-fail whenever
+  a wheel is republished in place.
+- **`diffusers-pin.txt`** — unlocked. Note before locking it that a digest over a
+  GitHub-generated source archive is a digest over bytes GitHub does not promise to keep
+  stable.
+- **`triton-kernels.txt`** — a git requirement cannot carry a hash, and `--require-hashes`
+  rejects it. The commit pin is the anchor instead, and being content-addressed it is a
+  stronger one than a version.
 - **`unsloth-zoo`** — a floor, not a pin. There is no stamped zoo version; the exact
   `unsloth` constrains it only through its own metadata.
-- **Ranges in the requirements files** — `torch>=2.4,<2.12` against a GPU-chosen index,
-  `huggingface-hub>=1.23,<2.0`, and all of `single-env/data-designer-deps.txt`.
+- **`install.sh`'s own `no-torch-runtime.txt` installs** on the fresh `--no-torch` legs run
+  unlocked; the update path through `install_python_stack.py` uses the lock.
+- **`pytorch_tokenizers`**, carved out into `locks/extras-no-deps.unlocked.txt` and
+  installed unlocked on purpose: it has no musllinux wheel at its cap and its arm64 wheel is
+  `macosx_14_0`, and neither axis has a PEP 508 marker, so pinning one version pushes musl
+  and macOS 13 hosts onto the sole sdist and a cmake build.
+- **Ranges in the still-unlocked requirements files** — `torch>=2.4,<2.12` against a
+  GPU-chosen index, and the torch followers keyed off whatever torch resolves to.
 - **Everything below the four MLX ceilings** — the newest admissible patch, and on the
   non-uv fallback path anything the resolver backtracks to. Per the table above, this is
   deliberate.
@@ -87,9 +135,20 @@ So these still resolve fresh at install time:
   force-reinstalls the pinned release over the top, so the *installed* version is
   pinned either way — but the shell installer still fetches a mutable wheel first.
 
-Honest summary: this moves the app from "a different stack most months" to "the same
-direct dependencies, with drifting transitives". It is a large improvement and not a
-guarantee. Closing the rest means a real lockfile with hashes.
+### One behaviour change the locks introduced
+
+Both with-deps locks pin `cryptography==48.0.1`, where Linux, Windows and macOS arm64
+resolve `50.0.0` today. The `<49` cap in `constraints.txt` exists only because 49.0.0
+dropped the `macosx_10_9_universal2` wheel that Intel Macs need — but `cryptography` arrives
+transitively (via `authlib`, `joserfc`, `pyjwt`, `secretstorage`), so it cannot be carved out
+of a hashed closure, and uv collapses the darwin-scoped cap onto every marker fork. The
+effect is that three platforms are held two majors back on a security-relevant library in
+exchange for a hashed closure. The fix is to lift the cap and regenerate once upstream ships
+an x86_64 macOS wheel again, or to move to per-platform locks.
+
+Honest summary: the app has gone from "a different stack most months" to a hash-verified
+closure for the torch-independent majority, with torch and its followers still resolving
+fresh. That is a large improvement and still not a whole-stack guarantee.
 
 ## Integrity is a separate axis from determinism
 
@@ -260,10 +319,26 @@ runner images and pinned tool digests — the things that otherwise exist only i
 that expire. It asserts the running rustc matches `rust-toolchain.toml`, so a pin that
 silently failed to apply fails the release.
 
+The Windows WebView2 bootstrapper is pinned too. `tauri-bundler` fetched it with an
+unverified download — the only such fetch left in the Windows bundler, while its siblings
+NSIS and `nsis_tauri_utils.dll` both went through `download_and_verify` — and embedded it in
+the NSIS installer, which with `createUpdaterArtifacts` is both the fresh installer and the
+auto-update payload. The build now fetches it from the immutable per-version URL, verifies a
+pinned sha256, fails closed, and seeds the bundler's tools cache; a second step then reads
+`WEBVIEW2BOOTSTRAPPERPATH` out of the rendered `installer.nsi` and hashes what `makensis`
+actually embedded, so a CLI bump that moves that cache fails the release rather than quietly
+reverting to an unverified download. The rotating `go.microsoft.com` fwlink is deliberately
+*not* the pinned URL, since it is repointed on Microsoft's schedule.
+
+This pins the 1.8 MB installer stub, **not** the runtime: it is Edge Update Setup, whose job
+is to fetch the current Evergreen runtime at install time, so users keep receiving WebView2
+security patches. `webviewInstallMode` stays `embedBootstrapper` and is guarded, because
+`fixedRuntime` would pin the runtime itself and cut users off from those updates — a product
+decision, not a cleanup.
+
 **What is still not reproducible.** Signed artifacts can never be byte-identical:
 `codesign` embeds a secure timestamp, Apple's stapled notarization ticket is
-per-submission, and the minisign `.sig` files carry timestamps of their own. The Windows
-installer embeds a WebView2 bootstrapper fetched at build time and not digest-pinned.
+per-submission, and the minisign `.sig` files carry timestamps of their own.
 `SOURCE_DATE_EPOCH` is exported from the tag commit as groundwork, but nothing verifies
 byte reproducibility and tauri-bundler's handling of it is unconfirmed. The release
 workflow also rewrites `Cargo.toml`/`Cargo.lock` to the dispatched version before
