@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Builds an UNSIGNED Apple Silicon .dmg on every push and attaches it to the run,
+# so a change can be tried on real hardware without going near release-desktop.yml.
+#
+# This is deliberately NOT a release. It differs from release-desktop.yml in ways
+# that matter, and the difference is the point:
+#
+#   - No Apple credentials, so no codesigning, no notarization, no stapling.
+#     release-desktop.yml fails closed without those secrets and cannot run in a
+#     fork; this can. Gatekeeper will refuse the result until the quarantine
+#     attribute is removed -- see the job summary it prints.
+#   - The updater bundle is signed with a throwaway minisign key generated per
+#     run. tauri.conf.json sets createUpdaterArtifacts, so the build wants a
+#     signing key; an ephemeral one keeps the real key out of dev builds and out
+#     of this workflow's threat model entirely. A dev build must never be
+#     something a released app would accept as an update.
+#   - Nothing is uploaded to a GitHub release, no tag is created, and no
+#     latest.json is published, so this cannot move the updater pointer that
+#     shipped apps follow.
+#
+# Toolchain versions are kept identical to release-desktop.yml on purpose: a dev
+# build that compiled with a different rustc or Node would not be evidence about
+# the release build.
+
+name: Desktop dev build (unsigned)
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      backend_version:
+        description: >-
+          Stamp UNSLOTH_DESKTOP_BACKEND_VERSION so the build pins the Python
+          backend to this exact version, the way a real release does (e.g.
+          2026.8.18). Leave empty to build like a dev checkout, which tracks
+          latest. Use this to exercise the pinned first-run path.
+        required: false
+        type: string
+
+concurrency:
+  # A dev build is only interesting for the newest commit on a ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dmg:
+    name: Unsigned .dmg (Apple Silicon)
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Same exact version release-desktop.yml pins.
+          node-version: '24.19.0'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-03-27
+        with:
+          # Must match studio/src-tauri/rust-toolchain.toml, or the target below
+          # installs against a toolchain the build will not use.
+          toolchain: '1.94.1'
+          targets: aarch64-apple-darwin
+
+      - name: Install the pinned Tauri CLI
+        # npm ci, not npm install: studio/package.json exists only to hold this
+        # pin, and ci cannot rewrite the lockfile.
+        run: npm ci --prefix studio --no-fund --no-audit
+
+      - name: Install frontend dependencies
+        # tauri.conf.json's beforeBuildCommand runs `npm run build` in
+        # studio/frontend, so its node_modules must exist before the build.
+        run: npm ci --prefix studio/frontend --no-fund --no-audit
+
+      - name: Generate a throwaway updater signing key
+        run: |
+          set -euo pipefail
+          # Never the real key. A dev build signed with the release key would be
+          # accepted as an update by shipped apps.
+          npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/dev-updater.key" -p ""
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/dev-updater.key")"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
+          } >> "$GITHUB_ENV"
+
+      - name: Build the .dmg
+        env:
+          # Empty unless dispatched with a value, in which case the build pins
+          # the backend exactly as a release does.
+          UNSLOTH_DESKTOP_BACKEND_VERSION: ${{ inputs.backend_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${UNSLOTH_DESKTOP_BACKEND_VERSION:-}" ]; then
+            echo "backend pinned to $UNSLOTH_DESKTOP_BACKEND_VERSION"
+          else
+            echo "backend unpinned (dev behaviour: first run tracks latest)"
+            unset UNSLOTH_DESKTOP_BACKEND_VERSION
+          fi
+          npx --prefix studio tauri build --target aarch64-apple-darwin --bundles dmg
+
+      - name: Locate the .dmg and rename it for this commit
+        id: dmg
+        run: |
+          set -euo pipefail
+          src="$(find studio/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg \
+                   -name '*.dmg' -maxdepth 1 -print -quit)"
+          if [ -z "$src" ]; then
+            echo "::error::no .dmg was produced" >&2
+            exit 1
+          fi
+          out="$RUNNER_TEMP/Unsloth-Desktop-dev-${GITHUB_SHA:0:8}-unsigned-MacOS.dmg"
+          mv "$src" "$out"
+          shasum -a 256 "$out"
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$out")" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(shasum -a 256 "$out" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm it is a real arm64 bundle, and unsigned
+        run: |
+          set -euxo pipefail
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/devdmg "${{ steps.dmg.outputs.path }}"
+          app="$(find /tmp/devdmg -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app"
+          exe="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          file "$exe" | grep -q 'arm64'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist"
+          # Expected to fail: this build is not notarized. Asserting that keeps
+          # the workflow honest about what it produces -- if this ever starts
+          # passing, something is signing dev builds.
+          if spctl --assess --type execute "$app" 2>/dev/null; then
+            echo "::error::a dev build passed Gatekeeper; it should not be signed" >&2
+            hdiutil detach /tmp/devdmg
+            exit 1
+          fi
+          echo "unsigned as expected"
+          hdiutil detach /tmp/devdmg
+
+      - name: Upload the .dmg
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.dmg.outputs.name }}
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Explain how to run it
+        run: |
+          {
+            echo "### Unsigned dev build"
+            echo
+            echo "\`${{ steps.dmg.outputs.name }}\` — download it from the artifacts on this run."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| commit | \`${GITHUB_SHA:0:8}\` |"
+            echo "| sha256 | \`${{ steps.dmg.outputs.sha256 }}\` |"
+            echo "| backend | ${{ inputs.backend_version && format('pinned to {0}', inputs.backend_version) || 'unpinned (tracks latest on first run)' }} |"
+            echo
+            echo "This build is **not signed or notarized**, so Gatekeeper will refuse it."
+            echo "After copying the app to /Applications:"
+            echo
+            echo '```sh'
+            echo 'xattr -dr com.apple.quarantine "/Applications/Unsloth.app"'
+            echo '```'
+            echo
+            echo "Its updater is signed with a throwaway key, so it cannot install"
+            echo "real updates and shipped apps will not accept it as one."
+          } >> "$GITHUB_STEP_SUMMARY"
