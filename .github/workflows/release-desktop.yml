@@ -1586,15 +1586,20 @@ jobs:
                   sys.exit(f'Expected exactly one {label} from tauri-action, found {matches}')
               return matches[0]
 
-          # Order matters: an updater signature also ends in .sig, and the tarball
-          # name is a prefix of the signature's.
-          print('dmg_path=' + exactly_one('.dmg', lambda p: p.lower().endswith('.dmg')))
-          print('updater_sig_path=' + exactly_one(
-              'updater signature', lambda p: p.endswith('.app.tar.gz.sig')
-          ))
-          print('updater_path=' + exactly_one(
-              'updater tarball', lambda p: p.endswith('.app.tar.gz')
-          ))
+          # Resolved first and printed second, so a list that is wrong about one
+          # of the three sets none of them: a half-populated output would leave a
+          # later step rewriting one file and publishing tauri's copy of another.
+          resolved = {
+              'dmg_path': exactly_one('.dmg', lambda p: p.lower().endswith('.dmg')),
+              'updater_path': exactly_one(
+                  'updater tarball', lambda p: p.endswith('.app.tar.gz')
+              ),
+              'updater_sig_path': exactly_one(
+                  'updater signature', lambda p: p.endswith('.app.tar.gz.sig')
+              ),
+          }
+          for name, value in resolved.items():
+              print(f'{name}={value}')
           PY
           cat "$GITHUB_OUTPUT"
 
@@ -1614,6 +1619,16 @@ jobs:
           bash scripts/inject_macos_runtime.sh \
             --payload "$RUNNER_TEMP/runtime" \
             --app "$APP"
+
+          # The payload now exists twice, and this leg is disk bound rather than
+          # CPU bound from here on: it still has to hold the app (~2.5 GiB), a
+          # writable disk image grown to fit it, a compressed image, an updater
+          # tarball and a full extraction of that tarball to check it. Nothing
+          # after this point reads the staging copy -- the manifest is read back
+          # out of the app bundle, precisely so that what is recorded is what
+          # shipped -- so it goes now, while the space is still free to give.
+          rm -rf "$RUNNER_TEMP/runtime"
+          df -h .
 
       # ── macOS: sign the payload, inside out, then the app ──
       # Tauri's bundler seals resources as data. It does not sign nested Mach-O
@@ -1985,8 +2000,11 @@ jobs:
             while IFS= read -r -d '' path; do
               attempt=1
               while :; do
+                # </dev/null so nothing can consume the path list this loop is
+                # reading from: a tool that read stdin here would silently skip
+                # every remaining file and the step would report success.
                 if codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
-                     --options runtime --timestamp "$@" "$path"; then
+                     --options runtime --timestamp "$@" "$path" </dev/null; then
                   break
                 fi
                 if [ "$attempt" -ge 3 ]; then
@@ -2014,17 +2032,21 @@ jobs:
           executables="$(sign_list "$RUNNER_TEMP/macho-executables" \
             --entitlements "$runtime_entitlements" | tail -n 1)"
 
+          # Counted on the way out as well as on the way in, and BEFORE the app is
+          # signed: the app's signature is the seal over the payload, so it must
+          # not be created over a payload the loops above did not actually cover.
+          total=$(( libraries + executables ))
+          if [ "$total" -lt "$MIN_SIGNED_TOTAL" ]; then
+            echo "::error::signed only $total Mach-O files in the payload" >&2
+            exit 1
+          fi
+
           echo "==> signing the app bundle (last, so it seals a fully signed payload)"
           codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
             --options runtime --timestamp \
             --entitlements studio/src-tauri/Entitlements.plist \
             "$APP"
 
-          total=$(( libraries + executables ))
-          if [ "$total" -lt "$MIN_SIGNED_TOTAL" ]; then
-            echo "::error::signed only $total Mach-O files in the payload" >&2
-            exit 1
-          fi
           echo "signed $total Mach-O files in the payload ($libraries libraries, $executables executables), then the app"
           echo "signed_macho_count=$total" >> "$GITHUB_OUTPUT"
           echo "SIGNED_MACHO_COUNT=$total" >> "$GITHUB_ENV"
@@ -2110,7 +2132,9 @@ jobs:
           # what notarization requires and what makes library validation apply).
           checked=0
           while IFS= read -r -d '' path; do
-            info="$(codesign --display --verbose=4 "$path" 2>&1)" || {
+            # </dev/null, same reason as the signing loop: this loop's stdin is
+            # the list of files it still has to check.
+            info="$(codesign --display --verbose=4 "$path" </dev/null 2>&1)" || {
               echo "::error::not signed: $path" >&2
               exit 1
             }

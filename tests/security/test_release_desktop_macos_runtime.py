@@ -160,6 +160,39 @@ def test_the_injection_leaves_tauris_disk_image_alone():
     )
 
 
+def test_nothing_after_the_injection_reads_the_staging_payload():
+    """The staging copy is deleted after the injection, and that has to stay safe.
+
+    This leg is disk bound: it holds the app, a writable image grown to fit it, a
+    compressed image, an updater tarball and a full extraction of that tarball.
+    Freeing the ~2.5 GiB staging copy is what makes that fit, and it is only safe
+    because everything downstream reads the app bundle instead -- including the
+    provenance record, deliberately, so that what is recorded is what shipped.
+    """
+    inject = _step(INJECT_STEP)["run"]
+    assert 'rm -rf "$RUNNER_TEMP/runtime"' in inject
+    later = _steps()[_index(INJECT_STEP) + 1:]
+    for step in later:
+        body = (step.get("run") or "") + yaml.safe_dump(step.get("env", {}))
+        assert "RUNNER_TEMP/runtime\"" not in body, step.get("name")
+        assert "RUNNER_TEMP/runtime/" not in body, step.get("name")
+        assert "RUNNER_TEMP}}/runtime" not in body, step.get("name")
+
+
+def test_an_incomplete_payload_never_reaches_a_signature():
+    """--skip-diffusers-pin and --with-sd-cpp both record themselves in the manifest.
+
+    A payload assembled with a component missing is fine for a dev build and is
+    not something to sign, notarize and publish.
+    """
+    run = _step(ASSEMBLE_STEP)["run"]
+    assert "scripts/build_macos_runtime.sh --out" in run
+    assert 'manifest["incomplete"]' in run
+    assert "--skip-diffusers-pin" not in run.split("<<'PY'")[0], (
+        "the release must assemble the complete payload"
+    )
+
+
 def test_the_notarization_step_keeps_its_contract():
     """It is the release's only notarization, and it must still read tauri's path.
 
