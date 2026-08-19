@@ -26,6 +26,33 @@ release" at install time.
 | stable-diffusion.cpp | `master-813-bfbef5b-u13b9d92` | `install_sd_cpp_prebuilt.py` (`DEFAULT_TAG`) |
 | Node | `24.18.0` | `node_prebuilt_pins.json` |
 | CPython | `3.13` via a uv-managed build, from pinned uv `0.12.1` | `install.sh` |
+| `triton_kernels` | commit `7c56a5e40f7fd928dfd5c72902d5def0097db73a` (tip of `release/3.6.x` on 2026-08-19) | `backend/requirements/triton-kernels.txt` |
+| ROCm `bitsandbytes` | `==0.50.1` on PyPI, replacing the `continuous-release_main` tag | `install_python_stack.py` (`_BNB_ROCM_PINNED_SPEC`) |
+| bootstrap `pip` | `==26.2.1` | `install_python_stack.py` (`_PIP_BOOTSTRAP_VERSION`) |
+| `mlx`, `mlx-metal` | `<0.33` — a **ceiling, not a pin** | `install_python_stack.py` (`_MLX_STACK_SPECS`) |
+| `mlx-lm` | `<0.32` — a ceiling | same |
+| `mlx-vlm` | `<0.7` — a ceiling | same |
+
+The four MLX bounds are ceilings, not exact versions: mlx is pre-1.0, so its breaking
+changes land in minor releases, and `<next-minor` is the window that keeps patch fixes
+reaching users. They were set one minor above the releases the stack resolved to on
+2026-08-19 (mlx/mlx-metal 0.32.1, mlx-lm 0.31.3, mlx-vlm 0.6.15). A patch release inside
+a window still arrives unreviewed — that is the deliberate trade, because an exact `==`
+strands Apple Silicon on a broken combination as readily as no ceiling does.
+
+There are deliberately **no floors**. `--upgrade` already takes the newest admissible
+version, so a floor cannot change what a healthy install resolves to; it can only change
+the failing case, and there it makes things worse. Without uv there is no `UV_OVERRIDE`,
+so mlx-vlm's own `transformers>=5.14.0` collides with the `transformers==5.5.0` in
+`constraints.txt`, and the resolver backtracking to an older mlx-vlm is the only thing
+keeping that install from failing outright. A floor would turn a degraded-but-installed
+stack — which `_report_mlx_stack_health()` already reports and the startup self-heal
+already retries — into a fatal macOS install error. A test asserts the floors stay absent,
+so adding one has to be a deliberate act.
+
+`mlx` declares `mlx-metal==<its own version>` on Darwin, so those two ceilings must stay
+identical or the pair is unsatisfiable; a test enforces that, and that each ceiling is the
+minor after the release it was resolved against.
 
 llama.cpp and whisper.cpp must stay paired: whisper's slim bundles need the ggml runtime
 from the llama release its manifest names in `paired_llama_tag`. A test enforces this.
@@ -44,11 +71,21 @@ So these still resolve fresh at install time:
   `unsloth` constrains it only through its own metadata.
 - **Ranges in the requirements files** — `torch>=2.4,<2.12` against a GPU-chosen index,
   `huggingface-hub>=1.23,<2.0`, and all of `single-env/data-designer-deps.txt`.
-- **`pip` itself**, upgraded to latest during bootstrap.
-- **`mlx`, `mlx-lm`, `mlx-vlm`, `mlx-metal`** on Apple Silicon — installed `--upgrade`,
-  unbounded.
-- **`triton_kernels`**, from the moving branch `release/3.6.x`, and **ROCm
-  `bitsandbytes`**, from the mutable tag `continuous-release_main`.
+- **Everything below the four MLX ceilings** — the newest admissible patch, and on the
+  non-uv fallback path anything the resolver backtracks to. Per the table above, this is
+  deliberate.
+- **The MLX startup self-heal.** `backend/utils/mlx_repair.py` reinstalls
+  `mlx`/`mlx-lm`/`mlx-vlm` by *floor* with `--upgrade`, so a host whose MLX stack is
+  actually blocked can still be walked past the installer's ceilings at launch. That
+  is the auto-heal working as designed — it runs only when the stack is already broken
+  — but it means the ceilings hold for healthy installs, not for repaired ones.
+- **The bitsandbytes fallback on a ROCm host** is still the shared `>=0.50.0` floor.
+  It fires only when the pinned release cannot install; `install.sh` and the `amd`
+  extra in `pyproject.toml` share that constant.
+- **`install.sh`'s own ROCm bitsandbytes step**, which still installs the
+  `continuous-release_main` wheel. The Python stack pass runs after it and
+  force-reinstalls the pinned release over the top, so the *installed* version is
+  pinned either way — but the shell installer still fetches a mutable wheel first.
 
 Honest summary: this moves the app from "a different stack most months" to "the same
 direct dependencies, with drifting transitives". It is a large improvement and not a
@@ -81,8 +118,20 @@ Pinning decides *which* artifact is fetched. It is not by itself a trust anchor.
   checksum-index asset to pin. Because sd.cpp installs lazily at the first image
   generation, these failures surface there rather than during bootstrap.
 
-No component verifies a signature, and only Node and (one hop removed) llama.cpp /
-whisper.cpp verify anything against a digest that lives in this repository.
+- `triton_kernels` is the one Python dependency whose pin *is* a digest. A full git
+  commit sha is content-addressed over the whole tree, and it lives in-tree in
+  `triton-kernels.txt`, so git rejects a fetch whose contents do not hash to it. That
+  makes it a stronger anchor than any version pin here — which is why the file also
+  insists on the full 40 characters, an abbreviation being a prefix match rather than
+  an identity.
+- The pinned PyPI versions (`bitsandbytes`, `pip`, and the MLX windows) are **not**
+  integrity anchors. pip checks each wheel against the hash the index served alongside
+  it, which is same-origin: it detects corruption in transit, not a compromised index.
+  The in-tree part is only the version number.
+
+No component verifies a signature, and apart from the `triton_kernels` commit, only
+Node and (one hop removed) llama.cpp / whisper.cpp verify anything against a digest that
+lives in this repository.
 
 ## Escape hatches
 
@@ -91,7 +140,7 @@ together so the update banner never offers what the installer would refuse:
 
 | Variable | Effect |
 | --- | --- |
-| `UNSLOTH_PREBUILT_ALLOW_LATEST=1` | llama.cpp, whisper.cpp and sd.cpp track newest again — and with the pin off, the in-tree checksum-index digest no longer applies |
+| `UNSLOTH_PREBUILT_ALLOW_LATEST=1` | llama.cpp, whisper.cpp and sd.cpp track newest again — and with the pin off, the in-tree checksum-index digest no longer applies. It also reverts the three first-run Python pins that live in `install_python_stack.py`: bootstrap `pip` goes back to `--upgrade pip`, the MLX stack to four bare names, and ROCm `bitsandbytes` to the `continuous-release_main` wheel first with the `>=0.50.0` floor behind it. (It does not reach `triton_kernels`: a requirements file cannot read the environment, so that commit is pinned unconditionally — override it by editing the file or pointing the step at your own requirement.) |
 | `UNSLOTH_PREBUILT_ALLOW_UNVERIFIED=1` | keep the pinned versions but install without checking the llama/whisper checksum index against its in-tree digest, and let sd.cpp install an asset that publishes no usable digest |
 | `UNSLOTH_LLAMA_RELEASE_TAG=<tag>` | install that llama release instead |
 | `UNSLOTH_WHISPER_RELEASE_TAG=<tag>` | install that whisper release instead |
@@ -104,10 +153,18 @@ The two `ALLOW_` variables say different things and are deliberately separate:
 nothing checked". Neither excuses a digest that *was* checked and disagreed — a real
 mismatch always stops the install.
 
-A `curl | sh` CLI install sets none of these and none of the pins, so it tracks latest
-exactly as it always has. Only release-stamped desktop builds pin the backend; an
-unstamped dev build sets nothing, which is why the plumbing reads `option_env!` directly
-rather than the `MIN_DESKTOP_BACKEND_VERSION` floor.
+**A `curl | sh` CLI install is no longer entirely unpinned.** It still sets none of
+these variables, so the *backend version* and the ggml-family prebuilts track latest
+exactly as they always have — only release-stamped desktop builds pin the backend, and
+an unstamped dev build sets nothing, which is why the plumbing reads `option_env!`
+directly rather than the `MIN_DESKTOP_BACKEND_VERSION` floor. But the first-run Python
+pins — `triton_kernels`, ROCm `bitsandbytes`, bootstrap `pip`, the MLX ceilings — live in
+`install_python_stack.py` and the requirements tree, so they are properties of the
+*source* rather than of a release stamp and apply to every install: CLI, CI, dev build
+and `.dmg` alike. That is deliberate — a moving git branch and a republished tag
+are supply-chain surface for CLI users too — and it is a change in what a CLI install
+gets: pinned `pip`, bounded MLX, `triton_kernels` at one commit, and ROCm
+`bitsandbytes` at one release instead of whatever the rolling tag held that day.
 
 ## Consequences worth knowing
 
@@ -125,6 +182,29 @@ rather than the `MIN_DESKTOP_BACKEND_VERSION` floor.
   no longer matches the in-tree digest; for sd.cpp, deleting a pinned tag no longer
   resolves to `latest`. Both are deliberate: a pin that quietly moved is the failure mode
   worth catching, and the errors name the pin, the file and the hatch.
+- **ROCm hosts stop tracking bitsandbytes' main branch.** They used to install the
+  `continuous-release_main` wheel, which is republished on every merge, so they picked up
+  every ROCm change (and every regression) within a day. They now get one release. The
+  substitution is not a downgrade today: all five `libbitsandbytes_rocm*.so` and both
+  `libbitsandbytes_xpu*.so` are byte-identical between that wheel and PyPI `0.50.1`
+  (verified per-member sha256, 2026-08-19); the rolling wheel's only functional
+  difference is in `backends/triton/kernels_4bit.py`, which bnb registers for XPU alone
+  and never for the HIP path. That equality is a fact about today's wheel, not a
+  guarantee — a future ROCm fix will need this pin bumped, exactly as `.dmg` prebuilts do.
+- **`triton_kernels` is now built from one commit on `release/3.6.x`, not its tip.** It
+  is a training speedup installed `--no-deps` and skipped entirely without git, so the
+  blast radius of a stale pin is performance, not function. The comment in the file
+  keeps the branch name, because a bare sha is otherwise unbumpable.
+- **The MLX ceilings will eventually hold users back.** mlx and mlx-vlm ship minor
+  releases frequently; when they do, Apple Silicon stops receiving them until the window
+  moves. That is the point — `_report_mlx_stack_health()` exists because a newer
+  mlx-lm/mlx-vlm against the Studio transformers pin has repeatedly blacked out Train —
+  but it does mean the windows need looking at as part of a release, not once a year.
+- **The pinned `pip` ages.** Nothing needs bootstrap pip to be newest (uv venvs need
+  *a* pip; the behaviours relied on are years old), and `ensurepip` is untouched because
+  the pip CPython bundles is already fixed by the pinned CPython. But a future Python
+  release can need a newer pip than this line names, and the symptom would be a
+  bootstrap failure rather than a wrong install.
 
 ## Bumping the pins
 
@@ -137,6 +217,23 @@ closed until it is corrected. The backend version needs no manual step — it fo
 
 Changes to the pins file trigger `clean-machine-install-ci.yml`, which installs on a
 toolchain-stripped machine, so a bump is exercised rather than assumed.
+
+The four first-run Python pins live next to what they pin, and each carries its own
+bump recipe in a comment:
+
+| Pin | How to re-resolve it |
+| --- | --- |
+| `triton_kernels` | `git ls-remote https://github.com/triton-lang/triton refs/heads/release/3.6.x` — paste the full sha into `triton-kernels.txt` |
+| ROCm `bitsandbytes` | pick the newest PyPI release, confirm it still ships `libbitsandbytes_rocm*.so` for the arch families in `_GFX_TO_AMD_INDEX_ARCH`, move `_BNB_ROCM_PINNED_SPEC` |
+| bootstrap `pip` | `curl -sL https://pypi.org/pypi/pip/json` → `.info.version` |
+| MLX windows | move each ceiling to the minor after the current release; keep `mlx` and `mlx-metal` identical |
+
+`tests/studio/install/test_first_run_install_pins.py` guards all four: it fails on any
+requirements file that references a git ref which is not a full 40-character commit sha,
+on a malformed or floor-violating version pin, on an MLX window that excludes the release
+it was resolved against or admits the next minor, and — driving `install_python_stack()`
+and `_ensure_rocm_torch()` — on argv that reaches pip without the pinned values.
+The bump table above is only bookkeeping; those tests are what actually fails.
 
 ## On the build itself
 

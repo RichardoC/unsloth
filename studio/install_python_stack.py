@@ -33,6 +33,11 @@ if str(_BACKEND_DIR) not in sys.path:
 # setup.sh/setup.ps1 invoke this by path, so its directory is sys.path[0].
 import install_manifest  # noqa: E402
 
+# Same directory, same reason. Imported (rather than re-spelling its env-var names)
+# so the pins below share one definition of the escape hatches with the ggml-family
+# prebuilt installers; it is stdlib-only, so this adds no dependency.
+import prebuilt_core  # noqa: E402
+
 from backend.utils.wheel_utils import (
     flash_attn_package_version,
     flash_attn_wheel_url,
@@ -491,6 +496,86 @@ def _repair_bad_anyio() -> None:
     )
 
 
+# -- Mutable-reference pins -----------------------------------------------------
+# Steps of this installer used to name something that changes under them: a
+# republished GitHub tag (ROCm bitsandbytes), `--upgrade` with no ceiling (the MLX
+# stack), and "newest" (bootstrap pip). Each meant the same desktop build -- and the
+# same `curl | sh` -- installed different code on different days with nothing
+# reviewing the change: a supply-chain surface, not only non-determinism. The three
+# are pinned here, together, so a bump is one edit. The fourth of the set,
+# triton_kernels, is pinned to a commit in backend/requirements/triton-kernels.txt,
+# because that is where the requirement lives.
+#
+# All three answer to the shared escape hatch UNSLOTH_PREBUILT_ALLOW_LATEST=1
+# (prebuilt_core.ALLOW_LATEST_ENV, reused rather than a fourth variable): with it
+# set, every pin below reverts to exactly the pre-pin behaviour. A requirements file
+# cannot read the environment, so triton_kernels is not covered by it.
+# See studio/DETERMINISM.md.
+
+
+def _allow_latest_pins() -> bool:
+    """True when the caller opted into pre-pin "track the newest" behaviour."""
+    return prebuilt_core.allow_latest_prebuilt()
+
+
+# pip resolves every other dependency, so bootstrapping "whatever pip is newest
+# today" put a moving part underneath the entire install. Pinned exact rather than
+# bounded: pip is the resolver, its own resolution behaviour changes between
+# releases, and there is nothing to be gained from a range.
+#
+# Nothing here needs pip to be the newest release -- the code only needs *a* pip
+# (uv venvs ship none), and the two behaviours it does depend on, PEP 517 builds and
+# `--only-binary`, have been stable for years. The ensurepip path is deliberately
+# left alone: the pip CPython bundles is fixed by the pinned CPython, so it is
+# already deterministic.
+# To bump: `curl -sL https://pypi.org/pypi/pip/json | jq -r .info.version`.
+_PIP_BOOTSTRAP_VERSION = "26.2.1"  # released 2026-08-04
+
+
+def _pip_bootstrap_spec() -> str:
+    """The pip requirement to bootstrap into the venv."""
+    return "pip" if _allow_latest_pins() else f"pip=={_PIP_BOOTSTRAP_VERSION}"
+
+
+# Apple Silicon MLX stack. Ceilings, not exact pins: mlx is pre-1.0, so its breaking
+# changes land in MINOR releases, which makes <next-minor the compatible-release
+# window here. Patch releases inside each window stay admitted on purpose -- an
+# exact == would strand Apple Silicon users on a broken combination just as readily
+# as no ceiling does, and mlx-vlm in particular ships fixes as patches. The numbers
+# below are the next minor after the releases this was resolved against on
+# 2026-08-19: mlx/mlx-metal 0.32.1, mlx-lm 0.31.3, mlx-vlm 0.6.15.
+#
+# _report_mlx_stack_health() exists because a newer mlx-lm/mlx-vlm paired with the
+# Studio transformers pin has repeatedly blacked out Train; the ceilings are what stop
+# that pairing arriving unannounced.
+#
+# Deliberately no floors. With --upgrade a floor cannot change what a healthy install
+# resolves to -- the newest admissible version is already chosen -- so it would only
+# change the failing case, and change it for the worse: without uv there is no
+# UV_OVERRIDE, so mlx-vlm's own `transformers>=5.14.0` collides with the pinned
+# transformers==5.5.0 in constraints.txt, and the resolver backtracking to an older
+# mlx-vlm is the only thing that keeps that install from failing outright. A floor
+# turns a degraded-but-installed stack, which the health probe above already reports
+# and the background self-heal already retries, into a fatal install error on macOS.
+#
+# mlx pins `mlx-metal==<its own version>` on Darwin, so the mlx-metal ceiling must stay
+# identical to the mlx one or the pair becomes unsatisfiable.
+# To bump: check PyPI for each of the four and move each ceiling to the next minor.
+_MLX_STACK_SPECS: tuple[str, ...] = (
+    "mlx<0.33",
+    "mlx-metal<0.33",
+    "mlx-lm<0.32",
+    "mlx-vlm<0.7",
+)
+# Pre-pin behaviour: bare names, newest of everything.
+_MLX_STACK_UNBOUNDED: tuple[str, ...] = ("mlx", "mlx-metal", "mlx-lm", "mlx-vlm")
+
+
+def _mlx_stack_specs() -> tuple[str, ...]:
+    """The four MLX requirements to install on Apple Silicon."""
+    return _MLX_STACK_UNBOUNDED if _allow_latest_pins() else _MLX_STACK_SPECS
+
+
 # AMD Windows ROCm wheels (repo.amd.com/rocm/whl/{arch_family}/).
 # Override with UNSLOTH_ROCM_WINDOWS_MIRROR for air-gapped/mirror installs.
 _ROCM_WINDOWS_INDEX_BASE = (
@@ -523,6 +608,14 @@ _GFX_TO_AMD_INDEX_ARCH: dict[str, str] = {
 # bitsandbytes continuous-release_main wheels with the ROCm 4-bit GEMV fix
 # (bnb #1887, post-0.49.2). bnb <= 0.49.2 NaNs at decode shape on every AMD GPU;
 # PyPI 0.50.0 is the first release with the fix, so the fallback below is safe.
+#
+# NO LONGER THE DEFAULT SOURCE -- reached only under UNSLOTH_PREBUILT_ALLOW_LATEST=1
+# (see _bnb_rocm_prerelease_url). `continuous-release_main` is a rolling tag that is
+# republished in place on every merge to bnb's main, so these URLs named different
+# bytes on different days: the wheel filename says 1.33.7.preview forever while its
+# metadata version walks forward (0.50.2.dev0 as of 2026-08-19). There is no
+# immutable handle on that tag, and the fix it existed for has since shipped in a
+# real release -- see _BNB_ROCM_PINNED_SPEC.
 _BNB_ROCM_PRERELEASE_URLS: dict[str, str] = {
     "x86_64": (
         "https://github.com/bitsandbytes-foundation/bitsandbytes/releases/"
@@ -546,14 +639,55 @@ _BNB_ROCM_PRERELEASE_URLS: dict[str, str] = {
 # Keep in step with the amd extra in pyproject.toml and the install.sh fallback.
 _BNB_ROCM_PYPI_FALLBACK = "bitsandbytes>=0.50.0"
 
+# The immutable reference that replaces the rolling tag above, and the default ROCm
+# bitsandbytes source. This is not a downgrade: the shared libraries that carry the
+# ROCm (and XPU) kernels are byte-identical between the 0.50.1 release on PyPI and
+# the continuous-release_main wheel -- verified per-member sha256 over both wheels on
+# 2026-08-19, all five libbitsandbytes_rocm*.so and both libbitsandbytes_xpu*.so
+# equal. The rolling wheel's only functional difference is in
+# backends/triton/kernels_4bit.py, which bnb registers for XPU alone, never for the
+# HIP path; the CUDA libraries differ and do not matter on a ROCm host.
+#
+# Exact rather than a floor: >=0.50.0 is what the *fallback* keeps (install.sh shares
+# that constant, and a floor is the right shape for "anything at least as fixed as
+# this"), but the primary install is what every ROCm host actually gets, so it names
+# one release. To bump: confirm the new release still ships libbitsandbytes_rocm*.so
+# for the arch families in _GFX_TO_AMD_INDEX_ARCH, then move this line.
+_BNB_ROCM_PINNED_SPEC = "bitsandbytes==0.50.1"  # released 2026-08-13
+
 
 def _bnb_rocm_prerelease_url() -> str | None:
     """Return the continuous-release_main bnb wheel URL for the current arch,
     or None when no pre-release wheel is available.
+
+    None unless UNSLOTH_PREBUILT_ALLOW_LATEST=1: that tag is republished in place, so
+    installing from it silently changed the installed bytes. With the hatch off the
+    callers install _BNB_ROCM_PINNED_SPEC instead -- an immutable release carrying
+    byte-identical ROCm kernels.
     """
+    if not _allow_latest_pins():
+        return None
     arch = platform.machine().lower()
     arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(arch, arch)
     return _BNB_ROCM_PRERELEASE_URLS.get(arch)
+
+
+def _bnb_rocm_primary_spec(arch_key: str | None = None) -> str | None:
+    """What to install first for ROCm bitsandbytes, or None when there is nothing.
+
+    Default: the exact pinned release. Under UNSLOTH_PREBUILT_ALLOW_LATEST=1: the
+    rolling continuous-release_main wheel for this arch, as before the pin -- and
+    None there when the arch has no such wheel, so the caller still reaches the
+    PyPI fallback rather than installing nothing.
+
+    ``arch_key`` names the wheel table entry directly (the Windows caller knows it
+    is win_amd64 regardless of what platform.machine() says under emulation).
+    """
+    if not _allow_latest_pins():
+        return _BNB_ROCM_PINNED_SPEC
+    if arch_key is None:
+        return _bnb_rocm_prerelease_url()
+    return _BNB_ROCM_PRERELEASE_URLS.get(arch_key)
 
 
 def _bnb_rocm_arch_has_binary() -> bool:
@@ -1916,34 +2050,41 @@ _rocm_windows_torch_installed: bool = False
 
 
 def _install_bnb_windows_rocm() -> bool:
-    """Install AMD Windows BNB, pre-release wheel first. Returns True on success.
+    """Install AMD Windows BNB, pinned release first. Returns True on success.
 
-    The wheel's filename version (1.33.7.preview, PEP 440 1.33.7rc0) does not
-    match its metadata (0.50.x.dev0). uv rejects the mismatch and still mangles
-    the install under UV_SKIP_WHEEL_FILENAME_CHECK, so force plain pip, which
-    performs no such check. Per the AMD install guide
-    (https://unsloth.ai/docs/get-started/install/amd/amd-hackathon).
+    The first attempt is _BNB_ROCM_PINNED_SPEC, an exact PyPI release. Its win_amd64
+    wheel ships libbitsandbytes_rocm{714,72}.dll from 0.50.0 on, so this is a real
+    ROCm build; before 0.50.0 PyPI was CUDA-only, which is why the rolling
+    continuous-release_main wheel used to be first and why the >=0.50.0 floor below
+    is a real fallback rather than a downgrade.
 
-    When that URL is blocked, fall back to PyPI. Its win_amd64 wheel ships
-    libbitsandbytes_rocm{714,72}.dll from 0.50.0 on, so the fallback is a real
-    ROCm build; before 0.50.0 it was CUDA-only, which is why there was none.
+    UNSLOTH_PREBUILT_ALLOW_LATEST=1 puts that rolling wheel back in front. Its
+    filename version (1.33.7.preview, PEP 440 1.33.7rc0) does not match its metadata
+    (0.50.x.dev0); uv rejects the mismatch and still mangles the install under
+    UV_SKIP_WHEEL_FILENAME_CHECK, so plain pip is forced -- it performs no such
+    check. Per the AMD install guide
+    (https://unsloth.ai/docs/get-started/install/amd/amd-hackathon). force_pip stays
+    set for the pinned spec too: nothing here needs uv, and one code path that always
+    behaves the same way is worth more than a marginally faster install.
     """
-    _bnb_win_url = _BNB_ROCM_PRERELEASE_URLS.get("win_amd64")
+    _bnb_win_spec = _bnb_rocm_primary_spec("win_amd64")
     _ok = False
-    if _bnb_win_url is not None:
+    if _bnb_win_spec is not None:
         _ok = pip_install_try(
-            "bitsandbytes (AMD Windows, pre-release main)",
+            "bitsandbytes (AMD Windows, pre-release main)"
+            if _allow_latest_pins()
+            else "bitsandbytes (AMD Windows, pinned)",
             "--force-reinstall",
             "--no-cache-dir",
             "--no-deps",
-            _bnb_win_url,
+            _bnb_win_spec,
             constrain = False,
             force_pip = True,
         )
         if not _ok:
             _safe_print(
                 _red(
-                    "   bnb pre-release install failed; falling back to PyPI "
+                    "   bnb install failed; falling back to PyPI "
                     f"{_BNB_ROCM_PYPI_FALLBACK}, which carries the ROCm 4-bit fix"
                 )
             )
@@ -3266,20 +3407,25 @@ def _ensure_rocm_torch() -> None:
                 [sys.executable, "-m", "pip", "uninstall", "-y", "bitsandbytes"],
                 capture_output = True,
             )
-    # Install bitsandbytes only when torch links against ROCm. Prefers the
-    # continuous-release_main wheel (bnb PR #1887 4-bit GEMV fix), falling back
-    # to PyPI when the pre-release wheel won't install. Use pip for the
-    # pre-release wheel because uv rejects its filename/metadata version mismatch.
+    # Install bitsandbytes only when torch links against ROCm, from the exact release
+    # _BNB_ROCM_PINNED_SPEC names: its ROCm kernels are byte-identical to the
+    # continuous-release_main wheel that used to be first here (bnb PR #1887 4-bit
+    # GEMV fix), and unlike that rolling tag it cannot change underneath us.
+    # UNSLOTH_PREBUILT_ALLOW_LATEST=1 restores the wheel-first order; that wheel needs
+    # plain pip, because uv rejects its filename/metadata version mismatch. Either way
+    # the >=0.50.0 floor stays the fallback if the first attempt cannot install.
     elif rocm_torch_ready:
-        _bnb_url = _bnb_rocm_prerelease_url()
+        _bnb_spec = _bnb_rocm_primary_spec()
         _bnb_installed = False
-        if _bnb_url is not None:
+        if _bnb_spec is not None:
             _bnb_installed = pip_install_try(
-                "bitsandbytes (AMD, pre-release main)",
+                "bitsandbytes (AMD, pre-release main)"
+                if _allow_latest_pins()
+                else "bitsandbytes (AMD, pinned)",
                 "--force-reinstall",
                 "--no-cache-dir",
                 "--no-deps",
-                _bnb_url,
+                _bnb_spec,
                 constrain = False,
                 force_pip = True,
             )
@@ -3289,7 +3435,7 @@ def _ensure_rocm_torch() -> None:
                 )
                 _safe_print(
                     _red(
-                        "   bnb pre-release install failed; falling back to PyPI "
+                        "   bnb install failed; falling back to PyPI "
                         f"{_BNB_ROCM_PYPI_FALLBACK}{_fallback_note}"
                     )
                 )
@@ -4383,8 +4529,10 @@ def install_python_stack() -> int:
     #    include pip by default).
     USE_UV = _bootstrap_uv()
 
-    # 2. Ensure pip is available (uv venvs from install.sh omit pip).
+    # 2. Ensure pip is available (uv venvs from install.sh omit pip), at the pinned
+    #    version -- see _PIP_BOOTSTRAP_VERSION for why this is not "newest".
     _progress("pip bootstrap")
+    _pip_spec = _pip_bootstrap_spec()
     if USE_UV:
         run(
             "Bootstrapping pip via uv",
@@ -4394,12 +4542,12 @@ def install_python_stack() -> int:
                 "install",
                 "--python",
                 sys.executable,
-                "pip",
+                _pip_spec,
             ],
         )
     else:
-        # pip may not exist yet (uv-created venvs omit it). Try ensurepip,
-        # then upgrade. Direct upgrade only when pip is already present.
+        # pip may not exist yet (uv-created venvs omit it). Try ensurepip, then move
+        # to the pin. Direct install only when pip is already present.
         _has_pip = (
             subprocess.run(
                 [sys.executable, "-m", "pip", "--version"],
@@ -4411,28 +4559,30 @@ def install_python_stack() -> int:
         )
 
         if not _has_pip:
+            # ensurepip installs the pip CPython bundles, which the pinned CPython
+            # fixes -- already deterministic, so it is left as it is.
             run(
                 "Bootstrapping pip via ensurepip",
                 [sys.executable, "-m", "ensurepip", "--upgrade"],
             )
         else:
             run(
-                "Upgrading pip",
-                [sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
+                "Upgrading pip" if _allow_latest_pins() else f"Installing {_pip_spec}",
+                [sys.executable, "-m", "pip", "install", "--upgrade", _pip_spec],
             )
 
-    # macOS arm64: install MLX stack at latest (UV_OVERRIDE relaxes the
-    # mlx-vlm / mlx-lm transformers pin -- set at module load).
+    # macOS arm64: install the MLX stack inside the bounded window
+    # _mlx_stack_specs() defines (UV_OVERRIDE relaxes the mlx-vlm / mlx-lm
+    # transformers pin -- set at module load). --upgrade stays: with ceilings in
+    # place it means "newest inside the window", which is how an older venv is
+    # walked forward without letting a new minor in.
     if IS_MAC_ARM and not skip_base:
         _progress("MLX stack (Apple Silicon)")
         pip_install(
             "Installing MLX stack (mlx + mlx-lm + mlx-vlm)",
             "--no-cache-dir",
             "--upgrade",
-            "mlx",
-            "mlx-metal",
-            "mlx-lm",
-            "mlx-vlm",
+            *_mlx_stack_specs(),
         )
 
     # gfx906: the base install below resolves unsloth's unconditional bitsandbytes
