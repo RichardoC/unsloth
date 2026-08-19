@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "comment": "Trust anchors for scripts/build_macos_runtime.sh, which assembles the self-contained macOS arm64 runtime that ships inside Unsloth.app/Contents/Resources/runtime. Every archive this file names is verified against the sha256 below BEFORE it is extracted, and the build fails closed on a mismatch: a bundled runtime is code that ships signed inside the app, so an unverified download here is worse than an unverified download at install time. The other three components reuse trust anchors that already exist in this tree rather than duplicating them -- llama.cpp and whisper.cpp go through studio/prebuilt_release_pins.json (in-tree digest -> release checksum index -> per-archive sha256), Node through studio/node_prebuilt_pins.json (digests frozen from nodejs.org SHASUMS256.txt), and the Python distributions through studio/backend/requirements/locks/*.lock.txt under --require-hashes. Nothing in this file may be hand-written from memory; each digest is copied from the upstream checksum file named in its own comment.",
+  "pinned_at_utc": "2026-08-19",
+  "components": {
+    "cpython": {
+      "comment": "Relocatable CPython from astral-sh/python-build-standalone -- the same distribution uv installs for a managed Python, so the interpreter in the bundle is the interpreter this repo's installer already uses. install_only_stripped, not install_only: the stripped variant drops debug symbols (25 MB compressed / 66 MB installed) and is what `uv python install` fetches. sha256 copied from the release's SHA256SUMS asset; re-record it with: curl -sL https://github.com/astral-sh/python-build-standalone/releases/download/<release>/SHA256SUMS | grep <asset>. WHY 3.13 AND NOT 3.14: install.sh pins 3.13 on Apple Silicon, and on macOS arm64 3.14 has strictly worse wheel coverage for the full bundle -- extras.txt routes darwin + python>=3.14 to MeCab==0.996.5, the last release carrying an sdist (a source build inside a bundle build is exactly what a prebuilt payload exists to avoid), and torch publishes cp314 macOS arm64 wheels only as macosx_14_0 while cp313 is macosx_11_0. 3.13.8 is skipped upstream too (install.sh PYTHON_SKIP: python/cpython#139783 breaks `import torch`), so the pin must stay at 3.13.9 or newer.",
+      "repo": "astral-sh/python-build-standalone",
+      "release": "20260728",
+      "python_version": "3.13.14",
+      "python_minor": "3.13",
+      "asset": "cpython-3.13.14+20260728-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "checksum_asset": "SHA256SUMS",
+      "sha256": "aa2a054f5e04bde63ae199e3bb6bbb634e457423efd294842deeb1299e7e5932"
+    }
+  },
+  "layout": {
+    "comment": "The payload contract. studio/src-tauri reads the bundled runtime through these exact paths, so they are data, not prose: scripts/build_macos_runtime.sh refuses to finish unless every one of them exists, and tests/security/test_macos_runtime_bundle.py asserts the script and the prune list still agree with this list. Changing anything here is changing an interface the Rust side depends on.",
+    "root": "Contents/Resources/runtime",
+    "required_dirs": [
+      "python",
+      "site-packages",
+      "llama.cpp",
+      "whisper.cpp",
+      "node",
+      "oxc-node-modules"
+    ],
+    "required_files": [
+      "BUNDLE_MANIFEST.json",
+      "python/bin/python3",
+      "site-packages/unsloth_cli/__init__.py",
+      "site-packages/studio/backend/run.py",
+      "llama.cpp/build/bin/llama-server",
+      "whisper.cpp/build/bin/whisper-server",
+      "node/bin/node",
+      "node/lib/node_modules/npm/bin/npm-cli.js",
+      "oxc-node-modules/oxc-parser/package.json"
+    ],
+    "required_files_comment": "The two site-packages entries are exactly what studio/src-tauri/src/bundled_runtime.rs::health() refuses to start without: unsloth_cli/__init__.py is what the bundled CLI entrypoint imports, and studio/backend/run.py is what `unsloth studio` loads to serve the backend (unsloth_cli/commands/studio.py::_find_run_py). Asserting them at build time means a payload that would fail that health check never reaches a .dmg.",
+    "required_executables": [
+      "python/bin/python3",
+      "llama.cpp/build/bin/llama-server",
+      "whisper.cpp/build/bin/whisper-server",
+      "node/bin/node"
+    ],
+    "required_imports": [
+      "fastapi",
+      "transformers",
+      "torch",
+      "mlx",
+      "diffusers",
+      "datasets",
+      "uvicorn",
+      "pymupdf",
+      "bitsandbytes",
+      "unsloth_zoo"
+    ]
+  },
+  "prune": {
+    "comment": "Everything the build deletes from the payload, with the reason it is safe. This list is CLOSED: tests/security/test_macos_runtime_bundle.py fails if an entry here would match anything in layout.required_dirs / required_files, and fails if the build script prunes a path this list does not name. Adding an entry means arguing, in the reason field, why the bundled app never needs it -- 'it looked big' is not a reason. Deliberately NOT pruned: per-package test suites and docs inside site-packages (a package that imports its own test helpers, or reads its own data files, fails at runtime rather than at build time, and the win is not worth that class of bug), and python/include (torch.utils.cpp_extension reads it).",
+    "entries": [
+      {
+        "path": "site-packages/studio/frontend",
+        "kind": "dir",
+        "optional": false,
+        "reason": "The unsloth wheel ships the whole Studio frontend -- both the vite build (studio/frontend/dist) and its TypeScript sources -- so that `unsloth studio` from a plain pip install can serve the web UI itself. 108 MiB measured, and entirely duplicate here: the Tauri app renders the frontend that is already inside the app bundle and launches the backend with --api-only, which is not a configuration but an invariant (studio/src-tauri's own process.rs test is named backend_args_always_enable_api_only). Nothing imports from this tree; backend/run.py only reads it when serving the UI, which the desktop never asks it to do. Consequence, deliberately accepted: running `python3 -m unsloth_cli studio` WITHOUT --api-only against the bundled interpreter exits with run.py's existing 'frontend build not found' message instead of serving a stale copy of the UI. Non-optional, because if this path stops existing the wheel changed shape and somebody should look."
+      },
+      {
+        "path": "node/include",
+        "kind": "dir",
+        "optional": false,
+        "reason": "Node's C++ headers, for building native addons. ~65 MB. The bundle runs one script (the OXC validator) against prefetched node_modules and never compiles an addon; oxc-node-modules ships its own prebuilt darwin-arm64 binding."
+      },
+      {
+        "path": "node/share/doc",
+        "kind": "dir",
+        "optional": true,
+        "reason": "Node's bundled documentation (the ChangeLog and API docs). Nothing in the app reads it, and no code path resolves a path under share/doc."
+      },
+      {
+        "path": "node/share/man",
+        "kind": "dir",
+        "optional": true,
+        "reason": "Node and npm man pages. Nothing in the app shells out to `man`, and npm does not read them to run."
+      },
+      {
+        "path": "python/lib/python*/idlelib",
+        "kind": "glob",
+        "optional": true,
+        "reason": "IDLE, the bundled Tk IDE. Nothing imports it; tkinter itself is kept because matplotlib's backend selection probes for it."
+      },
+      {
+        "path": "python/share/man",
+        "kind": "dir",
+        "optional": true,
+        "reason": "CPython man pages, for the same reason as Node's: nothing in the app invokes `man`."
+      },
+      {
+        "path": "__pycache__",
+        "kind": "dir-name",
+        "optional": true,
+        "reason": "Compiled bytecode caches. The app runs with PYTHONDONTWRITEBYTECODE=1, so a stale .pyc in the read-only bundle would never be refreshed, and a .pyc whose source mtime does not match is silently ignored anyway. Removing them makes the payload deterministic as well as smaller."
+      }
+    ]
+  },
+  "target": {
+    "comment": "The one macOS arm64 resolution the bundle is built for. macos_deployment_target is NOT cosmetic: it decides which wheels exist. At 13.0 there is no installable bitsandbytes at all (every macOS arm64 bitsandbytes wheel from 0.49.0 on is macosx_14_0), so the resolver backtracks `unsloth` to 2025.7.2 -- the last release whose bitsandbytes requirement an ancient py3-none-any wheel satisfies -- and drags mlx-vlm back to 0.3.9 with it. At 14.0 the same inputs resolve unsloth 2026.8.18, bitsandbytes 0.50.1, pytorch-tokenizers 1.4.1 and the mlx window install_python_stack.py documents (mlx 0.32.1 / mlx-lm 0.31.3 / mlx-vlm 0.6.15). So the bundle requires macOS 14; raising or lowering this changes the resolution and requires regenerating darwin-arm64-bundle.lock.txt.",
+    "rust_target": "aarch64-apple-darwin",
+    "uv_python_platform": "aarch64-apple-darwin",
+    "macos_deployment_target": "14.0"
+  }
+}

@@ -349,7 +349,29 @@ compile_lock data-designer single-env/data-designer.txt single-env/data-designer
 # ------------------------------------------------------------------------ check
 
 if [ "$CHECK_ONLY" = "1" ]; then
-    if diff -ru "$LOCK_DIR" "$OUT_DIR"; then
+    # Locks that live in LOCK_DIR but are NOT produced here, excluded from the diff so
+    # their presence is not read as "the committed locks are stale".
+    #
+    # scripts/gen_macos_bundle_lock.sh owns darwin-arm64-bundle.lock.txt: one
+    # single-platform resolution for the macOS app bundle, covering exactly the steps
+    # the WHAT IS *NOT* LOCKED section above explains this generator cannot lock.
+    # It has its own --check, run by the same lanes.
+    #
+    # This is an allowlist, not a wildcard: any OTHER unexpected file in LOCK_DIR still
+    # fails the diff, which is the property this check exists to protect.
+    FOREIGN_LOCKS=(darwin-arm64-bundle.lock.txt)
+    diff_args=()
+    for foreign in "${FOREIGN_LOCKS[@]}"; do
+        if [ ! -f "$LOCK_DIR/$foreign" ]; then
+            echo "error: $FOREIGN_LOCKS references $foreign, which is not committed." >&2
+            echo "       Regenerate it (bash scripts/gen_macos_bundle_lock.sh) or drop it" >&2
+            echo "       from FOREIGN_LOCKS here." >&2
+            exit 1
+        fi
+        diff_args+=("--exclude=$foreign")
+    done
+
+    if diff -ru "${diff_args[@]}" "$LOCK_DIR" "$OUT_DIR"; then
         echo "locks are up to date" >&2
     else
         echo >&2
