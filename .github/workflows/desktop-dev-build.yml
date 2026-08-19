@@ -28,10 +28,10 @@
 #
 # This workflow is also the proving ground for the self-contained payload:
 # scripts/build_macos_runtime.sh assembles a complete macOS arm64 runtime (CPython,
-# every Python distribution, llama.cpp, whisper.cpp, Node, the OXC node_modules) and
-# scripts/inject_macos_runtime.sh puts it inside Contents/Resources/runtime, so
-# copying the app off the .dmg is the whole installation and first launch builds
-# nothing. The verification step below does not merely check that the files landed:
+# every Python distribution, llama.cpp, whisper.cpp, stable-diffusion.cpp, Node, the
+# OXC node_modules) and scripts/inject_macos_runtime.sh puts it inside
+# Contents/Resources/runtime, so copying the app off the .dmg is the whole
+# installation and first launch builds nothing. The verification step below does not merely check that the files landed:
 # it mounts the .dmg and runs THE BUNDLED INTERPRETER against the BUNDLED
 # site-packages, because "the payload is present" and "the payload works" are
 # different claims and only the second one matters to a user.
@@ -135,9 +135,10 @@ jobs:
 
       - name: Assemble the bundled runtime payload
         # Everything the app needs at runtime, verified at build time: CPython, all
-        # Python distributions under --require-hashes, llama.cpp, whisper.cpp, Node
-        # and the OXC node_modules. Runs BEFORE tauri build so a payload failure
-        # costs seconds rather than a full Rust compile.
+        # Python distributions under --require-hashes, llama.cpp, whisper.cpp,
+        # stable-diffusion.cpp, Node and the OXC node_modules. No skip flags: those
+        # mark the payload incomplete and the proof step below refuses it. Runs BEFORE
+        # tauri build so a payload failure costs seconds rather than a full Rust compile.
         env:
           UV: ${{ steps.uv.outputs.bin }}
         run: |
@@ -268,6 +269,7 @@ jobs:
           test -d "$runtime/site-packages"
           test -d "$runtime/llama.cpp"
           test -d "$runtime/whisper.cpp"
+          test -d "$runtime/stable-diffusion.cpp"
           test -d "$runtime/node"
           test -d "$runtime/oxc-node-modules"
           test -f "$runtime/BUNDLE_MANIFEST.json"
@@ -285,8 +287,14 @@ jobs:
               assert key in manifest, f"BUNDLE_MANIFEST.json is missing {key!r}"
           assert manifest["python"]["venv"] is False
           assert manifest["distribution_count"] > 100, manifest["distribution_count"]
-          for component in ("python", "llama_cpp", "whisper_cpp", "node"):
+          for component in ("python", "llama_cpp", "whisper_cpp", "sd_cpp", "node"):
               assert manifest["components"][component]["asset_sha256"], component
+          # sd.cpp is the one component whose install-time path verifies against a digest
+          # GitHub serves beside the asset. The bundle must not: its digest comes from the
+          # pins file in this repo, and this is where a regression to the old path shows up.
+          assert manifest["components"]["sd_cpp"]["pins_file"] == "studio/macos_runtime_pins.json", (
+              manifest["components"]["sd_cpp"]
+          )
           assert not manifest["incomplete"], manifest["incomplete"]
           print(f"manifest ok: {manifest['distribution_count']} distributions, "
                 f"python {manifest['python']['version']}")
@@ -299,6 +307,24 @@ jobs:
           "$server" --version 2>&1 | head -5
           test -x "$runtime/whisper.cpp/build/bin/whisper-server"
           test -x "$runtime/node/bin/node"
+
+          # stable-diffusion.cpp, the same way: both binaries present, executable and
+          # arm64, and the CLI actually identifies itself. Without this the app would
+          # still generate images -- by downloading 45 MiB the first time somebody
+          # pressed Generate, which is the thing the payload exists to abolish.
+          sd_cli="$runtime/stable-diffusion.cpp/build/bin/sd-cli"
+          sd_server="$runtime/stable-diffusion.cpp/build/bin/sd-server"
+          test -x "$sd_cli"
+          test -x "$sd_server"
+          file "$sd_cli" | grep -q 'arm64'
+          file "$sd_server" | grep -q 'arm64'
+          # `|| true`: older sd-cli builds print their usage and exit non-zero, which
+          # under pipefail would fail the step for the wrong reason. The output is what
+          # is being judged -- the same predicate sd_cpp_engine.help_text_identifies_sd_cpp
+          # uses to decide an executable really is stable-diffusion.cpp.
+          sd_help="$("$sd_cli" --help 2>&1 || true)"
+          printf '%s\n' "$sd_help" | head -5
+          printf '%s\n' "$sd_help" | grep -qi 'stable-diffusion\|--cfg-scale'
           # Pruned on purpose; a reappearance means the prune list stopped applying.
           test ! -d "$runtime/node/include"
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "comment": "Trust anchors for scripts/build_macos_runtime.sh, which assembles the self-contained macOS arm64 runtime that ships inside Unsloth.app/Contents/Resources/runtime. Every archive this file names is verified against the sha256 below BEFORE it is extracted, and the build fails closed on a mismatch: a bundled runtime is code that ships signed inside the app, so an unverified download here is worse than an unverified download at install time. The other three components reuse trust anchors that already exist in this tree rather than duplicating them -- llama.cpp and whisper.cpp go through studio/prebuilt_release_pins.json (in-tree digest -> release checksum index -> per-archive sha256), Node through studio/node_prebuilt_pins.json (digests frozen from nodejs.org SHASUMS256.txt), and the Python distributions through studio/backend/requirements/locks/*.lock.txt under --require-hashes. Nothing in this file may be hand-written from memory; each digest is copied from the upstream checksum file named in its own comment.",
+  "comment": "Trust anchors for scripts/build_macos_runtime.sh, which assembles the self-contained macOS arm64 runtime that ships inside Unsloth.app/Contents/Resources/runtime. Every archive this file names is verified against the sha256 below BEFORE it is extracted, and the build fails closed on a mismatch: a bundled runtime is code that ships signed inside the app, so an unverified download here is worse than an unverified download at install time. A component belongs in THIS file only when the tree holds no anchor for it already -- llama.cpp and whisper.cpp go through studio/prebuilt_release_pins.json (in-tree digest -> release checksum index -> per-archive sha256), Node through studio/node_prebuilt_pins.json (digests frozen from nodejs.org SHASUMS256.txt), and the Python distributions through studio/backend/requirements/locks/*.lock.txt under --require-hashes. Two components have no such anchor and are pinned here directly: CPython (python-build-standalone publishes SHA256SUMS but nothing in this tree tracks it) and stable-diffusion.cpp (its releases publish no checksum index at all, so before this pin the only digest available was the one GitHub serves beside the asset -- the same channel that serves the asset). Nothing in this file may be hand-written from memory; each digest is copied from the upstream checksum file, or recorded from the downloaded archive, exactly as its own comment describes.",
   "pinned_at_utc": "2026-08-19",
   "components": {
     "cpython": {
@@ -12,16 +12,24 @@
       "asset": "cpython-3.13.14+20260728-aarch64-apple-darwin-install_only_stripped.tar.gz",
       "checksum_asset": "SHA256SUMS",
       "sha256": "aa2a054f5e04bde63ae199e3bb6bbb634e457423efd294842deeb1299e7e5932"
+    },
+    "sd_cpp": {
+      "comment": "The stable-diffusion.cpp prebuilt (sd-cli + sd-server) that backs native image generation on Apple Silicon. Measured: 45.2 MiB as the release archive, 110.4 MiB installed (two ~55 MB executables, sd-cli and sd-server), so it costs roughly the former on the .dmg and the latter in the installed app. Worth it because without it the app is complete except for image generation, which then downloads that same 45 MiB archive the first time somebody presses Generate. WHY THE DIGEST IS HERE AND NOT DERIVED: unlike llama.cpp and whisper.cpp, an sd.cpp release publishes no checksum index, so there is nothing in this tree -- or in any second channel -- to chain to. studio/install_sd_cpp_prebuilt.py therefore verifies against the `digest` GitHub serves beside the asset, which arrives over the same connection that served the asset: adequate for an opportunistic install, and not a standard to bake into a signed app. The line below closes that gap the only way available: the archive was downloaded once, its sha256 recorded in this diff, and every build from now on compares against bytes a human accepted. It is also the digest GitHub currently reports for the asset, so the two agree today; if they ever disagree, the value HERE is the one that decides, and the build stops. Re-record it with: curl -fsSL https://github.com/unslothai/stable-diffusion.cpp/releases/download/<release_tag>/<asset> | sha256sum. HOW TO BUMP: move DEFAULT_TAG in studio/install_sd_cpp_prebuilt.py first, then re-record the tag, the asset name and the digest here. scripts/fetch_macos_prebuilts.py refuses to build when the two disagree, because a bundle carrying a different build from the one a `pip install` user gets is a second, unreviewed configuration nobody tests.",
+      "repo": "unslothai/stable-diffusion.cpp",
+      "release_tag": "master-813-bfbef5b-u13b9d92",
+      "asset": "sd-master-813-bfbef5b-u13b9d92-bin-Darwin-macOS-arm64.zip",
+      "sha256": "1778b6da9529f74a77a056abfddbd00a6d06efa4f5865ee51a2509d36b9aa38e"
     }
   },
   "layout": {
-    "comment": "The payload contract. studio/src-tauri reads the bundled runtime through these exact paths, so they are data, not prose: scripts/build_macos_runtime.sh refuses to finish unless every one of them exists, and tests/security/test_macos_runtime_bundle.py asserts the script and the prune list still agree with this list. Changing anything here is changing an interface the Rust side depends on.",
+    "comment": "The payload contract. studio/src-tauri reads the bundled runtime through these exact paths, so they are data, not prose: scripts/build_macos_runtime.sh refuses to finish unless every one of them exists, and tests/security/test_macos_runtime_bundle.py asserts the script and the prune list still agree with this list. Changing anything here is changing an interface the Rust side depends on. The three native slots all use the layout their own installer produces under ~/.unsloth -- <component>/build/bin/<binary> plus the installer's marker JSON at the component root -- so the app finds the bundled copy through paths it already knows: llama.cpp and whisper.cpp via prebuilt_core.assemble_install_tree, stable-diffusion.cpp via sd_cpp_engine._layout_candidates, whose first candidate is build/bin. stable-diffusion.cpp names BOTH binaries because they are two different execution modes rather than a binary and a spare: sd-server loads the model once and serves many images, sd-cli reloads it per image, and a payload missing sd-server would silently ship the slow one.",
     "root": "Contents/Resources/runtime",
     "required_dirs": [
       "python",
       "site-packages",
       "llama.cpp",
       "whisper.cpp",
+      "stable-diffusion.cpp",
       "node",
       "oxc-node-modules"
     ],
@@ -32,6 +40,8 @@
       "site-packages/studio/backend/run.py",
       "llama.cpp/build/bin/llama-server",
       "whisper.cpp/build/bin/whisper-server",
+      "stable-diffusion.cpp/build/bin/sd-cli",
+      "stable-diffusion.cpp/build/bin/sd-server",
       "node/bin/node",
       "node/lib/node_modules/npm/bin/npm-cli.js",
       "oxc-node-modules/oxc-parser/package.json"
@@ -41,6 +51,8 @@
       "python/bin/python3",
       "llama.cpp/build/bin/llama-server",
       "whisper.cpp/build/bin/whisper-server",
+      "stable-diffusion.cpp/build/bin/sd-cli",
+      "stable-diffusion.cpp/build/bin/sd-server",
       "node/bin/node"
     ],
     "required_imports": [

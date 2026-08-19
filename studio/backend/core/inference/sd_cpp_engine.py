@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
+from utils.bundled_runtime import bundled_runtime_root
 from utils.process_lifetime import adopt_pid, child_popen_kwargs, forget_pid
 from utils.native_path_leases import child_env_without_native_path_secret
 from utils.subprocess_compat import windows_hidden_subprocess_kwargs
@@ -54,6 +55,12 @@ _SERVER_STEM = "sd-server"
 
 # Ownership marker written by install_sd_cpp_prebuilt.install and required by setup.sh / uninstall.sh / uninstall.ps1 before they delete a tree.
 OWNER_MARKER = ".unsloth-studio-owned"
+
+# The slot stable-diffusion.cpp occupies inside the runtime that ships in Unsloth.app
+# (Contents/Resources/runtime/stable-diffusion.cpp). Named in
+# studio/macos_runtime_pins.json's layout contract, which the payload build asserts, so
+# this string and that one have to stay the same string.
+BUNDLED_SLOT_NAME = "stable-diffusion.cpp"
 
 # Ceiling for one native run. The native engine exists FOR slow CPU hosts: on GPU-less CI runners a 512x512 4-step Q2_K generation took 900 s on Linux and 1465 s on Windows, so a 30-minute cap killed jobs that were still progressing.
 # It matches the Images page's own SETTLE_MAX_MS (6 h), so it only stops a WEDGED process from holding the lock forever; cancel_event is the user-facing abort.
@@ -377,6 +384,39 @@ def managed_install_root() -> Path:
     return _studio_component_root("stable-diffusion.cpp")
 
 
+def bundled_install_root() -> Optional[Path]:
+    """``Contents/Resources/runtime/stable-diffusion.cpp`` when this process IS the runtime
+    that ships inside Unsloth.app and that slot is populated, else None.
+
+    The macOS app carries a complete runtime and installs nothing on first run, which for
+    image generation means the sd-cli / sd-server prebuilt travels in the .dmg instead of
+    being downloaded the first time somebody presses Generate. This is how the finder sees
+    it: the same role UNSLOTH_LLAMA_CPP_PATH / UNSLOTH_WHISPER_CPP_PATH play for the ggml
+    components, except it needs no environment variable, because the predicate is
+    corroborated rather than declared -- ``bundled_runtime_root`` requires the manifest
+    beside the site-packages directory AND ``sys.prefix`` inside the same tree, which no
+    value left in a shell profile can arrange (see utils.bundled_runtime).
+
+    None when the slot is absent, which is a real case rather than a defensive one: a
+    payload built with --skip-sd-cpp, or an app from before sd.cpp joined the bundle, has
+    the runtime and not this component, and must keep falling back to the managed install
+    under ~/.unsloth exactly as it does today.
+
+    Never raises: a wrong answer here has to degrade to "no bundled copy", which is the
+    behaviour every non-bundled install already has."""
+    try:
+        root = bundled_runtime_root()
+    except Exception:  # noqa: BLE001 -- "cannot tell" is "not bundled"
+        return None
+    if root is None:
+        return None
+    slot = root / BUNDLED_SLOT_NAME
+    try:
+        return slot if slot.is_dir() else None
+    except OSError:
+        return None
+
+
 def _studio_component_root(name: str) -> Path:
     """``<studio home>/<name>``, or the legacy ``~/.unsloth/<name>`` when no custom home is set
     (or the home *is* the legacy ``~/.unsloth/studio``). The home is expanded and made absolute
@@ -501,9 +541,10 @@ def _find_binary(
 ) -> Optional[str]:
     """Shared finder for the stable-diffusion.cpp binaries (mirrors the llama.cpp finder).
 
-    Order: (1) ``direct_env`` binary path; (2) ``UNSLOTH_SD_CPP_PATH`` install dir; (3) the default
-    install root (honors ``UNSLOTH_STUDIO_HOME`` / ``STUDIO_HOME``, else ``~/.unsloth/...``);
-    (4) ``./stable-diffusion.cpp`` in-tree build; (5) ``path_stems`` on PATH.
+    Order: (1) ``direct_env`` binary path; (2) ``UNSLOTH_SD_CPP_PATH`` install dir; (2b) the copy
+    inside the app bundle; (3) the default install root (honors ``UNSLOTH_STUDIO_HOME`` /
+    ``STUDIO_HOME``, else ``~/.unsloth/...``); (4) ``./stable-diffusion.cpp`` in-tree build;
+    (5) ``path_stems`` on PATH.
     """
     # 1. Direct binary path.
     env_bin = os.environ.get(direct_env)
@@ -514,6 +555,19 @@ def _find_binary(
     custom = os.environ.get("UNSLOTH_SD_CPP_PATH")
     if custom:
         hit = _first_file(_layout_candidates(Path(custom), layout_stem))
+        if hit:
+            return hit
+
+    # 2b. The copy that ships inside Unsloth.app. AFTER the two explicit overrides, because a
+    # user who names a binary or an install dir has chosen a build and must keep getting it, and
+    # BEFORE the managed root, which is the position UNSLOTH_LLAMA_CPP_PATH / UNSLOTH_WHISPER_CPP_PATH
+    # give the bundled ggml components. Preferring it over an older lazy install under ~/.unsloth is
+    # the point: the bundled copy is the pin this app was built and tested against
+    # (macos_runtime_pins.json components.sd_cpp, kept equal to install_sd_cpp_prebuilt.DEFAULT_TAG),
+    # it needs no download, and it is read-only, so nothing can have half-replaced it.
+    bundled_root = bundled_install_root()
+    if bundled_root is not None:
+        hit = _first_file(_layout_candidates(bundled_root, layout_stem))
         if hit:
             return hit
 

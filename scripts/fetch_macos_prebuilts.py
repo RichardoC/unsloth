@@ -6,7 +6,7 @@
 
 ``scripts/build_macos_runtime.sh`` owns the Python side (locks + uv). This owns
 everything that arrives as a prebuilt archive: CPython itself, llama.cpp,
-whisper.cpp, Node, and -- behind ``--with-sd-cpp`` -- stable-diffusion.cpp.
+whisper.cpp, stable-diffusion.cpp and Node.
 
 WHY A SEPARATE SCRIPT AND NOT THE INSTALLERS
 
@@ -30,9 +30,14 @@ runs exactly as it does at install time:
 forge, and it is called with an EXPLICIT expected digest here so that the
 ``UNSLOTH_PREBUILT_ALLOW_LATEST`` / ``ALLOW_UNVERIFIED`` escape hatches, which turn
 verification into a no-op at install time, cannot turn it into a no-op in a build
-that ships signed inside an app. Node and CPython have no checksum index; their
-digests are frozen in-tree (``studio/node_prebuilt_pins.json``,
-``studio/macos_runtime_pins.json``) and compared directly.
+that ships signed inside an app. Node, CPython and stable-diffusion.cpp have no
+checksum index; their digests are frozen in-tree
+(``studio/node_prebuilt_pins.json``, ``studio/macos_runtime_pins.json``) and
+compared directly. stable-diffusion.cpp is also the one component whose install-time
+path has no in-tree anchor at all -- ``studio/install_sd_cpp_prebuilt.py`` verifies
+against the ``digest`` GitHub serves beside the asset -- so this script does NOT
+reuse that path: it reads the asset name and digest out of the pins file and never
+asks the release API anything. See ``_install_sd_cpp``.
 
 Every fetch fails closed. There is no unverified path.
 """
@@ -408,62 +413,136 @@ def _install_cpython(*, destination: Path, work_dir: Path) -> dict[str, Any]:
     }
 
 
-# ── stable-diffusion.cpp (opt in) ─────────────────────────────────────────────
-def _install_sd_cpp(*, destination: Path, work_dir: Path) -> dict[str, Any]:
-    """Fetch the sd-cli prebuilt for macOS arm64.
+# ── stable-diffusion.cpp ──────────────────────────────────────────────────────
+#: The executables the sd.cpp archive ships, and what each is for. Both are required:
+#: sd-server loads a model once and serves many images, sd-cli reloads it per image,
+#: and a payload with only the CLI would silently ship the slow mode
+#: (``sd_cpp_backend._resolve_backend`` prefers the server and logs a fallback).
+SD_CPP_BINARIES = ("sd-cli", "sd-server")
 
-    Off by default, and behind its own flag, because sd.cpp is the one prebuilt in
-    this tree with NO in-tree digest anchor: install_sd_cpp_prebuilt.py verifies
-    against the ``digest`` field GitHub publishes alongside the asset, which arrives
-    over the same channel as the asset. That is fine for an opportunistic install
-    and is not the standard the other three components are held to here, so a build
-    only ships it when asked. See the report in the PR that added this file.
+
+def _install_sd_cpp(*, destination: Path, work_dir: Path) -> dict[str, Any]:
+    """Fetch the stable-diffusion.cpp prebuilt (sd-cli + sd-server) for macOS arm64.
+
+    WHY THIS DOES NOT GO THROUGH THE RELEASE API
+
+    ``install_sd_cpp_prebuilt.py`` resolves the asset by listing the release and
+    verifies it against the ``digest`` GitHub publishes beside that asset -- one
+    channel serving both the bytes and the claim about them. Adequate for an
+    opportunistic install; not adequate for a payload that ships signed inside an
+    app, where it would be the single weakest link in an otherwise fully verified
+    tree. So the asset NAME and its sha256 are read out of
+    ``studio/macos_runtime_pins.json`` (recorded there from a download a human
+    accepted, see that file's components.sd_cpp comment), the URL is constructed
+    from them, and the digest is checked BEFORE extraction with the same
+    fail-closed ``_verify`` every other component uses. Nothing here asks the
+    release host what it thinks the digest is.
+
+    The pin is still cross-checked against the installer's own pin, because a
+    bundle carrying a different sd.cpp build from the one a `pip install` user gets
+    is a second configuration nobody tests. The asset name is checked through
+    ``resolve_release_asset`` -- the installer's real host->asset function -- so the
+    pinned file is provably the one a Mac would have chosen for itself.
     """
     sys.path.insert(0, str(STUDIO_DIR))
-    import install_sd_cpp_prebuilt as sd  # noqa: PLC0415  (optional component)
+    import install_sd_cpp_prebuilt as sd  # noqa: PLC0415  (kept out of module import)
 
-    tag = sd.DEFAULT_TAG
-    repo = sd.DEFAULT_REPO
-    api = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
-    _log(f"sd.cpp: resolving {repo}@{tag}")
-    release = json.loads(_http_get(api).decode("utf-8"))
-    assets = release.get("assets") or []
-    names = [asset["name"] for asset in assets]
-    chosen = sd.resolve_release_asset(names, system = "Darwin", machine = "arm64")
-    if not chosen:
-        raise FetchError(f"sd.cpp: {repo}@{tag} publishes no {TARGET_OS}-{TARGET_ARCH} asset")
-    asset = next(item for item in assets if item["name"] == chosen)
-    expected = (asset.get("digest") or "").split(":", 1)[-1]
-    if not expected:
+    pins = _read_json(STUDIO_DIR / "macos_runtime_pins.json")
+    try:
+        entry = pins["components"]["sd_cpp"]
+    except (KeyError, TypeError) as error:
         raise FetchError(
-            f"sd.cpp: {chosen} was published without a sha256 digest, so this download "
-            f"cannot be verified"
-        )
-    archive = work_dir / chosen
-    _download(asset["browser_download_url"], archive)
-    digest = _verify(archive, expected, label = f"sd.cpp/{chosen}")
+            "macos_runtime_pins.json has no components.sd_cpp entry, so there is no "
+            "in-tree digest for stable-diffusion.cpp and the build has nothing to verify "
+            "the archive against"
+        ) from error
+    for field in ("repo", "release_tag", "asset", "sha256"):
+        if not isinstance(entry.get(field), str) or not entry[field].strip():
+            raise FetchError(f"macos_runtime_pins.json: components.sd_cpp.{field} is missing")
 
-    unpacked = _extract(archive, work_dir / "sd-unpacked")
+    repo = entry["repo"]
+    tag = entry["release_tag"]
+    asset = entry["asset"]
+    if repo != sd.DEFAULT_REPO or tag != sd.DEFAULT_TAG:
+        raise FetchError(
+            f"sd.cpp: the bundle pins {repo}@{tag} but install_sd_cpp_prebuilt.py pins "
+            f"{sd.DEFAULT_REPO}@{sd.DEFAULT_TAG}. Move both together: a bundled build that "
+            f"differs from the one users install is a second configuration nobody tests."
+        )
+    chosen = sd.resolve_release_asset([asset], system = "Darwin", machine = "arm64")
+    if chosen != asset:
+        raise FetchError(
+            f"sd.cpp: {asset!r} is not what install_sd_cpp_prebuilt.resolve_release_asset "
+            f"picks for {TARGET_OS}-{TARGET_ARCH} (it picked {chosen!r}), so the pinned asset "
+            f"is not the one a Mac would install for itself"
+        )
+
+    url = prebuilt_core.release_asset_download_url(repo, tag, asset)
+    archive = work_dir / asset
+    _log(f"sd.cpp: downloading {asset} from {repo}@{tag}")
+    _download(url, archive)
+    digest = _verify(archive, entry["sha256"], label = f"sd.cpp/{asset}")
+
+    unpacked = _extract(archive, work_dir / "sd-cpp-unpacked")
     if destination.exists():
         shutil.rmtree(destination)
-    _copy_tree_into(unpacked, destination)
-    binaries = sorted(destination.rglob("sd-cli"))
-    if not binaries:
-        raise FetchError(f"sd.cpp: {chosen} did not contain an sd-cli binary")
-    _make_executable(binaries[0])
+    # The same shape the ggml components use, because the same reasoning applies: it is
+    # what the installer produces under ~/.unsloth/stable-diffusion.cpp, and
+    # sd_cpp_engine._layout_candidates probes build/bin first. The archive's LICENSE and
+    # UNSLOTH_BUILD.txt travel with the binaries rather than being dropped -- they are the
+    # build's own provenance and the license it ships under.
+    bin_dir = destination / "build" / "bin"
+    bin_dir.mkdir(parents = True)
+    _copy_tree_into(unpacked, bin_dir)
+
+    for name in SD_CPP_BINARIES:
+        binary = bin_dir / name
+        if not binary.is_file():
+            raise FetchError(f"sd.cpp: {asset} did not contain {name}")
+        _make_executable(binary)
+
+    marker = {
+        "schema_version": 1,
+        "component": "stable_diffusion_cpp",
+        "published_repo": repo,
+        "release_tag": tag,
+        "upstream_tag": sd.upstream_tag_for(tag),
+        "asset": asset,
+        "asset_sha256": digest,
+        # The Darwin arm64 asset IS the Metal build, and "cpu" is the class
+        # install_sd_cpp_prebuilt.accelerator_class gives it (auto/cpu are one install);
+        # recording anything else would read as a mismatch and invite a reinstall.
+        "accelerator": "cpu",
+        "backend": "metal",
+        "ships_server": True,
+        # Deliberately NOT .unsloth-studio-owned, the installer's ownership marker. That
+        # marker is what install_sd_cpp_prebuilt.install and uninstall.sh use to decide a
+        # tree may be extracted over or deleted, and this tree is code-signed and
+        # read-only. Same decision, for the same reason, as omitting install_fingerprint
+        # from the ggml markers above.
+        "bundled_in_app": True,
+        "bundle_source": "scripts/fetch_macos_prebuilts.py",
+    }
+    (destination / sd.INSTALL_RECORD).write_text(
+        json.dumps(marker, indent = 2) + "\n", encoding = "utf-8"
+    )
 
     return {
         "repo": repo,
         "release_tag": tag,
-        "asset": chosen,
+        "upstream_tag": sd.upstream_tag_for(tag),
+        "asset": asset,
         "asset_sha256": digest,
-        "asset_url": asset["browser_download_url"],
-        "digest_source": "github release asset digest (no in-tree anchor)",
+        "asset_url": url,
+        "layout": "build/bin",
+        "binaries": [f"build/bin/{name}" for name in SD_CPP_BINARIES],
+        "pins_file": "studio/macos_runtime_pins.json",
+        "digest_source": "in-tree pin (macos_runtime_pins.json components.sd_cpp.sha256)",
     }
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
-COMPONENT_ORDER = ("cpython", "llama.cpp", "whisper.cpp", "node", "sd.cpp")
+COMPONENT_ORDER = ("cpython", "llama.cpp", "whisper.cpp", "stable-diffusion.cpp", "node")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -473,7 +552,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--runtime-dir",
         required = True,
-        help = "the runtime/ directory to populate (python/, llama.cpp/, whisper.cpp/, node/)",
+        help = (
+            "the runtime/ directory to populate (python/, llama.cpp/, whisper.cpp/, "
+            "stable-diffusion.cpp/, node/)"
+        ),
     )
     parser.add_argument(
         "--report",
@@ -490,21 +572,24 @@ def main(argv: list[str] | None = None) -> int:
         action = "append",
         choices = COMPONENT_ORDER,
         default = None,
-        help = "fetch only these components (repeatable); default is all but sd.cpp",
+        help = "fetch only these components (repeatable); default is every component",
     )
     parser.add_argument(
-        "--with-sd-cpp",
+        "--skip-sd-cpp",
         action = "store_true",
-        help = "also fetch stable-diffusion.cpp (see _install_sd_cpp for why this is opt-in)",
+        help = (
+            "do not fetch stable-diffusion.cpp. For a fast local build only: the payload is "
+            "then incomplete and fails the layout contract, so it cannot be shipped"
+        ),
     )
     args = parser.parse_args(argv)
 
     runtime_dir = Path(args.runtime_dir).resolve()
     runtime_dir.mkdir(parents = True, exist_ok = True)
 
-    wanted = list(args.only) if args.only else ["cpython", "llama.cpp", "whisper.cpp", "node"]
-    if args.with_sd_cpp and "sd.cpp" not in wanted:
-        wanted.append("sd.cpp")
+    wanted = list(args.only) if args.only else list(COMPONENT_ORDER)
+    if args.skip_sd_cpp and "stable-diffusion.cpp" in wanted:
+        wanted.remove("stable-diffusion.cpp")
 
     owned_work_dir = not args.work_dir
     work_dir = Path(args.work_dir).resolve() if args.work_dir else Path(tempfile.mkdtemp())
@@ -537,13 +622,13 @@ def main(argv: list[str] | None = None) -> int:
                     destination = runtime_dir / "whisper.cpp",
                     work_dir = work_dir,
                 )
+            elif component == "stable-diffusion.cpp":
+                report["sd_cpp"] = _install_sd_cpp(
+                    destination = runtime_dir / "stable-diffusion.cpp", work_dir = work_dir
+                )
             elif component == "node":
                 report["node"] = _install_node(
                     destination = runtime_dir / "node", work_dir = work_dir
-                )
-            elif component == "sd.cpp":
-                report["sd_cpp"] = _install_sd_cpp(
-                    destination = runtime_dir / "sd.cpp", work_dir = work_dir
                 )
     except (FetchError, prebuilt_core.PrebuiltFallback, OSError, ValueError) as error:
         print(f"error: {error}", file = sys.stderr)

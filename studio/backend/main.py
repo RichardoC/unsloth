@@ -456,6 +456,21 @@ def _run_llama_cpp_startup_probes(app: FastAPI) -> None:
         import structlog as _structlog
 
         _log = _structlog.get_logger(__name__)
+        # Both warnings below end in "Run `unsloth studio update`", which is the
+        # wrong instruction when this llama.cpp is the copy inside Unsloth.app: that
+        # tree is code-signed and read-only, the updater refuses it on purpose (see
+        # utils.prebuilt.update_flow.immutable_runtime_root), and there is no managed
+        # install for the command to touch. The facts still get logged -- only the
+        # remedy changes -- so a payload behind on MTP or on releases is still
+        # visible to whoever reads the log.
+        from utils.bundled_runtime import path_is_inside_bundled_runtime
+
+        _bundled = path_is_inside_bundled_runtime(_bin)
+        _remedy = (
+            "Update the Unsloth app to change it."
+            if _bundled
+            else "Run `unsloth studio update`."
+        )
         if (
             _caps.get("found")
             and not _caps.get("supports_mtp")
@@ -463,13 +478,13 @@ def _run_llama_cpp_startup_probes(app: FastAPI) -> None:
         ):
             _msg = (
                 "llama.cpp prebuilt lacks MTP support "
-                "(--spec-type mtp/draft-mtp). Run `unsloth studio update`. "
+                f"(--spec-type mtp/draft-mtp). {_remedy} "
                 "MTP GGUFs will load without speculative decoding."
             )
             _log.warning(_msg)
             print(f"WARNING: {_msg}", flush = True)
         if _freshness.get("stale"):
-            _msg = format_stale_warning(_freshness)
+            _msg = format_stale_warning(_freshness, bundled = _bundled)
             _log.warning(_msg)
             print(f"WARNING: {_msg}", flush = True)
     except Exception as _probe_exc:

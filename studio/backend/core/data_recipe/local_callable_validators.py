@@ -265,11 +265,20 @@ def _run_oxc_batch(
         # is REPLACED rather than kept -- an inherited NODE_PATH is still discarded,
         # which is the whole point of the pop; it is just overwritten with the one
         # directory inside the signed bundle instead of with nothing.
+        # UNSLOTH_OXC_NODE_MODULES is the second half: NODE_PATH is honoured by
+        # CommonJS resolution but NOT by ESM's node_modules walk, so validate.mjs's
+        # bare `import "oxc-parser"` would still fail with it set. The runner reads
+        # this variable, resolves the specifier through createRequire (CJS, so
+        # NODE_PATH applies) and imports the resulting file URL, and takes the
+        # oxlint binary from the same directory. Both are set only in the bundled
+        # case, and both are set explicitly so nothing inherited decides either.
         bundled_modules = bundled_oxc_node_modules()
         if bundled_modules is None:
             env.pop("NODE_PATH", None)
+            env.pop("UNSLOTH_OXC_NODE_MODULES", None)
         else:
             env["NODE_PATH"] = str(bundled_modules)
+            env["UNSLOTH_OXC_NODE_MODULES"] = str(bundled_modules)
         proc = subprocess.run(
             [node_executable, str(_OXC_RUNNER_PATH)],
             cwd = str(_OXC_TOOL_DIR),

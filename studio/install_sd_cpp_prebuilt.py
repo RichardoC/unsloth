@@ -452,6 +452,33 @@ def default_install_dir() -> Path:
     return legacy if is_legacy else root / "stable-diffusion.cpp"
 
 
+# The receipt scripts/build_macos_runtime.sh writes at the root of the runtime that ships inside
+# Unsloth.app/Contents/Resources/runtime; studio/src-tauri refuses to launch a payload without it,
+# so its presence beside a component slot is what identifies that slot as part of the app bundle.
+BUNDLE_MANIFEST_NAME = "BUNDLE_MANIFEST.json"
+
+
+def is_bundled_runtime_target(target: Path) -> bool:
+    """True when ``target`` is a component slot inside the runtime that ships inside the macOS
+    app -- i.e. ``…/Unsloth.app/Contents/Resources/runtime/stable-diffusion.cpp``, where the app
+    now carries a verified sd-cli / sd-server so first-run installs nothing.
+
+    That tree is code-signed and, once the app sits in /Applications, root-owned: extracting into
+    it either fails outright or succeeds and invalidates the signature, after which Gatekeeper
+    refuses to launch the app. ``install``'s existing unowned-directory refusal would stop it
+    anyway -- the slot is non-empty and carries no ownership marker -- but it would say "remove or
+    move that directory", which is exactly the wrong advice about somebody's installed application.
+
+    Deliberately a filesystem question, not an environment variable: this script runs standalone
+    (before the backend package is importable) and cannot use utils.bundled_runtime, and a variable
+    left in a shell profile must not be able to talk it out of an install it should perform. Never
+    raises; "cannot tell" is "not the bundle", which is the behaviour every install already has."""
+    try:
+        return (target.parent / BUNDLE_MANIFEST_NAME).is_file()
+    except OSError:
+        return False
+
+
 def _make_executable(path: Path) -> None:
     mode = path.stat().st_mode
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -754,9 +781,19 @@ def install(
     still works. Raises ``RuntimeError`` when neither source has an asset for the host
     (including when the pinned release no longer resolves anywhere -- it is never
     replaced by an unpinned ``latest``), when the download cannot be verified against a
-    published sha256, or when the archive has no ``sd-cli``.
+    published sha256, when the archive has no ``sd-cli``, or when the target is the copy
+    that ships inside the macOS app bundle (see ``is_bundled_runtime_target``).
     """
     target = install_dir or default_install_dir()
+    # The one target that is never installable: the copy that ships inside the app. Checked before
+    # anything is claimed, downloaded or written, because none of that has a reason to happen.
+    if is_bundled_runtime_target(target):
+        raise RuntimeError(
+            f"stable-diffusion.cpp ships inside the Unsloth app ({target}), which is read-only "
+            f"and code-signed; Unsloth won't write there. Updating the app is how this "
+            f"stable-diffusion.cpp changes. To install a separate copy anyway, pass a writable "
+            f"--install-dir."
+        )
     # Claim ownership of `target` only if we created it, it was empty, or it is already marked: adopting a user's non-empty dir would let a later uninstall wipe it.
     marker = target / ".unsloth-studio-owned"
     _may_own = True

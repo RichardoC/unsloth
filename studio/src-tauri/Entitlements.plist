@@ -2,7 +2,31 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Allow spawning child processes (Python backend, install scripts) -->
+    <!--
+      Entitlements for the APP's own executable (Contents/MacOS/Unsloth) and
+      nothing else. Entitlements are a property of a signed executable, not
+      something a process passes to the children it spawns, so the bundled
+      Python interpreter, node, llama-server and whisper-server carry their own
+      set: see "Sign the bundled runtime and the macOS app" in
+      .github/workflows/release-desktop.yml, which is what signs them.
+
+      com.apple.security.cs.disable-library-validation is deliberately NOT here.
+      It used to be, with the comment "Allow loading Python/venv libraries not
+      signed by us", from when the Python stack was installed at first run into
+      ~/.unsloth. That reasoning never applied to this executable: the Python
+      stack runs in a separate process and its library loading is governed by
+      that process's entitlements. This one is a Rust/Tauri binary that loads
+      WebKit and other Apple frameworks plus its own statically linked code, and
+      it dlopen()s nothing (no libloading, no pyo3, no externalBin sidecar, no
+      Contents/Frameworks). Keeping the relief here would only mean the app's
+      process could be made to load a library signed by anyone at all, which is
+      the one process in the bundle where that matters most.
+    -->
+    <!--
+      Spawning the Python backend and the install scripts needs no entitlement,
+      but the app's own JIT-mapped pages do: WebKit's JavaScript engine is what
+      needs this key, and every WKWebView host carries it.
+    -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
     <!-- Network access for backend health checks and HuggingFace API -->
@@ -10,9 +34,6 @@
     <true/>
     <!-- Permit microphone capture for local dictation -->
     <key>com.apple.security.device.audio-input</key>
-    <true/>
-    <!-- Allow loading Python/venv libraries not signed by us -->
-    <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
 </dict>
 </plist>

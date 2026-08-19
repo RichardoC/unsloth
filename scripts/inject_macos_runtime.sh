@@ -109,15 +109,47 @@ for required in \
     runtime/site-packages \
     runtime/llama.cpp/build/bin/llama-server \
     runtime/whisper.cpp/build/bin/whisper-server \
+    runtime/stable-diffusion.cpp/build/bin/sd-cli \
+    runtime/stable-diffusion.cpp/build/bin/sd-server \
     runtime/node/bin/node \
     runtime/oxc-node-modules
 do
     [ -e "$RESOURCES/$required" ] || die "injection incomplete: $RESOURCES/$required is missing"
 done
-[ -x "$RESOURCES/runtime/python/bin/python3" ] || die \
-    "runtime/python/bin/python3 is not executable inside the app bundle"
-[ -x "$RESOURCES/runtime/llama.cpp/build/bin/llama-server" ] || die \
-    "runtime/llama.cpp/build/bin/llama-server is not executable inside the app bundle"
+# Every binary the app executes, not just the interpreter: `ditto` and `cp -a` both
+# preserve modes, so a missing exec bit here means the payload was assembled wrong,
+# and finding out on a user's Mac costs a failed launch or a failed generation.
+for executable in \
+    runtime/python/bin/python3 \
+    runtime/llama.cpp/build/bin/llama-server \
+    runtime/whisper.cpp/build/bin/whisper-server \
+    runtime/stable-diffusion.cpp/build/bin/sd-cli \
+    runtime/stable-diffusion.cpp/build/bin/sd-server \
+    runtime/node/bin/node
+do
+    [ -x "$RESOURCES/$executable" ] || die \
+        "$executable is not executable inside the app bundle"
+done
+
+# And that they are Mach-O arm64. A binary for the wrong architecture copies, signs and
+# ships perfectly and then cannot start, which is precisely the failure a cross-built
+# payload risks. `file -L` so python3 (a symlink to python3.13) is judged by its target
+# rather than reported as a link. Skipped where `file` is absent, which off a Mac it can
+# be; the dev-build workflow's proof step runs this same assertion on macOS.
+if command -v file >/dev/null 2>&1; then
+    for executable in \
+        runtime/python/bin/python3 \
+        runtime/llama.cpp/build/bin/llama-server \
+        runtime/whisper.cpp/build/bin/whisper-server \
+        runtime/stable-diffusion.cpp/build/bin/sd-cli \
+        runtime/stable-diffusion.cpp/build/bin/sd-server \
+        runtime/node/bin/node
+    do
+        file -L "$RESOURCES/$executable" | grep -q 'arm64' || die \
+            "$executable inside the app bundle is not an arm64 binary: \
+$(file -L "$RESOURCES/$executable")"
+    done
+fi
 echo "    ok: $(du -sh "$RESOURCES/runtime" 2>/dev/null | cut -f1) in Contents/Resources/runtime"
 
 if [ -z "$DMG" ]; then

@@ -356,16 +356,26 @@ def check_freshness(
     return out
 
 
-def format_stale_warning(info: dict, *, component: str) -> str:
-    """Human-readable one-liner for stale prebuilt info."""
+def format_stale_warning(info: dict, *, component: str, bundled: bool = False) -> str:
+    """Human-readable one-liner for stale prebuilt info.
+
+    ``bundled`` swaps the remedy for the copy that ships inside Unsloth.app. The
+    observation is unchanged -- the payload really is behind the newest release --
+    but `unsloth studio update` cannot refresh it: that tree is code-signed and
+    read-only, and the in-app updater refuses it for exactly that reason.
+    """
     age = info.get("age_days")
     installed = info.get("installed_tag") or "unknown"
     latest = info.get("latest_tag") or "unknown"
     age_str = f"{age} day{'s' if age != 1 else ''}" if age is not None else "some time"
+    remedy = (
+        "It ships with the Unsloth app; update the app to refresh it."
+        if bundled
+        else "Run `unsloth studio update` to refresh."
+    )
     return (
         f"{component} prebuilt is {age_str} behind: installed "
-        f"{installed}, latest {latest}. Run `unsloth studio update` "
-        f"to refresh."
+        f"{installed}, latest {latest}. {remedy}"
     )
 
 

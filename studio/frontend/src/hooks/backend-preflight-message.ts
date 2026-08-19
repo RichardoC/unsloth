@@ -11,6 +11,10 @@ export const WORKING_DIRECTORY_UNAVAILABLE = "working_directory_unavailable";
 /// Mirrors PATH_SETTING_UNRESOLVABLE in studio/src-tauri/src/preflight/managed.rs.
 export const PATH_SETTING_UNRESOLVABLE = "path_setting_unresolvable";
 
+/// The runtime that ships inside the app is missing, truncated, or will not run.
+/// Mirrors BUNDLED_RUNTIME_UNUSABLE in studio/src-tauri/src/preflight/managed.rs.
+export const BUNDLED_RUNTIME_UNUSABLE = "bundled_runtime_unusable";
+
 export function preflightStaleMessage(
   disposition: string,
   reason: string | null,
@@ -34,6 +38,14 @@ export function preflightStaleMessage(
   if (kind === PATH_SETTING_UNRESOLVABLE) {
     const which = setting ? `${setting} points` : "One of Unsloth's folder settings points";
     return `${which} somewhere that cannot be resolved, so Unsloth has nowhere safe to run from. Set it to a full path, such as D:\\unsloth-cache, and try again.`;
+  }
+  // Not an install problem either, and the one case where `unsloth studio update`
+  // is not merely unhelpful but impossible: this build carries its own runtime
+  // inside the .app, and the copy that arrived is incomplete or cannot execute
+  // (a truncated download, quarantine, a botched drag). Nothing under the user's
+  // profile can repair it, so the remedy is a fresh copy of the app.
+  if (kind === BUNDLED_RUNTIME_UNUSABLE) {
+    return "Unsloth's built-in runtime is damaged, so the backend cannot start. Download Unsloth again and replace the app.";
   }
   if (disposition === "owned_stale") {
     return "Desktop-owned Unsloth backend is too old for this desktop app. Run `unsloth studio update`, then restart Unsloth.";

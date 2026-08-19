@@ -503,6 +503,15 @@ jobs:
             args: '--target aarch64-apple-darwin'
             label: macOS (Apple Silicon)
             artifact: macos-aarch64
+            # The macOS leg stopped being comparable to the other two when the
+            # bundled runtime landed. On top of the Rust compile it downloads and
+            # hash-verifies a ~2.5 GiB payload, signs its ~700 Mach-O files one
+            # timestamped signature at a time (each one a round trip to Apple's
+            # timestamp service), rewrites a multi-gigabyte disk image twice, and
+            # notarizes the result. desktop-dev-build.yml budgets 90 minutes for
+            # the payload and the build ALONE, with no signing and no
+            # notarization, so 60 here would fail every release.
+            timeout_minutes: 180
           # - platform: macos-latest
           #   args: '--target x86_64-apple-darwin'
           #   label: macOS (Intel)
@@ -510,16 +519,21 @@ jobs:
             args: ''
             label: Linux (x64)
             artifact: linux-x64
+            timeout_minutes: 60
           - platform: windows-latest
             args: ''
             label: Windows (x64)
             artifact: windows-x64
+            timeout_minutes: 60
 
     name: Build ${{ matrix.label }}
     needs: prepare-version
     runs-on: ${{ matrix.platform }}
-    # 6.9-20.9 min observed across platforms and cache states.
-    timeout-minutes: 60
+    # Per leg, not one number for all three: 6.9-20.9 min was observed across
+    # platforms before the bundled runtime, and Linux and Windows still are that.
+    # Only macOS grew, and a shared cap would have to be the macOS one -- which
+    # would let a hung Windows signing step burn three hours instead of one.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
 
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -811,6 +825,153 @@ jobs:
             );
           }
 
+          // ── The macOS bundled runtime, and the order that makes it signable ──
+          // Same shape as the two pins above: the invariant is checked against the
+          // real steps rather than trusted to a comment. Here the invariant is an
+          // ORDER, because getting it wrong does not fail loudly -- it produces a
+          // .dmg that Gatekeeper rejects on a user's machine, or an updater
+          // payload that macOS refuses to launch, days after the release.
+          const macosLegSteps = [
+            'Check the macOS bundle lock is not stale',
+            'Assemble the bundled runtime payload',
+            'Locate the built macOS bundle',
+            'Inject the bundled runtime into the macOS app',
+            'Sign the bundled runtime and the macOS app',
+            'Verify every Mach-O in the macOS bundle is signed',
+            'Rebuild the macOS updater artifact from the signed app',
+            'Rebuild the macOS disk image around the signed app',
+          ];
+          const stepIndex = (name) => {
+            const index = lines.findIndex((line) => new RegExp(`^\\s*- name: ${name}\\s*$`).test(line));
+            if (index === -1) {
+              throw new Error(`The macOS release leg must keep the "${name}" step`);
+            }
+            return index;
+          };
+          const order = [
+            'Check the macOS bundle lock is not stale',
+            'Assemble the bundled runtime payload',
+            'Build macOS app',
+            'Locate the built macOS bundle',
+            'Inject the bundled runtime into the macOS app',
+            'Sign the bundled runtime and the macOS app',
+            'Verify every Mach-O in the macOS bundle is signed',
+            'Rebuild the macOS updater artifact from the signed app',
+            'Rebuild the macOS disk image around the signed app',
+            'Notarize final macOS disk image',
+          ];
+          for (let i = 1; i < order.length; i += 1) {
+            if (stepIndex(order[i - 1]) >= stepIndex(order[i])) {
+              throw new Error(
+                `The macOS release leg must run "${order[i - 1]}" before "${order[i]}". `
+                + 'The payload cannot be injected into a signed bundle (that invalidates the '
+                + 'signature), the disk image cannot be rebuilt before the app it contains is '
+                + 'signed, and notarization cannot run before the image is rebuilt.'
+              );
+            }
+          }
+          for (const name of macosLegSteps) {
+            const block = stepBlock(name);
+            if (!block.some((line) => /^\s*if:\s*matrix\.platform == 'macos-latest'\s*$/.test(line))) {
+              throw new Error(`"${name}" must be gated on the macOS leg`);
+            }
+          }
+
+          // tauri-action must not be handed a signing identity. If it signs the
+          // app, the injection that follows invalidates that signature, and
+          // scripts/inject_macos_runtime.sh would refuse to run at all.
+          const macosBuildBlock = stepBlock('Build macOS app');
+          for (const secret of ['APPLE_SIGNING_IDENTITY', 'APPLE_ID', 'APPLE_PASSWORD', 'APPLE_TEAM_ID']) {
+            if (macosBuildBlock.some((line) => new RegExp(`^\\s*${secret}:`).test(line))) {
+              throw new Error(
+                `"Build macOS app" must not receive ${secret}: tauri signs the app before the `
+                + 'bundled runtime is injected, and injecting into a signed bundle invalidates '
+                + 'the signature. Signing happens after the injection instead.'
+              );
+            }
+          }
+
+          // The injection must not touch the disk image tauri built: that image is
+          // rebuilt around the SIGNED app further down, so adding the payload to
+          // it here would only produce an image whose app is unsigned.
+          const injectBlock = stepBlock('Inject the bundled runtime into the macOS app');
+          if (!injectBlock.some((line) => line.includes('scripts/inject_macos_runtime.sh'))) {
+            throw new Error('The injection step must use scripts/inject_macos_runtime.sh');
+          }
+          if (injectBlock.some((line) => !isComment(line) && /--dmg\b/.test(line))) {
+            throw new Error(
+              'The macOS release leg must not inject into tauri\'s disk image; the image is '
+              + 'rebuilt around the signed app instead'
+            );
+          }
+
+          // What the signature has to be. --options runtime and --timestamp are
+          // both notarization requirements, and --deep is not a substitute for
+          // signing the payload: it walks nested bundles, not files sitting in
+          // Contents/Resources, so it would report success over ~700 unsigned
+          // Mach-Os.
+          const signBlock = stepBlock('Sign the bundled runtime and the macOS app');
+          for (const flag of ['--options runtime', '--timestamp']) {
+            if (!signBlock.some((line) => !isComment(line) && line.includes(flag))) {
+              throw new Error(`The macOS signing step must pass ${flag}`);
+            }
+          }
+          if (signBlock.some((line) => !isComment(line) && /codesign[^\n]*--deep/.test(line))) {
+            throw new Error(
+              'codesign --deep must not sign the bundled runtime: it does not reach Mach-O '
+              + 'files stored as resources, so it would leave the payload unsigned'
+            );
+          }
+          if (!signBlock.some((line) => !isComment(line)
+              && /--entitlements\s+studio\/src-tauri\/Entitlements\.plist/.test(line))) {
+            throw new Error(
+              'The app must be re-signed with studio/src-tauri/Entitlements.plist: codesign '
+              + '--force replaces a signature wholesale, so omitting it strips the app\'s '
+              + 'entitlements'
+            );
+          }
+          if (!signBlock.some((line) => /MIN_SIGNED_TOTAL:/.test(line))) {
+            throw new Error(
+              'The macOS signing step must declare a floor for how many Mach-O files it '
+              + 'signs, so a silently empty payload cannot reach notarization'
+            );
+          }
+
+          // The entitlements split, which is the reason there are two plists at
+          // all: the app does not get library-validation relief (nothing foreign
+          // is loaded into its process), and the payload's executables do (a
+          // user's own torch.compile output and pip-installed extensions are not
+          // signed by us, and hardened runtime is mandatory inside a notarized
+          // bundle).
+          // The <key> element, not the string: both plists explain in a comment
+          // why the key is or is not there, and a substring match would read the
+          // explanation as the setting.
+          const libraryValidationKey =
+            /<key>\s*com\.apple\.security\.cs\.disable-library-validation\s*<\/key>/;
+          const appEntitlements = readFileSync('studio/src-tauri/Entitlements.plist', 'utf8');
+          if (libraryValidationKey.test(appEntitlements)) {
+            throw new Error(
+              'studio/src-tauri/Entitlements.plist must not carry '
+              + 'com.apple.security.cs.disable-library-validation: it applies to the app\'s own '
+              + 'process, which loads nothing but Apple frameworks and its own code. The bundled '
+              + 'interpreter needs it and is signed with its own entitlements instead.'
+            );
+          }
+          if (!signBlock.some((line) => libraryValidationKey.test(line))) {
+            throw new Error(
+              'The payload\'s executables must be signed with '
+              + 'com.apple.security.cs.disable-library-validation, or a user\'s own extension '
+              + 'modules will not load under the hardened runtime a notarized bundle requires'
+            );
+          }
+
+          const verifyBlock = stepBlock('Verify every Mach-O in the macOS bundle is signed');
+          if (!verifyBlock.some((line) => !isComment(line) && /--verify --deep --strict/.test(line))) {
+            throw new Error(
+              'The macOS verification step must run codesign --verify --deep --strict over the app'
+            );
+          }
+
           const releaseBody = process.env.DESKTOP_RELEASE_NOTES;
           if (!releaseBody) {
             throw new Error('DESKTOP_RELEASE_NOTES must not be empty');
@@ -1046,6 +1207,91 @@ jobs:
           security find-identity -v -p codesigning build.keychain
           rm -f certificate.p12
 
+      # ── macOS: the self-contained runtime that ships inside the app ──
+      # Unsloth.app/Contents/Resources/runtime holds a complete macOS arm64
+      # runtime -- CPython, every Python distribution, llama.cpp, whisper.cpp,
+      # Node and the OXC node_modules -- so copying the app off the .dmg is the
+      # whole installation and first launch builds nothing.
+      #
+      # THE ORDER IS NOT NEGOTIABLE. Injecting a payload into a signed bundle
+      # invalidates its signature, so scripts/inject_macos_runtime.sh refuses an
+      # app that is already signed. That single constraint decides this whole leg:
+      #
+      #   assemble payload -> tauri build (UNSIGNED) -> inject -> sign every
+      #   Mach-O in the payload -> sign the app -> rebuild the updater tarball
+      #   and the .dmg around the signed app -> notarize and staple the .dmg
+      #
+      # "Build macOS app" below therefore no longer receives APPLE_SIGNING_IDENTITY
+      # (see the comment there), and everything Apple-signed is signed by the
+      # steps after the injection instead of by tauri-bundler.
+      #
+      # These three steps run BEFORE the build on purpose: they are the ones most
+      # likely to fail (a moved wheel, a bumped pin, a stale lock, an unreachable
+      # release), and failing them costs seconds instead of a ~20 minute compile.
+      - name: Install the pinned uv
+        if: matrix.platform == 'macos-latest'
+        # The version install.sh downloads for users, read out of install.sh
+        # rather than written here twice: the runtime payload is installed by uv,
+        # so a payload built with a different uv is a payload for an install
+        # nobody performs. Both lock generators and the assembly script refuse to
+        # run against any other version, so drift fails loudly here rather than
+        # producing a subtly different bundle. Same step as in
+        # desktop-dev-build.yml, so a dev build is evidence about this one.
+        id: uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^UV_PINNED_VERSION="\([^"]*\)".*/\1/p' install.sh | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read UV_PINNED_VERSION out of install.sh" >&2
+            exit 1
+          fi
+          python3 -m venv "$RUNNER_TEMP/uvpin"
+          "$RUNNER_TEMP/uvpin/bin/python" -m pip install --quiet --disable-pip-version-check \
+            "uv==$version"
+          "$RUNNER_TEMP/uvpin/bin/uv" --version
+          echo "bin=$RUNNER_TEMP/uvpin/bin/uv" >> "$GITHUB_OUTPUT"
+
+      - name: Check the macOS bundle lock is not stale
+        if: matrix.platform == 'macos-latest'
+        # Cheap, and it runs before every expensive step. A bundle lock that no
+        # longer matches a fresh regeneration means a requirements file, the torch
+        # window, the MLX ceilings or the pins moved without the lock following,
+        # and the payload assembled below would ship versions nobody reviewed --
+        # inside a signed, notarized release.
+        shell: bash
+        env:
+          UV: ${{ steps.uv.outputs.bin }}
+        run: bash scripts/gen_macos_bundle_lock.sh --check
+
+      - name: Assemble the bundled runtime payload
+        if: matrix.platform == 'macos-latest'
+        # Everything the app needs at runtime, verified at build time: CPython,
+        # all Python distributions under --require-hashes, llama.cpp,
+        # whisper.cpp, Node and the OXC node_modules.
+        shell: bash
+        env:
+          UV: ${{ steps.uv.outputs.bin }}
+        run: |
+          set -euo pipefail
+          bash scripts/build_macos_runtime.sh --out "$RUNNER_TEMP/runtime"
+          python3 - "$RUNNER_TEMP/runtime/BUNDLE_MANIFEST.json" <<'PY'
+          import json
+          import sys
+
+          manifest = json.load(open(sys.argv[1]))
+          # --skip-diffusers-pin and --with-sd-cpp both record themselves in the
+          # manifest. A release must ship the complete payload, so an incomplete
+          # one fails here rather than reaching a signature.
+          if manifest["incomplete"]:
+              sys.exit(f'the assembled payload is incomplete: {manifest["incomplete"]}')
+          print(
+              f'payload ok: python {manifest["python"]["version"]}, '
+              f'{manifest["distribution_count"]} distributions, '
+              f'{manifest["total_bytes"] / (1024 ** 3):.2f} GiB'
+          )
+          PY
+
       # ── Windows: install Azure Trusted Signing CLI ──
       # This binary runs in the steps holding the Azure Trusted Signing and
       # Tauri signing secrets, so where it comes from is a signing-key question,
@@ -1261,7 +1507,28 @@ jobs:
               output.write(f'artifactPaths={json.dumps(paths)}\n')
           PY
 
-      # ── macOS: build + sign + notarize ──
+      # ── macOS: build unsigned, then inject, then sign, then repackage ──
+      # This step deliberately holds NO Apple credentials. It used to be
+      # "build + sign + notarize" in one action, and that stopped being possible
+      # when the bundled runtime landed: tauri-bundler signs the .app, then builds
+      # the .dmg and the updater tarball from it, and the payload has to go in
+      # BEFORE any of that or the signature it produced is invalid the moment the
+      # runtime is copied in. scripts/inject_macos_runtime.sh refuses a signed
+      # app for exactly that reason.
+      #
+      # So tauri produces an unsigned .app, an unsigned .dmg and an updater
+      # tarball built from an app with no payload in it, and the steps below
+      # replace all three: the payload is injected, every Mach-O in it is signed
+      # with the release identity, the app is signed over the top, and the .dmg
+      # and the updater tarball are rebuilt around the signed app. The .dmg keeps
+      # the path tauri reported, so "Notarize final macOS disk image" and "Stage
+      # release assets" still read steps.build_macos.outputs.artifactPaths and
+      # need no knowledge of any of this.
+      #
+      # APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID are gone from here too: they
+      # only ever did anything in combination with a signing identity (tauri
+      # notarizes only what it signed), and leaving them would suggest this step
+      # still notarizes something. It does not; the .dmg step below does.
       - name: Build macOS app
         id: build_macos
         if: matrix.platform == 'macos-latest'
@@ -1276,22 +1543,785 @@ jobs:
           # prompts for a password when the variable is absent, which would hang
           # the job, so the line stays.
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: studio
           tauriScript: npx --prefix . tauri
           args: -v ${{ matrix.args }}
 
+      - name: Locate the built macOS bundle
+        id: macos_bundle
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.build_macos.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          app="$(find studio/src-tauri/target/aarch64-apple-darwin/release/bundle/macos \
+                   -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$app" ]; then
+            echo "::error::no .app was produced by the macOS build" >&2
+            exit 1
+          fi
+          test -f "$app/Contents/Info.plist"
+          echo "app_path=$app" >> "$GITHUB_OUTPUT"
+          # The three files tauri reported, resolved from the same output the
+          # notarization and staging steps read, so the steps below rewrite
+          # exactly what the release will publish rather than a sibling copy.
+          python3 <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+
+          try:
+              paths = json.loads(os.environ.get('ARTIFACT_PATHS', ''))
+          except json.JSONDecodeError as error:
+              sys.exit(f'Invalid tauri-action artifactPaths output: {error}')
+          if not isinstance(paths, list):
+              sys.exit('tauri-action artifactPaths must be a JSON list')
+          paths = [path for path in paths if isinstance(path, str)]
+
+          def exactly_one(label: str, predicate) -> str:
+              matches = sorted({path for path in paths if predicate(path)})
+              if len(matches) != 1:
+                  sys.exit(f'Expected exactly one {label} from tauri-action, found {matches}')
+              return matches[0]
+
+          # Order matters: an updater signature also ends in .sig, and the tarball
+          # name is a prefix of the signature's.
+          print('dmg_path=' + exactly_one('.dmg', lambda p: p.lower().endswith('.dmg')))
+          print('updater_sig_path=' + exactly_one(
+              'updater signature', lambda p: p.endswith('.app.tar.gz.sig')
+          ))
+          print('updater_path=' + exactly_one(
+              'updater tarball', lambda p: p.endswith('.app.tar.gz')
+          ))
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Inject the bundled runtime into the macOS app
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+        run: |
+          set -euo pipefail
+          # --app only, and no --dmg on purpose. The script's --dmg mode adds the
+          # payload to the image tauri built, which would leave that image holding
+          # an UNSIGNED app; the image is rebuilt further down around the signed
+          # one instead. The script still refuses a signed app, so if anything
+          # ever starts signing before this point, this fails rather than shipping
+          # a broken signature.
+          bash scripts/inject_macos_runtime.sh \
+            --payload "$RUNNER_TEMP/runtime" \
+            --app "$APP"
+
+      # ── macOS: sign the payload, inside out, then the app ──
+      # Tauri's bundler seals resources as data. It does not sign nested Mach-O
+      # files, and Contents/Resources/runtime holds ~700 of them (617 .so/.dylib
+      # in site-packages, 54 in CPython, 45 in llama.cpp, plus whisper.cpp, Node
+      # and the OXC .node addons). Notarization rejects an unsigned Mach-O, so
+      # every one of them is signed here with the release identity, hardened
+      # runtime and a secure timestamp.
+      #
+      # WHY NOT codesign --deep
+      #
+      # Because it would not work, before any of the reasons Apple gives for
+      # calling it "for emergency repairs only". --deep walks nested *bundles* and
+      # the standard code locations inside them; a .so sitting in
+      # Contents/Resources is a resource as far as it is concerned, so it would
+      # sign the app, report success, and leave all ~700 payload Mach-Os
+      # unsigned -- exactly the notarization failure this step exists to prevent.
+      # On top of that it would apply one entitlement set to everything it did
+      # find, which is the opposite of what is wanted here (see the two plists
+      # below).
+      #
+      # WHAT "INSIDE OUT" MEANS HERE
+      #
+      # Signing a container seals what is inside it, so contents must be signed
+      # first or the seal records unsigned content. The payload has exactly one
+      # containment relation -- the .app contains all of it -- because the guard
+      # below refuses any nested .framework/.app/.xpc/.bundle inside the payload,
+      # which is the only thing that could create another one. So the required
+      # order is "all 700 payload Mach-Os, then the app bundle", and the list is
+      # additionally sorted deepest-first so that if a nested bundle ever does
+      # appear the order is still correct while the guard explains itself.
+      - name: Sign the bundled runtime and the macOS app
+        id: sign_macos
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          # Below the ~720 measured today, far above what any single missing
+          # component could leave behind, and per component so that a payload
+          # that lost llama.cpp cannot hide inside a healthy total.
+          MIN_SIGNED_TOTAL: '600'
+          MIN_SIGNED_SITE_PACKAGES: '400'
+          MIN_SIGNED_PYTHON: '30'
+          MIN_SIGNED_LLAMA_CPP: '20'
+          MIN_SIGNED_WHISPER_CPP: '1'
+          MIN_SIGNED_NODE: '1'
+          MIN_SIGNED_OXC_NODE_MODULES: '1'
+        run: |
+          set -euo pipefail
+          # No `set -x` anywhere in this step: the identity is a masked secret and
+          # a traced `codesign --sign "$IDENTITY"` line puts it in the log 700 times.
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "::error::APPLE_SIGNING_IDENTITY is empty; refusing to publish an unsigned bundle." >&2
+            exit 1
+          fi
+
+          # "Import Apple certificate" ran with `set-keychain-settings -t 3600`,
+          # and on this leg it now runs more than an hour before the first
+          # signature (payload assembly plus the Rust compile). An idle keychain
+          # relocks, and codesign against a locked keychain fails with "User
+          # interaction is not allowed". Unlock it here, in the step that needs it.
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+
+          # ── The two entitlement sets ──
+          # studio/src-tauri/Entitlements.plist is the APP's, and it is passed
+          # explicitly below because `codesign --force` on a bundle replaces its
+          # signature wholesale: omitting it would silently strip the app's
+          # network-client and microphone entitlements.
+          #
+          # The payload's executables need a different, deliberately smaller set,
+          # and they need their OWN because entitlements are a property of a
+          # signed executable, not something a parent process passes down. The
+          # bundled python3 is a child process; whatever the app is entitled to
+          # says nothing about what python3 may load.
+          runtime_entitlements="$RUNNER_TEMP/runtime-entitlements.plist"
+          cat > "$runtime_entitlements" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <!--
+                Entitlements for the executables INSIDE Contents/Resources/runtime
+                (python3, node, llama-server, whisper-server and the other helper
+                binaries), not for the app. Two keys, both load-bearing:
+
+                disable-library-validation: hardened runtime otherwise restricts
+                a process to libraries signed by the same Team ID or by Apple.
+                Everything shipped in the payload is signed by us and would pass,
+                but the extension modules a user's own work produces are not:
+                torch.compile writes a .so and dlopen()s it, `pip install` of
+                anything with a native extension lands an unsigned .so in the
+                user's data root, and node loads .node addons the same way. All of
+                that works today because these binaries live unsigned under
+                ~/.unsloth with no hardened runtime at all; shipping them inside a
+                notarized bundle means hardened runtime is mandatory, so the
+                exception has to be stated for the processes that need it.
+
+                allow-unsigned-executable-memory: the JIT paths in the same stack
+                (numba's LLVM JIT, torch inductor) map generated code as
+                executable.
+
+                Deliberately NOT here: allow-dyld-environment-variables. The
+                backend sets DYLD_LIBRARY_PATH for llama-server as a fallback for
+                a prebuilt with wrong install names (see
+                core/inference/llama_cpp.py); hardened runtime strips DYLD_* from
+                a process that is not entitled for it, so that fallback is inert
+                for the bundled copy. That is acceptable because the payload's
+                llama-server resolves through @loader_path, which is what
+                desktop-dev-build.yml proves when it runs the binary out of the
+                mounted .dmg with no DYLD_LIBRARY_PATH set at all. Entitling every
+                payload executable to honour injected loader variables would buy
+                nothing for a case that does not occur.
+              -->
+              <key>com.apple.security.cs.disable-library-validation</key>
+              <true/>
+              <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+              <true/>
+          </dict>
+          </plist>
+          PLIST
+          # plutil, not a comment claiming it is well formed: a malformed
+          # entitlements file makes codesign fail 700 times in a row instead of
+          # once here. Note the XML comment above must contain no double hyphen,
+          # which is what this catches if one is ever added.
+          plutil -lint "$runtime_entitlements"
+          plutil -p "$runtime_entitlements"
+
+          # ── Find the Mach-O files by reading their headers ──
+          # Not by extension: this payload carries .so (CPython extension
+          # modules), .dylib (llama.cpp, ggml, libpython), .node (the OXC parser
+          # binding) and bare extensionless executables (python3.13, node,
+          # llama-server, whisper-server, torch_shm_manager), and a list of
+          # suffixes would have to be right about all of them forever.
+          #
+          # So every regular file under the .app is opened, its first four bytes
+          # are compared against the Mach-O and universal-binary magics, and any
+          # candidate has its `filetype` header field read to decide what it is:
+          # MH_EXECUTE gets the payload entitlements, MH_DYLIB/MH_BUNDLE get none
+          # (a library's entitlements are ignored; the process that loads it is
+          # what carries them), MH_OBJECT is skipped because codesign cannot sign
+          # an object file and notarization does not ask it to, and anything else
+          # fails the release rather than being quietly skipped.
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import struct
+          import sys
+
+          MACHO_MAGICS = {
+              b"\xcf\xfa\xed\xfe": ("<", 64),   # MH_MAGIC_64, little endian
+              b"\xce\xfa\xed\xfe": ("<", 32),   # MH_MAGIC, little endian
+              b"\xfe\xed\xfa\xcf": (">", 64),   # big endian
+              b"\xfe\xed\xfa\xce": (">", 32),
+          }
+          FAT_MAGICS = {b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf",
+                        b"\xbe\xba\xfe\xca", b"\xbf\xba\xfe\xca"}
+          MH_OBJECT, MH_EXECUTE, MH_DYLIB, MH_BUNDLE = 0x1, 0x2, 0x6, 0x8
+          NAMES = {MH_OBJECT: "object", MH_EXECUTE: "executable",
+                   MH_DYLIB: "dylib", MH_BUNDLE: "bundle"}
+
+          def slice_filetype(blob, offset):
+              magic = blob[offset:offset + 4]
+              if magic not in MACHO_MAGICS:
+                  return None
+              endian, _ = MACHO_MAGICS[magic]
+              (filetype,) = struct.unpack_from(endian + "I", blob, offset + 12)
+              return filetype
+
+          def filetypes(path):
+              """Mach-O filetypes in this file, or None if it is not a Mach-O at all."""
+              with open(path, "rb") as handle:
+                  blob = handle.read(65536)
+              if len(blob) < 16:
+                  return None
+              head = blob[:4]
+              if head in MACHO_MAGICS:
+                  found = slice_filetype(blob, 0)
+                  return None if found is None else {found}
+              if head not in FAT_MAGICS:
+                  return None
+              # A universal binary. CA FE BA BE is also the Java class magic, so
+              # the count has to be plausible AND every slice header has to be a
+              # real Mach-O; a class file's version fields fail both.
+              (count,) = struct.unpack_from(">I", blob, 4)
+              if not 1 <= count <= 16:
+                  return None
+              found = set()
+              for index in range(count):
+                  entry = 8 + index * 20
+                  if entry + 20 > len(blob):
+                      return None
+                  (offset,) = struct.unpack_from(">I", blob, entry + 8)
+                  with open(path, "rb") as handle:
+                      handle.seek(offset)
+                      slice_blob = handle.read(4096)
+                  kind = slice_filetype(slice_blob, 0)
+                  if kind is None:
+                      return None
+                  found.add(kind)
+              return found
+
+          app = pathlib.Path(os.environ["APP"]).resolve()
+          runtime = app / "Contents" / "Resources" / "runtime"
+          if not runtime.is_dir():
+              sys.exit(f"{runtime} does not exist; the injection step did not run")
+
+          # A nested bundle would introduce a second containment relation, and
+          # signing the Mach-O inside one instead of the bundle around it is
+          # wrong. None exist today; refuse rather than sign the wrong thing.
+          nested = sorted(
+              str(path.relative_to(app))
+              for path in runtime.rglob("*")
+              if path.is_dir() and path.suffix in (".framework", ".app", ".xpc", ".bundle")
+          )
+          if nested:
+              sys.exit(
+                  "the payload contains nested code bundles, which need to be signed as "
+                  f"bundles rather than as files: {nested}"
+              )
+
+          executables, libraries, objects, unexpected = [], [], [], []
+          scanned = 0
+          for path in sorted(app.rglob("*")):
+              if path.is_symlink() or not path.is_file():
+                  continue
+              scanned += 1
+              try:
+                  kinds = filetypes(path)
+              except OSError as error:
+                  sys.exit(f"could not read {path}: {error}")
+              if not kinds:
+                  continue
+              if kinds == {MH_OBJECT}:
+                  objects.append(str(path))
+                  continue
+              stray = kinds - {MH_EXECUTE, MH_DYLIB, MH_BUNDLE}
+              if stray:
+                  unexpected.append(f"{path}: filetype(s) {sorted(hex(k) for k in stray)}")
+                  continue
+              if MH_EXECUTE in kinds:
+                  executables.append(str(path))
+              else:
+                  libraries.append(str(path))
+
+          if unexpected:
+              sys.exit(
+                  "unrecognised Mach-O filetypes; decide what they are rather than "
+                  "leaving them unsigned:\n  " + "\n  ".join(unexpected)
+              )
+
+          # Everything outside the payload is covered by signing the bundle, and
+          # the only Mach-O a tauri app bundle keeps there is its main executable
+          # in Contents/MacOS. A sidecar or a Frameworks directory appearing later
+          # would need signing of its own, so it fails here instead of shipping
+          # unsigned.
+          macos_dir = app / "Contents" / "MacOS"
+          covered_by_bundle = (
+              {str(path) for path in macos_dir.iterdir() if path.is_file() and not path.is_symlink()}
+              if macos_dir.is_dir() else set()
+          )
+          prefix = str(runtime) + os.sep
+          stray = sorted(
+              path for path in executables + libraries
+              if not path.startswith(prefix) and path not in covered_by_bundle
+          )
+          if stray:
+              sys.exit(
+                  "Mach-O files outside both the payload and Contents/MacOS; signing the "
+                  f"app bundle does not cover these: {stray}"
+              )
+
+          payload_executables = sorted(p for p in executables if p.startswith(prefix))
+          payload_libraries = sorted(p for p in libraries if p.startswith(prefix))
+
+          # Deepest first. See the step comment: with no nested bundles this is
+          # belt and braces, and it stays correct if one ever appears.
+          def depth_key(path):
+              return (-path.count(os.sep), path)
+
+          out = pathlib.Path(os.environ["RUNNER_TEMP"])
+          def dump(name, paths):
+              (out / name).write_bytes(
+                  b"".join(p.encode() + b"\0" for p in sorted(paths, key = depth_key))
+              )
+
+          dump("macho-executables", payload_executables)
+          dump("macho-libraries", payload_libraries)
+          # Object files are not signed, and the verification step needs to know
+          # which ones they were: it re-detects Mach-Os with file(1) and compares
+          # the two views, so "unsigned on purpose" has to be recorded rather than
+          # inferred from a description string.
+          dump("macho-objects", [p for p in objects if p.startswith(prefix)])
+
+          counts = {}
+          for path in payload_executables + payload_libraries:
+              component = pathlib.Path(path).relative_to(runtime).parts[0]
+              counts[component] = counts.get(component, 0) + 1
+          summary = {
+              "scanned_files": scanned,
+              "payload_total": len(payload_executables) + len(payload_libraries),
+              "payload_executables": len(payload_executables),
+              "payload_libraries": len(payload_libraries),
+              "objects_skipped": len(objects),
+              "by_component": counts,
+          }
+          (out / "macho-summary.json").write_text(json.dumps(summary, indent = 2, sort_keys = True))
+          print(json.dumps(summary, indent = 2, sort_keys = True))
+          PY
+
+          # ── The count guard ──
+          # A payload that assembled but landed empty, or lost a component to a
+          # moved path, would otherwise sail through: codesign would sign nothing,
+          # report nothing, and notarization would pass because there is nothing
+          # left to reject.
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          summary = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "macho-summary.json").read_text())
+          floors = {
+              "site-packages": int(os.environ["MIN_SIGNED_SITE_PACKAGES"]),
+              "python": int(os.environ["MIN_SIGNED_PYTHON"]),
+              "llama.cpp": int(os.environ["MIN_SIGNED_LLAMA_CPP"]),
+              "whisper.cpp": int(os.environ["MIN_SIGNED_WHISPER_CPP"]),
+              "node": int(os.environ["MIN_SIGNED_NODE"]),
+              "oxc-node-modules": int(os.environ["MIN_SIGNED_OXC_NODE_MODULES"]),
+          }
+          failures = []
+          total_floor = int(os.environ["MIN_SIGNED_TOTAL"])
+          if summary["payload_total"] < total_floor:
+              failures.append(
+                  f'only {summary["payload_total"]} Mach-O files in the payload, '
+                  f'expected at least {total_floor}'
+              )
+          for component, floor in sorted(floors.items()):
+              found = summary["by_component"].get(component, 0)
+              if found < floor:
+                  failures.append(
+                      f'{component}: {found} Mach-O files, expected at least {floor}'
+                  )
+          if failures:
+              sys.exit(
+                  "the bundled runtime is implausibly thin, so it is not the payload "
+                  "this release is supposed to ship:\n  " + "\n  ".join(failures)
+              )
+          print(f'{summary["payload_total"]} Mach-O files to sign: '
+                f'{summary["payload_executables"]} executables, '
+                f'{summary["payload_libraries"]} libraries '
+                f'({summary["objects_skipped"]} object files skipped)')
+          PY
+
+          # ── Sign ──
+          # One file per codesign call, sequentially. Batching would be faster,
+          # but --timestamp is a round trip to Apple's timestamp service for every
+          # code object; per file means a throttled or dropped timestamp is
+          # retried on its own rather than re-signing 700 files, and the failure
+          # names the file. `read -d ''` keeps arbitrary paths intact and works on
+          # the bash 3.2 that macOS ships.
+          sign_list() {
+            list="$1"
+            shift
+            signed=0
+            while IFS= read -r -d '' path; do
+              attempt=1
+              while :; do
+                if codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
+                     --options runtime --timestamp "$@" "$path"; then
+                  break
+                fi
+                if [ "$attempt" -ge 3 ]; then
+                  echo "::error::codesign failed three times for $path" >&2
+                  return 1
+                fi
+                delay=$(( 10 * attempt ))
+                echo "::warning::codesign failed for $path (attempt $attempt/3); retrying in ${delay}s"
+                sleep "$delay"
+                attempt=$(( attempt + 1 ))
+              done
+              signed=$(( signed + 1 ))
+              # Progress goes to stderr so it reaches the log: stdout is the
+              # function's return channel and the caller reads its last line.
+              if [ $(( signed % 100 )) -eq 0 ]; then
+                echo "  signed $signed ..." >&2
+              fi
+            done < "$list"
+            echo "$signed"
+          }
+
+          echo "==> signing payload libraries (no entitlements: a library's are ignored)"
+          libraries="$(sign_list "$RUNNER_TEMP/macho-libraries" | tail -n 1)"
+          echo "==> signing payload executables (with the runtime entitlements)"
+          executables="$(sign_list "$RUNNER_TEMP/macho-executables" \
+            --entitlements "$runtime_entitlements" | tail -n 1)"
+
+          echo "==> signing the app bundle (last, so it seals a fully signed payload)"
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime --timestamp \
+            --entitlements studio/src-tauri/Entitlements.plist \
+            "$APP"
+
+          total=$(( libraries + executables ))
+          if [ "$total" -lt "$MIN_SIGNED_TOTAL" ]; then
+            echo "::error::signed only $total Mach-O files in the payload" >&2
+            exit 1
+          fi
+          echo "signed $total Mach-O files in the payload ($libraries libraries, $executables executables), then the app"
+          echo "signed_macho_count=$total" >> "$GITHUB_OUTPUT"
+          echo "SIGNED_MACHO_COUNT=$total" >> "$GITHUB_ENV"
+
+      - name: Verify every Mach-O in the macOS bundle is signed
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+          SIGNED: ${{ steps.sign_macos.outputs.signed_macho_count }}
+        run: |
+          set -euo pipefail
+          # An independent oracle first. file(1) is the system's own identification,
+          # so if the header parser in the signing step missed a Mach-O -- the
+          # exact thing notarization would then reject -- the two views disagree
+          # and this fails. `find -type f` excludes symlinks, so nothing is counted
+          # twice through a link.
+          find "$APP" -type f -print > "$RUNNER_TEMP/all-files.txt"
+          file -f "$RUNNER_TEMP/all-files.txt" > "$RUNNER_TEMP/all-types.txt"
+          python3 <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          paths = temp.joinpath("all-files.txt").read_text().splitlines()
+          runtime = str(pathlib.Path(os.environ["APP"]).resolve() / "Contents/Resources/runtime")
+
+          # file(1) output is parsed as "<path>: <description>" rather than paired
+          # positionally with --brief, because a universal binary can be described
+          # over more than one line and positional pairing would then silently
+          # shift every following file's description by one.
+          known = set(paths)
+          bad = sorted(path for path in paths if ": " in path)
+          if bad:
+              sys.exit(f"paths containing ': ' cannot be attributed to a file(1) line: {bad}")
+
+          described = {}
+          current = None
+          for line in temp.joinpath("all-types.txt").read_text().splitlines():
+              head, separator, tail = line.partition(": ")
+              if separator and head in known:
+                  current = head
+                  described[current] = tail
+              elif current is not None:
+                  described[current] += " " + line.strip()
+          undescribed = sorted(set(paths) - set(described))
+          if undescribed:
+              sys.exit(f"file(1) said nothing about {len(undescribed)} files, e.g. {undescribed[:5]}")
+
+          def read_list(name):
+              blob = temp.joinpath(name).read_bytes()
+              return {entry for entry in blob.decode().split("\0") if entry}
+
+          signed = read_list("macho-executables") | read_list("macho-libraries")
+          # Object files are Mach-O but cannot be signed, and the signing step
+          # recorded which ones it decided that about.
+          objects = read_list("macho-objects")
+
+          found = {
+              path for path, description in described.items()
+              if "Mach-O" in description
+              and str(pathlib.Path(path).resolve()).startswith(runtime + os.sep)
+          }
+          found = {str(pathlib.Path(path).resolve()) for path in found}
+          missing = sorted(found - signed - objects)
+          extra = sorted((signed | objects) - found)
+          if missing or extra:
+              sys.exit(
+                  "the signing step's Mach-O list and file(1) disagree, so something in "
+                  f"the payload may be unsigned:\n  only file(1) saw: {missing}\n"
+                  f"  only the signer saw: {extra}"
+              )
+          pathlib.Path(temp, "macho-verify.txt").write_bytes(
+              b"".join(entry.encode() + b"\0" for entry in sorted(signed))
+          )
+          print(f"file(1) and the signer agree on {len(signed)} signed Mach-O files "
+                f"and {len(objects)} unsignable object files")
+          PY
+
+          # Then every one of them, individually: really signed (not ad hoc, so it
+          # carries a Team Identifier) and really hardened (the runtime flag is
+          # what notarization requires and what makes library validation apply).
+          checked=0
+          while IFS= read -r -d '' path; do
+            info="$(codesign --display --verbose=4 "$path" 2>&1)" || {
+              echo "::error::not signed: $path" >&2
+              exit 1
+            }
+            case "$info" in
+              *"flags="*"runtime"*) ;;
+              *) echo "::error::signed without hardened runtime: $path" >&2; exit 1 ;;
+            esac
+            case "$info" in
+              *"Signature=adhoc"*) echo "::error::ad hoc signature: $path" >&2; exit 1 ;;
+            esac
+            case "$info" in
+              *"TeamIdentifier=not set"*)
+                echo "::error::no Team Identifier, so this was not signed with the release identity: $path" >&2
+                exit 1 ;;
+              *"TeamIdentifier="*) ;;
+              *) echo "::error::no Team Identifier line for $path" >&2; exit 1 ;;
+            esac
+            checked=$(( checked + 1 ))
+          done < "$RUNNER_TEMP/macho-verify.txt"
+          echo "verified $checked payload Mach-O signatures"
+          if [ "$checked" -ne "$SIGNED" ]; then
+            echo "::error::verified $checked signatures but the signing step reported $SIGNED" >&2
+            exit 1
+          fi
+
+          # The whole bundle, including the seal over the payload.
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          # The entitlements decision, asserted rather than described. The app is
+          # signed WITHOUT disable-library-validation (nothing foreign is loaded
+          # into its process; see studio/src-tauri/Entitlements.plist), and the
+          # bundled interpreter is signed WITH it, because a user's own
+          # torch.compile output or pip-installed extension is not signed by us.
+          # plutil rather than PlistBuddy: the same value, from a tool this leg
+          # already uses, and reachable through PATH so this step can be executed
+          # against stubs in tests/security.
+          executable="$(plutil -extract CFBundleExecutable raw -o - "$APP/Contents/Info.plist")"
+          app_entitlements="$(codesign --display --entitlements - --xml \
+            "$APP/Contents/MacOS/$executable" 2>/dev/null || true)"
+          case "$app_entitlements" in
+            *disable-library-validation*)
+              echo "::error::the app is signed with com.apple.security.cs.disable-library-validation; it does not need it" >&2
+              exit 1 ;;
+          esac
+          case "$app_entitlements" in
+            *network.client*) ;;
+            *) echo "::error::the app lost its entitlements; --force without --entitlements strips them" >&2; exit 1 ;;
+          esac
+          python_entitlements="$(codesign --display --entitlements - --xml \
+            "$APP/Contents/Resources/runtime/python/bin/python3" 2>/dev/null || true)"
+          case "$python_entitlements" in
+            *disable-library-validation*) ;;
+            *)
+              echo "::error::the bundled interpreter is signed without com.apple.security.cs.disable-library-validation, so a user's own extension modules will not load" >&2
+              exit 1 ;;
+          esac
+          echo "entitlements: app without library-validation relief, bundled interpreter with it"
+
+      # ── macOS: rebuild what tauri built from the pre-injection app ──
+      # tauri produced the updater tarball and the disk image before the payload
+      # existed and before anything was signed, so both are stale. They are
+      # rebuilt here, in place, at the paths tauri reported -- so the release
+      # asset names, "Stage release assets" and "Notarize final macOS disk image"
+      # all stay exactly as they were.
+      #
+      # The tarball is not cosmetic: it is the auto-update payload. Publishing
+      # tauri's copy would push shipped installs an app with no runtime in it and
+      # no Apple signature, which macOS refuses to launch.
+      - name: Rebuild the macOS updater artifact from the signed app
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+          UPDATER: ${{ steps.macos_bundle.outputs.updater_path }}
+          UPDATER_SIG: ${{ steps.macos_bundle.outputs.updater_sig_path }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Empty, not unset: the CLI prompts for a password when the variable is
+          # absent and would hang the job. Same reasoning as the build step.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: |
+          set -euo pipefail
+          # COPYFILE_DISABLE keeps Apple's tar from writing AppleDouble `._`
+          # members for extended attributes. Those would extract as files the
+          # bundle's signature does not seal, and the update would fail to launch.
+          # Symlinks are stored as symlinks (bsdtar does not follow them), which
+          # the payload needs: python/bin/python3 and llama.cpp's libggml chain
+          # are links, and dereferencing them breaks the seal as well.
+          rm -f "$UPDATER" "$UPDATER_SIG"
+          COPYFILE_DISABLE=1 tar -czf "$UPDATER" \
+            -C "$(dirname "$APP")" "$(basename "$APP")"
+
+          # Prove the round trip preserved the signature, on the artifact itself
+          # rather than on the directory it was made from.
+          check="$RUNNER_TEMP/updater-check"
+          rm -rf "$check"
+          mkdir -p "$check"
+          tar -xzf "$UPDATER" -C "$check"
+          extracted="$(find "$check" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$extracted"
+          test -x "$extracted/Contents/Resources/runtime/python/bin/python3"
+          codesign --verify --deep --strict --verbose=2 "$extracted"
+          rm -rf "$check"
+
+          # The updater signature is over the new bytes. This is the minisign key
+          # shipped apps check before they install anything, so a stale signature
+          # is a failed update, not a warning.
+          npx --prefix studio tauri signer sign "$UPDATER"
+          test -s "$UPDATER_SIG"
+          python3 - "$UPDATER_SIG" <<'PY'
+          import base64
+          import binascii
+          import pathlib
+          import sys
+
+          # The same shape "Generate versioned updater metadata" will demand in
+          # publish-release, checked here where the failure names this step.
+          value = pathlib.Path(sys.argv[1]).read_text(encoding = "utf-8").strip()
+          try:
+              decoded = base64.b64decode(value, validate = True)
+          except (binascii.Error, ValueError) as error:
+              sys.exit(f"the regenerated updater signature is not base64: {error}")
+          if not decoded.startswith(b"untrusted comment:") or b"\ntrusted comment:" not in decoded:
+              sys.exit("the regenerated updater signature is not a minisign signature")
+          print("updater signature regenerated and well formed")
+          PY
+          ls -l "$UPDATER" "$UPDATER_SIG"
+
+      - name: Rebuild the macOS disk image around the signed app
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+          DMG: ${{ steps.macos_bundle.outputs.dmg_path }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Converted, grown, written into and converted back, rather than
+          # recreated: tauri's image carries a background, a window size, icon
+          # positions and the /Applications symlink, all encoded in a .DS_Store
+          # that `hdiutil create -srcfolder` would not reproduce. Same approach as
+          # scripts/inject_macos_runtime.sh takes for the dev build, except that
+          # what goes in is the signed app rather than a payload directory.
+          work="$RUNNER_TEMP/dmg-rebuild"
+          rm -rf "$work"
+          mkdir -p "$work/mnt"
+          rw="$work/rw.dmg"
+          trap 'hdiutil detach "$work/mnt" -quiet >/dev/null 2>&1 || true' EXIT
+
+          hdiutil convert "$DMG" -format UDRW -o "$rw" -quiet
+          app_mb="$(du -sm "$APP" | cut -f1)"
+          image_mb="$(du -sm "$rw" | cut -f1)"
+          target_mb=$(( app_mb + image_mb + 512 ))
+          echo "growing the image to ${target_mb}m (app ${app_mb}m + image ${image_mb}m + slack)"
+          hdiutil resize -size "${target_mb}m" "$rw" >/dev/null
+
+          hdiutil attach "$rw" -nobrowse -mountpoint "$work/mnt" -quiet
+          mounted="$(find "$work/mnt" -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$mounted" ]; then
+            echo "::error::no .app inside the disk image tauri produced" >&2
+            exit 1
+          fi
+          if [ "$(basename "$mounted")" != "$(basename "$APP")" ]; then
+            echo "::error::the image holds $(basename "$mounted") but the signed app is $(basename "$APP"); the .DS_Store layout is keyed by name" >&2
+            exit 1
+          fi
+          # ditto, not cp -R: it preserves the symlinks, permissions and extended
+          # attributes the signature depends on.
+          rm -rf "$mounted"
+          ditto "$APP" "$mounted"
+          codesign --verify --deep --strict --verbose=2 "$mounted"
+          test -x "$mounted/Contents/Resources/runtime/python/bin/python3"
+          hdiutil detach "$work/mnt" -quiet
+
+          # ULFO (lzfse) rather than UDZO (zlib): measurably smaller for a payload
+          # that is mostly already-compressed wheels and dylibs, and readable on
+          # every macOS this bundle targets. Matches the dev build's image.
+          hdiutil convert "$rw" -format ULFO -o "$work/out.dmg" -quiet
+          mv "$work/out.dmg" "$DMG"
+
+          # The bundler used to sign the image; nothing does now unless this does,
+          # and notarization requires a signature with a secure timestamp. The
+          # notarization step's first gate is `codesign --verify` on this file, so
+          # a silent failure here stops the release there.
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$DMG"
+          codesign --verify --verbose=2 "$DMG"
+          echo "rebuilt $(du -sh "$DMG" | cut -f1) $DMG"
+
       # ── macOS: notarize + staple the disk image itself ──
-      # tauri-bundler notarizes and staples the .app, but only codesigns the
-      # .dmg it wraps around it (tauri-apps/tauri#7533). The disk image users
-      # actually download therefore ships signed but without a notarization
-      # ticket, so Gatekeeper has to phone home to clear it and blocks it
-      # outright offline. Close that gap here and fail the release if any part
-      # of it does not hold.
+      # This step exists because tauri-bundler notarized and stapled the .app but
+      # only codesigned the .dmg it wrapped around it (tauri-apps/tauri#7533): the
+      # disk image users actually download shipped signed but without a
+      # notarization ticket, so Gatekeeper had to phone home to clear it and
+      # blocked it outright offline.
+      #
+      # Since the bundled runtime landed, tauri signs and notarizes nothing on
+      # this leg (see "Build macOS app"), and this is the ONLY notarization the
+      # release performs. That is deliberate rather than an omission. The ticket
+      # Apple issues for a disk image covers the code nested inside it, so the app
+      # a user drags out of the image is covered by the ticket stapled here. The
+      # updater tarball is not, so an update installed through the updater lands a
+      # signed, hardened, but unstapled app -- which macOS accepts, because the
+      # updater writes the bundle itself and never sets a quarantine attribute, so
+      # no Gatekeeper assessment happens. What protects that path is the minisign
+      # signature the updater checks before it installs anything, and "Rebuild the
+      # macOS updater artifact from the signed app" regenerates it over the signed
+      # bytes.
+      #
+      # Everything below is unchanged, and its first gate still holds: the image
+      # arriving here must already be signed, which is now the rebuild step's job
+      # rather than the bundler's.
       - name: Notarize final macOS disk image
         if: matrix.platform == 'macos-latest'
         shell: bash
@@ -1330,9 +2360,9 @@ jobs:
           PY
           )"
 
-          # First gate, before the multi-minute upload: the bundler signs the
-          # DMG whenever a signing identity is configured, so an unsigned image
-          # here means the signing step silently did nothing.
+          # First gate, before the multi-minute upload: the image is signed by
+          # "Rebuild the macOS disk image around the signed app", so an unsigned
+          # image here means that step silently did nothing.
           codesign --verify --verbose=2 "$dmg_path"
 
           # notarytool has no environment or stdin form for --password, so the
@@ -1983,6 +3013,10 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
           ARTIFACT_KEY: ${{ matrix.artifact }}
+          # The manifest is read out of the SIGNED app bundle, not out of the
+          # staging directory it was assembled in, so what lands in the record is
+          # what shipped. Empty on the legs that ship no payload.
+          BUNDLED_RUNTIME_APP: ${{ steps.macos_bundle.outputs.app_path }}
         run: |
           set -euo pipefail
           if command -v python3 >/dev/null 2>&1; then
@@ -2082,6 +3116,48 @@ jobs:
               'pinned_actions': pinned_actions,
               'pinned_downloads': pinned_downloads,
           }
+
+          # ── The bundled runtime, for the legs that ship one ──
+          # A shipped .dmg now contains a whole Python stack, and "which versions
+          # were in it" has to be answerable from the release rather than from a
+          # runner log that expires. BUNDLE_MANIFEST.json is exactly that answer:
+          # every distribution and its version, the digest of every prebuilt
+          # archive, and a `locks` map that already carries the SHA-256 of
+          # darwin-arm64-bundle.lock.txt. So it is embedded whole, digested as
+          # shipped, and nothing about the payload is restated here -- the same
+          # reason pinned_downloads is scraped out of the workflow above instead of
+          # being copied into it.
+          app = os.environ.get('BUNDLED_RUNTIME_APP', '')
+          if os.environ['PLATFORM'].startswith('macos') and not app:
+              sys.exit(
+                  'the macOS leg recorded no app bundle, so the bundled runtime cannot be '
+                  'described; "Locate the built macOS bundle" must run before this step'
+              )
+          if app:
+              manifest_path = pathlib.Path(app, 'Contents/Resources/runtime/BUNDLE_MANIFEST.json')
+              if not manifest_path.is_file():
+                  sys.exit(f'{manifest_path} is missing; the signed app ships no bundled runtime')
+              manifest_bytes = manifest_path.read_bytes()
+              manifest = json.loads(manifest_bytes)
+              if manifest.get('incomplete'):
+                  sys.exit(f'the shipped payload is incomplete: {manifest["incomplete"]}')
+              bundle_lock = 'darwin-arm64-bundle.lock.txt'
+              if bundle_lock not in manifest.get('locks', {}):
+                  sys.exit(
+                      f'BUNDLE_MANIFEST.json records no {bundle_lock}, so the release cannot '
+                      'say which lock resolved the payload'
+                  )
+              record['bundled_runtime'] = {
+                  'root': 'Contents/Resources/runtime',
+                  'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+                  'manifest': manifest,
+                  # Recorded because a payload nobody signed is the failure this
+                  # release path exists to prevent, so the count belongs with the
+                  # digests rather than only in the signing step's log.
+                  'signed_macho_count': int(os.environ.get('SIGNED_MACHO_COUNT', '0')),
+              }
+              if record['bundled_runtime']['signed_macho_count'] <= 0:
+                  sys.exit('no Mach-O count was recorded, so nothing proves the payload was signed')
 
           out_dir = pathlib.Path(os.environ['RUNNER_TEMP'], 'build-inputs')
           out_dir.mkdir(parents=True, exist_ok=True)
@@ -2185,9 +3261,12 @@ jobs:
     # is one runner slot held for the length of the run.
     needs: [prepare-version]
     runs-on: ubuntu-latest
-    # Waits out the build (legs cap at 60) then downloads and uploads; the
-    # publish steps themselves are 17-40s.
-    timeout-minutes: 90
+    # Waits out the build (the macOS leg caps at 180 now that it assembles,
+    # signs and notarizes the bundled runtime; the other two still cap at 60)
+    # then downloads and uploads. The publish steps themselves are 17-40s, but
+    # the macOS .dmg went from tens of megabytes to ~600 MB, so the download and
+    # the `gh release upload` are no longer instant either.
+    timeout-minutes: 210
     permissions:
       contents: write      # create the versioned Release and replace updater-channel metadata
       actions: read        # the waiter reads this run's job list
@@ -2223,7 +3302,12 @@ jobs:
           # The three matrix legs, by their `name:` (Build <matrix.label>).
           LEGS=('Build macOS (Apple Silicon)' 'Build Linux (x64)' 'Build Windows (x64)')
           POLL=30
-          DEADLINE=$(( $(date +%s) + 75 * 60 ))
+          # Longer than the longest leg's own cap (macOS, 180 minutes since the
+          # bundled runtime), so a leg that is merely slow is waited out and only
+          # a leg that has genuinely stopped reporting trips this. Shorter than
+          # this job's 210, so the timeout is this explicit message rather than
+          # the runner killing the job.
+          DEADLINE=$(( $(date +%s) + 195 * 60 ))
           # Matrix job records appear with the run, so a leg still missing well
           # after the start is a real problem, not a slow API.
           STARTUP_DEADLINE=$(( $(date +%s) + 15 * 60 ))
@@ -2347,6 +3431,19 @@ jobs:
                   f'missing={sorted(EXPECTED_LEGS - set(platforms))}, '
                   f'unexpected={sorted(set(platforms) - EXPECTED_LEGS)}'
               )
+
+          # The macOS .dmg ships a complete Python runtime inside the app bundle.
+          # A release whose record cannot say which one is a release whose runtime
+          # is unauditable once the runner logs expire, so refuse to publish it.
+          macos = platforms['macos-aarch64']
+          bundled = macos.get('bundled_runtime') or {}
+          if not bundled.get('manifest_sha256') or not bundled.get('manifest'):
+              sys.exit(
+                  'the macOS build input record carries no bundled runtime manifest, so the '
+                  'release could not say what is inside the app bundle it publishes'
+              )
+          if bundled.get('signed_macho_count', 0) <= 0:
+              sys.exit('the macOS build input record reports no signed Mach-O files')
 
           commits = {key: record['commit'] for key, record in platforms.items()}
           if len(set(commits.values())) != 1:
@@ -2827,7 +3924,14 @@ jobs:
     # A missing secret, a VirusTotal outage or quota exhaustion must not fail
     # the release whose assets are already uploaded.
     continue-on-error: true
-    timeout-minutes: 30
+    # Raised with the bundled runtime. scripts/virustotal_scan.py already uploads
+    # through the signed-URL flow because "every desktop bundle is 41-46 MB",
+    # which is over the 32 MB cap on POST /files; the macOS .dmg is now ~600 MB,
+    # so that one upload alone is an order of magnitude slower than the whole scan
+    # used to be. Nothing else changes: the job still cannot block a release, and a
+    # .dmg that exceeds VirusTotal's 650 MB signed-URL ceiling degrades to an
+    # annotated "unavailable" row rather than a failure.
+    timeout-minutes: 60
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0

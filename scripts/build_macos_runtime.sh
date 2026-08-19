@@ -15,6 +15,7 @@
 #   runtime/site-packages/         every installed distribution, flat
 #   runtime/llama.cpp/             llama.cpp prebuilt, ~/.unsloth/llama.cpp layout
 #   runtime/whisper.cpp/           whisper.cpp prebuilt, same layout
+#   runtime/stable-diffusion.cpp/  sd-cli + sd-server prebuilt, same layout
 #   runtime/node/                  trimmed Node (bin/node + npm, no include/)
 #   runtime/oxc-node-modules/      prefetched node_modules for the OXC validator
 #   runtime/BUNDLE_MANIFEST.json   what is inside, and where every byte came from
@@ -51,7 +52,10 @@
 #                          gen_python_locks.sh generates plus the macOS bundle lock
 #                          gen_macos_bundle_lock.sh generates.
 #   Prebuilt archives      Every one, fail-closed, through the in-tree digest chain
-#                          (see scripts/fetch_macos_prebuilts.py).
+#                          (see scripts/fetch_macos_prebuilts.py). llama.cpp and
+#                          whisper.cpp chain through prebuilt_release_pins.json;
+#                          CPython, Node and stable-diffusion.cpp are compared
+#                          directly against a digest committed in this tree.
 #   OXC node_modules       npm ci against the committed package-lock.json, whose
 #                          every entry carries an integrity digest.
 #   The two local          Built from this checkout. Their identity is the commit.
@@ -69,19 +73,25 @@
 #
 #   bash scripts/build_macos_runtime.sh --out <dir>       # assemble into <dir>
 #   bash scripts/build_macos_runtime.sh --out <dir> --skip-diffusers-pin
-#   bash scripts/build_macos_runtime.sh --out <dir> --with-sd-cpp
+#   bash scripts/build_macos_runtime.sh --out <dir> --skip-sd-cpp
 #   UV=/path/to/uv bash scripts/build_macos_runtime.sh --out <dir>
 #
 # --skip-diffusers-pin exists for build hosts that cannot reach
 # github.com/*/archive/*.zip (some egress policies block it while allowing
-# releases). It is recorded in the manifest as an incomplete payload so a build that
-# used it cannot be mistaken for a shippable one.
+# releases). --skip-sd-cpp exists to shave a 45 MiB download off a local iteration
+# on something else entirely. NEITHER may ship: both are recorded in the manifest's
+# `incomplete` list, and the dev-build workflow refuses a payload whose `incomplete`
+# is non-empty, so a build that used one cannot be mistaken for a shippable one.
+# --skip-sd-cpp additionally removes the stable-diffusion.cpp paths from the layout
+# assertion below -- narrowly, by name, only for the component that was skipped, so
+# a component that was MEANT to be there and is missing still fails the build.
 
 set -euo pipefail
 
 # Bumped whenever the payload's shape or contents change in a way an auditor
 # reading an old BUNDLE_MANIFEST.json would need to know about.
-GENERATOR_VERSION="1"
+#   2: stable-diffusion.cpp joined the payload as a required slot.
+GENERATOR_VERSION="2"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STUDIO_DIR="$REPO_ROOT/studio"
@@ -94,16 +104,20 @@ OUT_DIR=""
 WORK_DIR=""
 KEEP_WORK=0
 SKIP_DIFFUSERS=0
-WITH_SD_CPP=0
+# stable-diffusion.cpp is part of the payload, not an extra: the app is meant to need
+# no first-run download, and image generation was the one feature still reaching for
+# one. It has an in-tree digest anchor now (studio/macos_runtime_pins.json
+# components.sd_cpp), which is what kept it out before.
+SKIP_SD_CPP=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) OUT_DIR="${2:-}"; shift 2 ;;
         --work-dir) WORK_DIR="${2:-}"; KEEP_WORK=1; shift 2 ;;
         --skip-diffusers-pin) SKIP_DIFFUSERS=1; shift ;;
-        --with-sd-cpp) WITH_SD_CPP=1; shift ;;
+        --skip-sd-cpp) SKIP_SD_CPP=1; shift ;;
         -h|--help)
-            sed -n '2,78p' "${BASH_SOURCE[0]}"
+            sed -n '2,87p' "${BASH_SOURCE[0]}"
             exit 0 ;;
         *) echo "error: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -269,7 +283,12 @@ fetch_args=(
     --report "$PREBUILT_REPORT"
     --work-dir "$WORK_DIR/downloads"
 )
-[ "$WITH_SD_CPP" = "1" ] && fetch_args+=(--with-sd-cpp)
+SD_CPP_STATUS="installed"
+if [ "$SKIP_SD_CPP" = "1" ]; then
+    SD_CPP_STATUS="skipped (--skip-sd-cpp)"
+    fetch_args+=(--skip-sd-cpp)
+    echo "    -> stable-diffusion.cpp SKIPPED; this payload is incomplete"
+fi
 "$PYTHON_BIN" "${fetch_args[@]}" || die "prebuilt fetch failed"
 
 # The interpreter the bundle ships must be the one the locks were resolved for.
@@ -589,7 +608,7 @@ echo "==> 6/6 BUNDLE_MANIFEST.json and the layout contract"
 "$PYTHON_BIN" - \
     "$PINS_JSON" "$STAGE" "$PREBUILT_REPORT" "$PRUNE_REPORT" "$LOCK_DIR" \
     "$GENERATOR_VERSION" "$UV_ACTUAL" "$DIFFUSERS_URL" "$DIFFUSERS_SHA256" \
-    "$DIFFUSERS_STATUS" "$REPO_ROOT" \
+    "$DIFFUSERS_STATUS" "$REPO_ROOT" "$SD_CPP_STATUS" \
     <<'PY' || die "manifest generation failed"
 """Write runtime/BUNDLE_MANIFEST.json, then assert the layout contract holds.
 
@@ -617,7 +636,8 @@ import time
     diffusers_sha256,
     diffusers_status,
     repo_root,
-) = sys.argv[1:12]
+    sd_cpp_status,
+) = sys.argv[1:13]
 
 pins = json.loads(pathlib.Path(pins_path).read_text(encoding = "utf-8"))
 stage = pathlib.Path(stage_path).resolve()
@@ -708,10 +728,18 @@ components["oxc_node_modules"] = {
 
 sizes = {
     name: tree_bytes(stage / name)
-    for name in ("python", "site-packages", "llama.cpp", "whisper.cpp", "node",
-                 "oxc-node-modules", "sd.cpp")
+    for name in ("python", "site-packages", "llama.cpp", "whisper.cpp",
+                 "stable-diffusion.cpp", "node", "oxc-node-modules")
     if (stage / name).exists()
 }
+
+# What this build could not do, so a payload assembled with a skip flag can never be
+# mistaken for a shippable one: the dev-build workflow refuses a non-empty list.
+incomplete = []
+if diffusers_status != "installed":
+    incomplete.append(f"diffusers_pin: {diffusers_status}")
+if sd_cpp_status != "installed":
+    incomplete.append(f"sd_cpp: {sd_cpp_status}")
 
 manifest = {
     "schema_version": 1,
@@ -748,7 +776,7 @@ manifest = {
         "required_dirs": layout["required_dirs"],
         "required_files": layout["required_files"],
     },
-    "incomplete": [] if diffusers_status == "installed" else [f"diffusers_pin: {diffusers_status}"],
+    "incomplete": incomplete,
 }
 
 (stage / "BUNDLE_MANIFEST.json").write_text(
@@ -757,14 +785,31 @@ manifest = {
 
 # The contract, asserted here rather than trusted. A payload that does not satisfy
 # it must not reach a .dmg, because the Rust side resolves these exact paths.
+#
+# A component the invocation EXPLICITLY skipped is excluded from the assertion, by
+# name, and only that component: --skip-sd-cpp is for a fast local iteration, and a
+# build that used it is already recorded as incomplete above. Everything else stays
+# mandatory, so a component that was meant to be fetched and silently is not still
+# stops the build here rather than on somebody's Mac.
+skipped_prefixes = () if sd_cpp_status == "installed" else ("stable-diffusion.cpp",)
+
+
+def expected(paths):
+    return [
+        path
+        for path in paths
+        if not any(path == prefix or path.startswith(prefix + "/") for prefix in skipped_prefixes)
+    ]
+
+
 missing = []
-for name in layout["required_dirs"]:
+for name in expected(layout["required_dirs"]):
     if not (stage / name).is_dir():
         missing.append(f"dir {name}")
-for name in layout["required_files"]:
+for name in expected(layout["required_files"]):
     if not (stage / name).exists():
         missing.append(f"file {name}")
-for name in layout["required_executables"]:
+for name in expected(layout["required_executables"]):
     path = stage / name
     resolved = path.resolve()
     if not resolved.is_file():

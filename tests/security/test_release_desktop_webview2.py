@@ -42,6 +42,7 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release-desktop.yml"
 TAURI_CONF = REPO_ROOT / "studio" / "src-tauri" / "tauri.conf.json"
 WINDOWS_CONF = REPO_ROOT / "studio" / "src-tauri" / "tauri.windows.conf.json"
 NSIS_TEMPLATE = REPO_ROOT / "studio" / "src-tauri" / "windows" / "installer.nsi"
+ENTITLEMENTS = REPO_ROOT / "studio" / "src-tauri" / "Entitlements.plist"
 
 # The bootstrapper this release is pinned to. Recorded from the artifact itself:
 #
@@ -218,7 +219,14 @@ def test_the_digest_reaches_the_build_inputs_record():
 
 
 def _run_guard(tmp_path: Path, mutate = None):
-    """Run the in-workflow guard against a copy of the three files it reads."""
+    """Run the in-workflow guard against a copy of the files it reads.
+
+    The guard grew a fourth input when the macOS bundled runtime landed: it now
+    also reads studio/src-tauri/Entitlements.plist, to assert the app is not
+    signed with library-validation relief it does not need. `mutate` still only
+    receives the three files these Windows tests care about; the plist is copied
+    verbatim so the guard can read it.
+    """
     workflow_text = WORKFLOW.read_text(encoding = "utf-8")
     config_text = TAURI_CONF.read_text(encoding = "utf-8")
     overlay_text = WINDOWS_CONF.read_text(encoding = "utf-8")
@@ -234,6 +242,9 @@ def _run_guard(tmp_path: Path, mutate = None):
     conf_dir.mkdir(parents = True, exist_ok = True)
     (conf_dir / "tauri.conf.json").write_text(config_text, encoding = "utf-8")
     (conf_dir / "tauri.windows.conf.json").write_text(overlay_text, encoding = "utf-8")
+    (conf_dir / "Entitlements.plist").write_text(
+        ENTITLEMENTS.read_text(encoding = "utf-8"), encoding = "utf-8"
+    )
 
     return subprocess.run(
         ["bash", "-c", _step(GUARD_STEP)["run"]],

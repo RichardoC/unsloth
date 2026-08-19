@@ -19,9 +19,9 @@ file is the guard on each:
      notice in a 4000-line diff.
 
   2. THE TRUST ANCHORS. Every archive that is not a wheel -- CPython, llama.cpp,
-     whisper.cpp, Node -- must be verified against a digest committed in this tree
-     before it is extracted, with no environment variable able to turn that off. A
-     bundled runtime has no user to fall back for.
+     whisper.cpp, stable-diffusion.cpp, Node -- must be verified against a digest
+     committed in this tree before it is extracted, with no environment variable able
+     to turn that off. A bundled runtime has no user to fall back for.
 
   3. THE LAYOUT CONTRACT. studio/src-tauri resolves the bundled runtime through fixed
      paths. They live in studio/macos_runtime_pins.json as data, and the build script,
@@ -67,6 +67,9 @@ UNIVERSAL_GENERATOR = REPO_ROOT / "scripts" / "gen_python_locks.sh"
 BUILD_SCRIPT = REPO_ROOT / "scripts" / "build_macos_runtime.sh"
 INJECT_SCRIPT = REPO_ROOT / "scripts" / "inject_macos_runtime.sh"
 FETCH_SCRIPT = REPO_ROOT / "scripts" / "fetch_macos_prebuilts.py"
+SD_ENGINE = STUDIO_DIR / "backend" / "core" / "inference" / "sd_cpp_engine.py"
+SD_BACKEND = STUDIO_DIR / "backend" / "core" / "inference" / "sd_cpp_backend.py"
+SD_INSTALLER = STUDIO_DIR / "install_sd_cpp_prebuilt.py"
 DEV_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "desktop-dev-build.yml"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release-desktop.yml"
 
@@ -118,6 +121,26 @@ def dev_workflow() -> dict:
     assert yaml is not None, "PyYAML is required"
     assert DEV_WORKFLOW.is_file(), f"{DEV_WORKFLOW} is missing"
     return yaml.safe_load(DEV_WORKFLOW.read_text(encoding = "utf-8"))
+
+
+def _load_sd_installer():
+    """``studio/install_sd_cpp_prebuilt.py`` as a module, without putting studio/ on
+    sys.path for the rest of the suite.
+
+    Import-safe and hermetic: the file is stdlib-only by design (it has to run before the
+    backend package exists) and does nothing at import time -- no network, no filesystem
+    writes. Loading it means the asset assertions below use the REAL host->asset function
+    rather than a copy of it that can quietly disagree.
+    """
+    import importlib.util
+
+    path = STUDIO_DIR / "install_sd_cpp_prebuilt.py"
+    assert path.is_file(), f"{path} is missing"
+    spec = importlib.util.spec_from_file_location("_sd_cpp_installer_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _dev_steps(workflow: dict) -> list[dict]:
@@ -537,22 +560,86 @@ class TestPins:
         """No second copy of a digest that already exists in this repo: llama.cpp and
         whisper.cpp go through prebuilt_release_pins.json, Node through
         node_prebuilt_pins.json. A duplicated digest is a digest that will drift.
+
+        Which is why exactly two components may be pinned HERE, and both because the
+        tree holds nothing to chain to: CPython (nothing tracks python-build-standalone's
+        SHA256SUMS) and stable-diffusion.cpp (its releases publish no checksum index at
+        all, so the alternative is the digest the release host serves beside the asset --
+        the one thing a bundled, signed payload must not depend on).
         """
         pins = json.loads(PINS_JSON.read_text(encoding = "utf-8"))
-        assert set(pins["components"]) == {"cpython"}, (
+        assert set(pins["components"]) == {"cpython", "sd_cpp"}, (
             f"macos_runtime_pins.json carries pins for {sorted(pins['components'])}. Only "
-            f"CPython belongs here; llama.cpp and whisper.cpp are anchored by "
-            f"prebuilt_release_pins.json and Node by node_prebuilt_pins.json, and a "
-            f"second copy of a digest is a digest that will drift."
+            f"CPython and stable-diffusion.cpp belong here; llama.cpp and whisper.cpp are "
+            f"anchored by prebuilt_release_pins.json and Node by node_prebuilt_pins.json, "
+            f"and a second copy of a digest is a digest that will drift."
         )
         digests = re.findall(r"\b[0-9a-f]{64}\b", PINS_JSON.read_text(encoding = "utf-8"))
-        assert digests == [pins["components"]["cpython"]["sha256"]], (
+        assert digests == [
+            pins["components"]["cpython"]["sha256"],
+            pins["components"]["sd_cpp"]["sha256"],
+        ], (
             f"macos_runtime_pins.json holds {len(digests)} sha256 values; it may hold "
-            f"exactly one, CPython's"
+            f"exactly two, CPython's and stable-diffusion.cpp's, in that order"
         )
         fetch = FETCH_SCRIPT.read_text(encoding = "utf-8")
         assert "prebuilt_release_pins.json" in fetch or "RELEASE_PINS_FILENAME" in fetch
         assert "node_prebuilt_pins.json" in fetch
+
+    def test_the_sd_cpp_pin_is_a_complete_trust_anchor(self, pins):
+        """The pin that let stable-diffusion.cpp into the payload at all. Before it, the
+        only digest available for this archive was the one GitHub serves beside the asset,
+        over the connection that served the asset -- which is why the component was
+        assembled behind a flag and shipped to nobody.
+        """
+        entry = pins["components"]["sd_cpp"]
+        for field in ("repo", "release_tag", "asset", "sha256"):
+            assert isinstance(entry.get(field), str) and entry[field].strip(), field
+        assert SHA256_RE.match(entry["sha256"]), entry["sha256"]
+        assert entry["release_tag"] in entry["asset"], (
+            "the asset name must name the release it claims to come from, or a tag bump "
+            "could leave the digest pointing at the previous build"
+        )
+        assert "Darwin-macOS-arm64" in entry["asset"], (
+            "the bundle must pin the macOS arm64 asset; every other asset in that release "
+            "is for a host this payload is not built for"
+        )
+        assert "curl" in entry["comment"] and "sha256sum" in entry["comment"], (
+            "the comment must say how to re-record the digest; a pin nobody can reproduce "
+            "is a pin nobody will bump correctly"
+        )
+
+    def test_the_sd_cpp_pin_is_the_release_the_installer_pins(self, pins):
+        """A bundled build that differs from the one `pip install` users get is a second
+        configuration nobody tests. install_sd_cpp_prebuilt.py's DEFAULT_TAG /
+        DEFAULT_REPO are the pin of record; this file must name the same release.
+        """
+        installer = (STUDIO_DIR / "install_sd_cpp_prebuilt.py").read_text(encoding = "utf-8")
+        tag = re.search(r'^DEFAULT_TAG = "([^"]+)"', installer, re.MULTILINE)
+        repo = re.search(r'^DEFAULT_REPO = "([^"]+)"', installer, re.MULTILINE)
+        assert tag and repo, "could not read DEFAULT_TAG / DEFAULT_REPO out of the installer"
+        entry = pins["components"]["sd_cpp"]
+        assert entry["release_tag"] == tag.group(1), (
+            f"the bundle pins {entry['release_tag']} but the installer pins {tag.group(1)}"
+        )
+        assert entry["repo"] == repo.group(1), (
+            f"the bundle pins {entry['repo']} but the installer pins {repo.group(1)}"
+        )
+
+    def test_the_pinned_sd_cpp_asset_is_the_one_a_mac_would_choose_for_itself(self, pins):
+        """Checked through the installer's own host -> asset function, not by eyeballing
+        the filename: ``resolve_release_asset`` is what decides on a real Mac, it is pure,
+        and if the pinned name is not what it picks then the bundle ships an asset no
+        install would ever have selected.
+        """
+        module = _load_sd_installer()
+        entry = pins["components"]["sd_cpp"]
+        assert (
+            module.resolve_release_asset(
+                [entry["asset"]], system = "Darwin", machine = "arm64"
+            )
+            == entry["asset"]
+        ), f"{entry['asset']} is not the asset resolve_release_asset picks for Darwin/arm64"
 
 
 # ── 4. the layout contract ───────────────────────────────────────────────────
@@ -565,6 +652,7 @@ class TestLayoutContract:
             "site-packages",
             "llama.cpp",
             "whisper.cpp",
+            "stable-diffusion.cpp",
             "node",
             "oxc-node-modules",
         }, (
@@ -580,9 +668,24 @@ class TestLayoutContract:
             "python/bin/python3",
             "llama.cpp/build/bin/llama-server",
             "whisper.cpp/build/bin/whisper-server",
+            "stable-diffusion.cpp/build/bin/sd-cli",
+            "stable-diffusion.cpp/build/bin/sd-server",
             "node/bin/node",
         ):
             assert path in required, f"{path} is not in required_files"
+
+    def test_both_sd_cpp_binaries_are_required_and_required_to_be_executable(self, pins):
+        """sd-server and sd-cli are two execution modes, not a binary and a spare:
+        sd_cpp_backend._resolve_backend prefers the resident server and falls back to
+        reloading the model per image. A payload with only the CLI still generates images,
+        just slowly, which is exactly the kind of regression nobody notices in a diff.
+        """
+        executables = set(pins["layout"]["required_executables"])
+        for path in (
+            "stable-diffusion.cpp/build/bin/sd-cli",
+            "stable-diffusion.cpp/build/bin/sd-server",
+        ):
+            assert path in executables, f"{path} is not in required_executables"
 
     def test_the_contract_covers_what_the_rust_health_check_refuses_to_start_without(self, pins):
         """bundled_runtime.rs::health() names two site-packages files explicitly. A
@@ -604,19 +707,25 @@ class TestLayoutContract:
                     f"macos_runtime_pins.json should follow it"
                 )
 
-    def test_the_ggml_prebuilts_keep_the_layout_the_installer_uses(self, pins):
-        """`build/bin/<server>` is not an arbitrary choice: it is what
+    def test_the_native_prebuilts_keep_the_layout_the_installers_use(self, pins):
+        """`build/bin/<binary>` is not an arbitrary choice: it is what
         prebuilt_core.assemble_install_tree and install_whisper_prebuilt.runtime_bin_dir
-        produce under ~/.unsloth, so the app finds the bundled copy through paths it
-        already knows.
+        produce under ~/.unsloth, and the first place sd_cpp_engine._layout_candidates
+        looks -- so the app finds the bundled copy through paths it already knows.
         """
         for path in pins["layout"]["required_files"]:
-            if path.startswith(("llama.cpp/", "whisper.cpp/")):
+            if path.startswith(("llama.cpp/", "whisper.cpp/", "stable-diffusion.cpp/")):
                 assert "/build/bin/" in path, path
         whisper = STUDIO_DIR / "install_whisper_prebuilt.py"
         assert '"build" / "bin"' in whisper.read_text(encoding = "utf-8"), (
             "install_whisper_prebuilt.py no longer uses build/bin; the bundle layout "
             "must follow it rather than diverge"
+        )
+        engine = (SD_ENGINE).read_text(encoding = "utf-8")
+        candidates = engine.split("def _layout_candidates", 1)[1].split("\n\n", 1)[0]
+        assert 'root / "build" / "bin" / name' in candidates, (
+            "sd_cpp_engine._layout_candidates no longer probes build/bin first, so the "
+            "bundled stable-diffusion.cpp slot would not be found through it"
         )
 
     def test_the_build_script_asserts_the_contract_rather_than_assuming_it(self):
@@ -635,10 +744,33 @@ class TestLayoutContract:
             "runtime/python/bin/python3",
             "runtime/llama.cpp/build/bin/llama-server",
             "runtime/whisper.cpp/build/bin/whisper-server",
+            "runtime/stable-diffusion.cpp/build/bin/sd-cli",
+            "runtime/stable-diffusion.cpp/build/bin/sd-server",
             "runtime/node/bin/node",
             "runtime/oxc-node-modules",
         ):
             assert path in text, f"the injection script does not check for {path}"
+
+    def test_the_injection_script_checks_every_binary_is_executable_and_arm64(self):
+        """The last point before the .dmg. A binary that lost its exec bit in the copy, or
+        one built for the wrong architecture, ships and signs perfectly and then cannot
+        start -- which is the specific risk a payload cross-built on Linux carries.
+        """
+        text = INJECT_SCRIPT.read_text(encoding = "utf-8")
+        assert "file -L" in text and "grep -q 'arm64'" in text, (
+            "the injection script must assert the payload's binaries are arm64"
+        )
+        block = text.split("for executable in", 1)[-1]
+        for binary in (
+            "runtime/python/bin/python3",
+            "runtime/llama.cpp/build/bin/llama-server",
+            "runtime/whisper.cpp/build/bin/whisper-server",
+            "runtime/stable-diffusion.cpp/build/bin/sd-cli",
+            "runtime/stable-diffusion.cpp/build/bin/sd-server",
+            "runtime/node/bin/node",
+        ):
+            assert binary in block, f"the executability loop does not cover {binary}"
+        assert "not executable inside the app bundle" in text
 
     def test_the_injection_script_refuses_to_break_an_existing_signature(self):
         text = INJECT_SCRIPT.read_text(encoding = "utf-8")
@@ -916,16 +1048,64 @@ class TestBuildScripts:
             "two artifacts claiming the same kind must fail rather than be picked from"
         )
 
-    def test_sd_cpp_stays_opt_in_because_it_has_no_in_tree_digest(self):
-        """The one prebuilt in this tree whose digest arrives over the same channel as
-        the asset. That is fine for an opportunistic install and is not the standard the
-        rest of the payload is held to, so a build only ships it when asked.
+    def test_sd_cpp_is_fetched_by_default_and_lands_in_the_contract_slot(self):
+        """It used to be opt-in, for one reason: no in-tree digest. Now there is one, so
+        it is part of the payload -- the app is supposed to install nothing on first run,
+        and image generation was the last feature still downloading a binary.
         """
         text = FETCH_SCRIPT.read_text(encoding = "utf-8")
-        assert "--with-sd-cpp" in text
-        assert "no in-tree digest" in text.lower()
-        assert 'default = ["cpython", "llama.cpp", "whisper.cpp", "node"]' in text or (
-            '"sd.cpp" not in wanted' in text
+        assert "--with-sd-cpp" not in text, (
+            "the opt-in flag is gone; a build that has to ask for sd.cpp is a build that "
+            "ships without it"
+        )
+        assert '"stable-diffusion.cpp"' in text
+        assert "wanted = list(args.only) if args.only else list(COMPONENT_ORDER)" in text, (
+            "the default component set must be every component, so nothing is left out by "
+            "an omission"
+        )
+        assert 'COMPONENT_ORDER = ("cpython", "llama.cpp", "whisper.cpp", ' in text
+        assert 'runtime_dir / "stable-diffusion.cpp"' in text, (
+            "the fetched tree must land in the slot the layout contract names"
+        )
+        assert "--skip-sd-cpp" in text
+
+    def test_the_fetch_script_verifies_sd_cpp_against_the_in_tree_pin_before_extracting(self):
+        """The whole point of the pin. Two properties, both about order and about source:
+        the digest comes from macos_runtime_pins.json rather than from the release host,
+        and it is checked BEFORE the archive is opened -- because what follows extraction
+        is two 55 MB executables that a signed app will invite people to run.
+        """
+        text = FETCH_SCRIPT.read_text(encoding = "utf-8")
+        body = text.split("def _install_sd_cpp", 1)[1].split("\n# ──", 1)[0]
+        assert 'pins["components"]["sd_cpp"]' in body, (
+            "sd.cpp must be verified against the in-tree pin, not against a digest the "
+            "release serves beside the asset"
+        )
+        assert 'entry["sha256"]' in body
+        verify_at = body.index("_verify(")
+        extract_at = body.index("_extract(")
+        assert verify_at < extract_at, (
+            "the sha256 check must run before extraction; verifying afterwards means the "
+            "bytes were already unpacked when the build decided it did not trust them"
+        )
+        # And the old path -- resolve through the release API, trust the digest it serves
+        # next to the asset -- must be gone rather than merely unused.
+        assert "api.github.com" not in text
+        assert 'asset.get("digest")' not in text
+        assert "browser_download_url" not in text
+
+    def test_the_fetch_script_keeps_the_sd_cpp_pin_in_step_with_the_installer(self):
+        """A bundled sd.cpp that differs from the one users install is a configuration
+        nobody tests, and the failure is silent: images still generate, from a build
+        nobody reviewed against this app.
+        """
+        body = FETCH_SCRIPT.read_text(encoding = "utf-8").split("def _install_sd_cpp", 1)[1]
+        assert "sd.DEFAULT_REPO" in body and "sd.DEFAULT_TAG" in body, (
+            "the fetch script must compare the pin against install_sd_cpp_prebuilt.py's"
+        )
+        assert "resolve_release_asset" in body, (
+            "the pinned asset must be checked through the installer's own host->asset "
+            "function, so it is provably what a Mac would pick"
         )
 
 
@@ -1024,6 +1204,59 @@ class TestDevBuildWorkflow:
         assert "grep -q 'arm64'" in run
         assert "--version" in run
 
+    def test_the_workflow_asserts_both_sd_cpp_binaries_are_executable_arm64_and_real(
+        self, dev_workflow
+    ):
+        """Same standard llama-server is held to, and for the same reason: a present file
+        is not a working binary. The sd-cli --help output is checked as well, because the
+        one thing a wrong-architecture or truncated copy cannot do is identify itself.
+        """
+        step = next(
+            item
+            for item in _dev_steps(dev_workflow)
+            if "Prove the bundled runtime works" in str(item.get("name", ""))
+        )
+        run = str(step.get("run", ""))
+        assert 'test -d "$runtime/stable-diffusion.cpp"' in run
+        assert "stable-diffusion.cpp/build/bin/sd-cli" in run
+        assert "stable-diffusion.cpp/build/bin/sd-server" in run
+        assert 'test -x "$sd_cli"' in run and 'test -x "$sd_server"' in run
+        assert 'file "$sd_cli" | grep -q \'arm64\'' in run
+        assert 'file "$sd_server" | grep -q \'arm64\'' in run
+        assert "--help" in run and "stable-diffusion" in run
+
+    def test_the_workflow_assembles_the_payload_with_no_skip_flags(self, dev_workflow):
+        """--skip-diffusers-pin and --skip-sd-cpp both produce a payload the manifest marks
+        incomplete. The proof step refuses one, but the shipped lane must not reach for a
+        skip in the first place.
+        """
+        assemble = next(
+            step
+            for step in _dev_steps(dev_workflow)
+            if "Assemble the bundled runtime" in str(step.get("name", ""))
+        )
+        run = str(assemble.get("run", ""))
+        assert "build_macos_runtime.sh" in run
+        for flag in ("--skip-diffusers-pin", "--skip-sd-cpp"):
+            assert flag not in run, f"the dev build assembles the payload with {flag}"
+
+    def test_the_workflow_asserts_the_bundled_sd_cpp_digest_came_from_the_in_tree_pin(
+        self, dev_workflow
+    ):
+        """The regression this guards against is invisible in the payload itself: the same
+        archive, verified against the release host's own claim instead of against a digest
+        committed here. The manifest records which, so the workflow checks which.
+        """
+        step = next(
+            item
+            for item in _dev_steps(dev_workflow)
+            if "Prove the bundled runtime works" in str(item.get("name", ""))
+        )
+        run = str(step.get("run", ""))
+        assert '"sd_cpp"' in run
+        assert 'manifest["components"]["sd_cpp"]["pins_file"]' in run
+        assert "studio/macos_runtime_pins.json" in run
+
     def test_the_workflow_parses_the_manifest_and_refuses_an_incomplete_payload(self, dev_workflow):
         step = next(
             item
@@ -1087,20 +1320,152 @@ class TestDevBuildWorkflow:
         digest = next(i for i, name in enumerate(names) if "Record the .dmg digest" in name)
         assert inject < digest, f"the digest is taken before injection: {names}"
 
-    def test_the_release_workflow_is_untouched_by_this_stage(self):
-        """Release wiring and code signing are a separate stage. If the release
-        workflow starts referencing these scripts without the signing question being
-        answered, it would ship an app whose signature the injection invalidated.
+    def test_the_dmg_size_summary_names_the_sd_cpp_slot_it_now_carries(self, dev_workflow):
+        """The per-component breakdown is generated from the manifest's sizes_bytes, so a
+        110 MiB component that is not in that map is a 110 MiB jump nobody can attribute.
+        """
+        text = BUILD_SCRIPT.read_text(encoding = "utf-8")
+        sizes_block = text.split("sizes = {", 1)[1].split("}", 1)[0]
+        assert '"stable-diffusion.cpp"' in sizes_block, (
+            "BUNDLE_MANIFEST.json's sizes_bytes must include the stable-diffusion.cpp slot"
+        )
+        assert '"sd.cpp"' not in sizes_block, (
+            "the slot is named stable-diffusion.cpp in the layout contract; a second "
+            "spelling here silently measures nothing"
+        )
+
+    def test_the_release_workflow_reuses_these_scripts_rather_than_reimplementing_them(self):
+        """The release leg now ships the payload too, and it must do it with these scripts.
+
+        This test used to assert the opposite -- that release-desktop.yml did not
+        mention them at all -- because wiring a payload into a SIGNED build needs
+        the signing order settled first, and it was not. It is now (inject, then
+        sign every Mach-O, then rebuild the .dmg around the signed app), so the
+        assertion flips: the release must call the same three scripts the dev
+        build calls, so that a dev build stays evidence about a release. A second,
+        release-only copy of the assembly or injection logic is what this now
+        refuses. Ordering and signing invariants live in
+        tests/security/test_release_desktop_macos_runtime.py.
         """
         if not RELEASE_WORKFLOW.is_file():
             pytest.skip("release-desktop.yml is not present")
         text = RELEASE_WORKFLOW.read_text(encoding = "utf-8")
         for script in (
-            "build_macos_runtime.sh",
-            "inject_macos_runtime.sh",
-            "gen_macos_bundle_lock.sh",
+            "scripts/build_macos_runtime.sh",
+            "scripts/inject_macos_runtime.sh",
+            "scripts/gen_macos_bundle_lock.sh",
         ):
-            assert script not in text, (
-                f"release-desktop.yml references {script}; wiring the payload into a "
-                f"SIGNED build needs the signing order settled first (inject, then sign)."
+            assert script in text, (
+                f"release-desktop.yml does not call {script}. The macOS release leg must "
+                f"assemble and inject the payload with the same scripts desktop-dev-build.yml "
+                f"exercises, or the dev build stops being evidence about the release."
             )
+        # The payload is assembled by one script, in both workflows. A release
+        # that grew its own `uv pip install --target` would be building a
+        # different bundle from the one the dev build proves.
+        assert "uv pip install" not in text, (
+            "release-desktop.yml installs Python distributions itself; the payload is "
+            "scripts/build_macos_runtime.sh's job"
+        )
+
+
+# ── 8. the app side of the contract ──────────────────────────────────────────
+#
+# A slot in the payload is only half of it. The backend has to PREFER the bundled
+# stable-diffusion.cpp over a lazy install, and -- the security half -- it must never
+# try to install INTO it: that tree is code-signed and, once the app is in
+# /Applications, root-owned, so a write there either fails or succeeds and invalidates
+# the signature, after which Gatekeeper refuses to launch the app the user just
+# "updated". The llama.cpp / whisper.cpp updaters already carry that refusal
+# (utils/prebuilt/update_flow.immutable_runtime_root); these are the same property for
+# the one component that installs itself lazily, at first image generation.
+
+
+class TestTheAppResolvesTheBundledCopy:
+    def test_the_finder_prefers_the_bundle_over_the_managed_install(self):
+        """Precedence, asserted by position in the finder itself: after the two explicit
+        overrides (a user who names a binary or an install dir has chosen a build), before
+        the managed root under ~/.unsloth. That is the same slot UNSLOTH_LLAMA_CPP_PATH /
+        UNSLOTH_WHISPER_CPP_PATH occupy for the bundled ggml components.
+        """
+        text = SD_ENGINE.read_text(encoding = "utf-8")
+        finder = text.split("def _find_binary", 1)[1].split("\ndef ", 1)[0]
+        for needle in ("UNSLOTH_SD_CPP_PATH", "bundled_install_root()", "managed_install_root()"):
+            assert needle in finder, f"the finder no longer consults {needle}"
+        assert (
+            finder.index("UNSLOTH_SD_CPP_PATH")
+            < finder.index("bundled_install_root()")
+            < finder.index("managed_install_root()")
+        ), (
+            "the bundled copy must be preferred over the managed install and yield to an "
+            "explicit user override; the order in _find_binary decides that"
+        )
+
+    def test_the_bundled_root_is_corroborated_and_not_declared(self):
+        """The predicate is a security boundary: a bare environment variable would let a
+        value left in somebody's shell profile persuade an ordinary install that it is a
+        signed app bundle. utils.bundled_runtime requires the manifest AND sys.prefix
+        inside the same tree, which no variable can arrange.
+        """
+        text = SD_ENGINE.read_text(encoding = "utf-8")
+        assert "from utils.bundled_runtime import bundled_runtime_root" in text
+        body = text.split("def bundled_install_root", 1)[1].split("\ndef ", 1)[0]
+        assert "bundled_runtime_root()" in body
+        assert 'BUNDLED_SLOT_NAME = "stable-diffusion.cpp"' in text, (
+            "the slot name must match the layout contract's required_dirs entry"
+        )
+        assert "os.environ" not in body, (
+            "bundled_install_root must not decide anything from an environment variable of "
+            "its own; the corroborated predicate in utils.bundled_runtime is the answer"
+        )
+
+    def test_the_lazy_installer_is_refused_for_a_bundled_runtime(self):
+        """The guard around the lazy install. Both cases: the bundle provides sd.cpp (so
+        an install would download 45 MiB into a directory the finder then ignores), and
+        the install target itself resolves inside the bundle (so the write is the signed
+        tree).
+        """
+        text = SD_BACKEND.read_text(encoding = "utf-8")
+        assert "from utils.bundled_runtime import path_is_inside_bundled_runtime" in text
+        refusal = text.split("def bundled_runtime_refusal", 1)[1].split("\ndef ", 1)[0]
+        assert "bundled_install_root()" in refusal
+        assert "path_is_inside_bundled_runtime(target)" in refusal
+        assert "read-only and code-signed" in refusal, (
+            "the refusal must say what the install is and why Unsloth will not write there, "
+            "the same way update_flow.immutable_runtime_refusal does"
+        )
+        allowed = text.split("def _install_allowed", 1)[1].split("\ndef ", 1)[0]
+        assert "bundled_runtime_refusal()" in allowed and "return False" in allowed, (
+            "_install_allowed must refuse when the runtime ships inside the app; without "
+            "that, first image generation still reaches for a download"
+        )
+
+    def test_the_installer_itself_refuses_a_target_inside_the_app_bundle(self, tmp_path):
+        """Belt as well as braces, and behaviourally: install_sd_cpp_prebuilt.py is also a
+        standalone CLI, so the refusal cannot live only in the backend that usually calls
+        it. Raised before anything is claimed, downloaded or written -- the suite's network
+        blocker would report a different failure if a download were attempted.
+        """
+        module = _load_sd_installer()
+        runtime = tmp_path / "Unsloth.app" / "Contents" / "Resources" / "runtime"
+        slot = runtime / "stable-diffusion.cpp"
+        slot.mkdir(parents = True)
+        (runtime / "BUNDLE_MANIFEST.json").write_text("{}", encoding = "utf-8")
+        assert module.is_bundled_runtime_target(slot) is True
+        with pytest.raises(RuntimeError) as excinfo:
+            module.install(install_dir = slot)
+        message = str(excinfo.value)
+        assert "read-only" in message and "code-signed" in message, message
+        assert "Updating the app" in message, message
+        # Nothing may have been written into the slot, and it must not have been claimed.
+        assert list(slot.iterdir()) == [], sorted(path.name for path in slot.iterdir())
+
+    def test_an_ordinary_install_directory_is_not_mistaken_for_the_bundle(self, tmp_path):
+        """The other half of the predicate. Every non-bundled install -- which is every
+        install on Linux and Windows, and a pip install on a Mac -- must keep installing
+        exactly as it does today.
+        """
+        module = _load_sd_installer()
+        ordinary = tmp_path / ".unsloth" / "stable-diffusion.cpp"
+        ordinary.mkdir(parents = True)
+        assert module.is_bundled_runtime_target(ordinary) is False

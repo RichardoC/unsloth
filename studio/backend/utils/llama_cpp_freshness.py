@@ -256,9 +256,13 @@ def check_prebuilt_freshness(
     )
 
 
-def format_stale_warning(info: dict) -> str:
-    """Human-readable one-liner for stale prebuilt info."""
-    return _flow.format_stale_warning(info, component = "llama.cpp")
+def format_stale_warning(info: dict, *, bundled: bool = False) -> str:
+    """Human-readable one-liner for stale prebuilt info.
+
+    ``bundled`` names the remedy for the copy that ships inside Unsloth.app, where
+    `unsloth studio update` cannot help: the tree is read-only and signed.
+    """
+    return _flow.format_stale_warning(info, component = "llama.cpp", bundled = bundled)
 
 
 def reset_caches(*, drop_disk: bool = False) -> None:
