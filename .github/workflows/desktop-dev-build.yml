@@ -345,6 +345,15 @@ jobs:
 
           # Node runs the OXC validator against the prefetched, darwin-arm64
           # node_modules. A Linux binding would fail exactly here.
+          #
+          # NODE_PATH is required, not decorative: the payload's directory is called
+          # oxc-node-modules, not node_modules, so oxc-parser cannot resolve its flat
+          # siblings -- including the native @oxc-parser/binding-darwin-arm64 its
+          # generated bindings.js loads through its own createRequire -- by the normal
+          # upward walk. This is the same variable local_callable_validators.py sets
+          # for the real validator, so the probe exercises the shipped mechanism
+          # rather than a bespoke one.
+          NODE_PATH="$runtime/oxc-node-modules" \
           "$runtime/node/bin/node" -e \
             'const {parseSync} = require(process.argv[1] + "/oxc-parser");
              const r = parseSync("t.ts", "const x: number = 1;");

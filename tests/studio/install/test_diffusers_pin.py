@@ -74,12 +74,47 @@ def test_only_the_pin_file_names_diffusers():
         # place the pin could be overridden from, so it stays in the scan.
         if _GENERATED_FILTER.fullmatch(path.name):
             continue
+        # locks/ holds machine-generated resolutions, not authored requirements. A
+        # with-deps closure names diffusers because something depends on it, and no
+        # edit to a lock can change that -- gen_python_locks.sh and
+        # gen_macos_bundle_lock.sh regenerate them from the authored files, so the
+        # pin file is still the only place a human chooses a diffusers source. What
+        # actually has to hold is that the pin lands last, which is what the next
+        # test asserts rather than assumes.
+        if path.parent.name == "locks":
+            continue
         named = [line for line in _requirements(path) if line.lower().startswith("diffusers")]
         if named:
             offenders[str(path.relative_to(REPO_ROOT))] = named
     assert not offenders, (
         f"diffusers is requirement-listed outside diffusers-pin.txt: {offenders}. "
         f"Move it into the pin file so the dedicated late step remains authoritative."
+    )
+
+
+def test_the_bundle_installs_the_pin_after_every_lock():
+    """The macOS payload installs the locks and then the pin, and only that order makes
+    the exemption above safe: darwin-arm64-bundle.lock.txt resolves diffusers from PyPI,
+    so a pin step that ran first would be overwritten and the bundle would ship a
+    diffusers nobody chose."""
+    script = REPO_ROOT / "scripts" / "build_macos_runtime.sh"
+    if not script.is_file():  # pragma: no cover - the payload builder is macOS-only
+        pytest.skip("scripts/build_macos_runtime.sh is not present")
+    body = script.read_text(encoding = "utf-8")
+
+    lock_loops = [i for i, line in enumerate(body.splitlines()) if 'for lock in "${LOCK_STEPS[@]}"' in line]
+    assert lock_loops, "build_macos_runtime.sh no longer installs from LOCK_STEPS"
+
+    pin_lines = [
+        i for i, line in enumerate(body.splitlines())
+        if "diffusers-pin.txt" in line and not line.lstrip().startswith("#")
+    ]
+    assert pin_lines, "build_macos_runtime.sh no longer installs the diffusers pin"
+
+    assert max(pin_lines) > max(lock_loops), (
+        "the diffusers pin is applied before the last lock install in "
+        "build_macos_runtime.sh, so the lock's PyPI diffusers would overwrite the "
+        "pinned archive and the bundle would ship an unpinned diffusers"
     )
 
 

@@ -1639,12 +1639,13 @@ jobs:
       #
       # Signing a container seals what is inside it, so contents must be signed
       # first or the seal records unsigned content. The payload has exactly one
-      # containment relation -- the .app contains all of it -- because the guard
+      # containment relation -- the .app contains all of it -- because the check
       # below refuses any nested .framework/.app/.xpc/.bundle inside the payload,
       # which is the only thing that could create another one. So the required
-      # order is "all 700 payload Mach-Os, then the app bundle", and the list is
-      # additionally sorted deepest-first so that if a nested bundle ever does
-      # appear the order is still correct while the guard explains itself.
+      # order is "all ~700 payload Mach-Os, then the app bundle", and that is what
+      # this step does. The correctness of that rests on the nested-bundle refusal,
+      # not on the sort: each list is additionally ordered deepest first, which is
+      # cheap insurance and makes the log read in the direction the seal is built.
       - name: Sign the bundled runtime and the macOS app
         id: sign_macos
         if: matrix.platform == 'macos-latest'
@@ -2147,21 +2148,25 @@ jobs:
           # already uses, and reachable through PATH so this step can be executed
           # against stubs in tests/security.
           executable="$(plutil -extract CFBundleExecutable raw -o - "$APP/Contents/Info.plist")"
+          # The <key> element, not a bare substring: an entitlements plist can
+          # carry a comment naming the key it deliberately omits, and reading that
+          # as the setting is exactly the mistake this check exists to catch.
+          relief='<key>com.apple.security.cs.disable-library-validation</key>'
           app_entitlements="$(codesign --display --entitlements - --xml \
             "$APP/Contents/MacOS/$executable" 2>/dev/null || true)"
           case "$app_entitlements" in
-            *disable-library-validation*)
+            *"$relief"*)
               echo "::error::the app is signed with com.apple.security.cs.disable-library-validation; it does not need it" >&2
               exit 1 ;;
           esac
           case "$app_entitlements" in
-            *network.client*) ;;
+            *"<key>com.apple.security.network.client</key>"*) ;;
             *) echo "::error::the app lost its entitlements; --force without --entitlements strips them" >&2; exit 1 ;;
           esac
           python_entitlements="$(codesign --display --entitlements - --xml \
             "$APP/Contents/Resources/runtime/python/bin/python3" 2>/dev/null || true)"
           case "$python_entitlements" in
-            *disable-library-validation*) ;;
+            *"$relief"*) ;;
             *)
               echo "::error::the bundled interpreter is signed without com.apple.security.cs.disable-library-validation, so a user's own extension modules will not load" >&2
               exit 1 ;;
