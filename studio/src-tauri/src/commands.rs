@@ -514,6 +514,11 @@ pub async fn start_install(
     backend_state: tauri::State<'_, BackendState>,
     diagnostics: tauri::State<'_, DiagnosticsState>,
 ) -> Result<(), String> {
+    // First: with a bundled runtime there is no installation to start, and the
+    // checks below stop a backend and probe ports on behalf of one that must not run.
+    if let Some(msg) = install::bundled_runtime_install_refusal() {
+        return Err(msg);
+    }
     if has_owned_backend(&backend_state)? {
         return Err(
             "The Unsloth backend is still running. Stop it before starting installation."
@@ -588,6 +593,14 @@ pub async fn start_backend_update(
     diagnostics: tauri::State<'_, DiagnosticsState>,
 ) -> Result<(), String> {
     info!("start_backend_update command called");
+
+    // Before the backend is stopped: an update that cannot run must not cost the
+    // user a running server. The frontend can reach this command from a stale
+    // backend even though preflight no longer offers repair, so the refusal lives
+    // here as well as in `update::run_backend_update`.
+    if crate::bundled_runtime::bundled_runtime().is_some() {
+        return Err(update::BUNDLED_RUNTIME_UPDATE_REFUSAL.to_string());
+    }
 
     if install_state
         .lock()
@@ -690,6 +703,39 @@ pub async fn start_managed_repair(
 
     let repair_group_id = install::take_pending_repair_group_for_resume(&install_state)
         .unwrap_or_else(|| diagnostics::begin_repair_group(&diagnostics_state));
+
+    // With the code inside the app bundle, repair is the writable half only: the
+    // update below rewrites the Python environment, and this one is signed and
+    // read-only. It runs after the stop above for the same reason the managed repair
+    // does -- it re-creates the desktop ownership id, and a backend still holding
+    // the old one would stop being ours.
+    if let Some(runtime) = crate::bundled_runtime::bundled_runtime() {
+        let _ = app.emit("repair-progress", "Checking Unsloth's data folder...");
+        return match crate::bundled_runtime::repair_writable_state(runtime) {
+            Ok(()) => {
+                info!("Bundled runtime repair complete");
+                diagnostics::finish_repair_group(
+                    &diagnostics_state,
+                    &repair_group_id,
+                    "success",
+                    None,
+                );
+                let _ = app.emit("repair-complete", ());
+                Ok(())
+            }
+            Err(msg) => {
+                error!("Bundled runtime repair failed: {}", msg);
+                diagnostics::finish_repair_group(
+                    &diagnostics_state,
+                    &repair_group_id,
+                    "failed",
+                    Some(msg.clone()),
+                );
+                let _ = app.emit("repair-failed", &msg);
+                Err(msg)
+            }
+        };
+    }
 
     let _ = app.emit("repair-progress", "Updating existing Unsloth install...");
     let update_app = app.clone();

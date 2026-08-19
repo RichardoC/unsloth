@@ -1057,8 +1057,33 @@ fn find_unsloth_binary_in_studio_dir(studio: &std::path::Path) -> Option<std::pa
 }
 
 pub fn find_unsloth_binary() -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
-    let studio = home.join(".unsloth").join("studio");
+    find_unsloth_binary_with(
+        crate::bundled_runtime::bundled_runtime(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// The CLI this app runs: the bundled runtime's interpreter when the app carries
+/// one, else the managed install under the profile exactly as before.
+///
+/// The bundled runtime comes first because it IS the install for that build.
+/// Falling back to `~/.unsloth` when both exist would launch a mutable environment
+/// the bundle's shell was never tested against, and would let a user's leftover
+/// install decide which Python stack a signed app runs.
+///
+/// The path returned for a bundled runtime is the interpreter itself, not a
+/// launcher that does not exist there. Every caller reaches the CLI through
+/// [`resolve_managed_cli_invocation_with`], which is where the bundle turns it into
+/// an argument vector; the callers that only ask "is there an install" or log the
+/// path get a real file either way.
+fn find_unsloth_binary_with(
+    bundled: Option<&crate::bundled_runtime::BundledRuntime>,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(runtime) = bundled {
+        return Some(runtime.interpreter());
+    }
+    let studio = home?.join(".unsloth").join("studio");
 
     find_unsloth_binary_in_studio_dir(&studio)
 }
@@ -1107,6 +1132,11 @@ pub(crate) const WINDOWS_CLI_ENTRYPOINT: &str =
 pub(crate) struct ManagedCliInvocation {
     pub program: std::path::PathBuf,
     pub args: Vec<std::ffi::OsString>,
+    /// Variables the program cannot run without. Empty for a managed install under
+    /// the profile, which needs none. A bundled runtime puts the paths that make it
+    /// importable here, so no builder can assemble the argument vector and leave
+    /// the environment behind.
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
 impl ManagedCliInvocation {
@@ -1116,6 +1146,9 @@ impl ManagedCliInvocation {
     pub(crate) fn to_command(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        for (name, value) in &self.env {
+            cmd.env(name, value);
+        }
         cmd
     }
 }
@@ -1148,6 +1181,47 @@ pub(crate) fn resolve_managed_cli_invocation_with(
     args: &[&str],
     isolation: Isolation,
 ) -> Result<ManagedCliInvocation, String> {
+    resolve_managed_cli_invocation_for(
+        crate::bundled_runtime::bundled_runtime(),
+        bin,
+        args,
+        isolation,
+    )
+}
+
+/// The one place a bundled runtime replaces the managed install's launcher.
+///
+/// Isolation is not a choice here: the bundled interpreter always runs `-I`, so the
+/// updater's `Isolated` and everything else's `Inherit` collapse to the same
+/// command. That is the right answer rather than a shortcut. `Inherit` exists so
+/// the swap away from the console script stays invisible to a user who could have
+/// typed the same thing themselves, and nobody can type their way into a signed
+/// bundle's interpreter. `bin` is unused for the same reason: there is no launcher
+/// beside the bundled interpreter to derive anything from.
+fn resolve_managed_cli_invocation_for(
+    bundled: Option<&crate::bundled_runtime::BundledRuntime>,
+    bin: &std::path::Path,
+    args: &[&str],
+    isolation: Isolation,
+) -> Result<ManagedCliInvocation, String> {
+    if let Some(runtime) = bundled {
+        let _ = (bin, isolation);
+        let interpreter = runtime.interpreter();
+        // Fails closed, as the Windows arm below does: an absent interpreter must
+        // not fall through to a `~/.unsloth` install this build never tested.
+        if !interpreter.is_file() {
+            return Err(format!(
+                "The Python runtime inside this Unsloth app is missing: {}. Reinstall the app.",
+                interpreter.display()
+            ));
+        }
+        return Ok(ManagedCliInvocation {
+            program: interpreter,
+            args: runtime.cli_args(args),
+            env: runtime.child_env(),
+        });
+    }
+
     #[cfg(windows)]
     {
         let python = bin
@@ -1177,6 +1251,7 @@ pub(crate) fn resolve_managed_cli_invocation_with(
         Ok(ManagedCliInvocation {
             program: python,
             args: argv,
+            env: Vec::new(),
         })
     }
 
@@ -1188,6 +1263,7 @@ pub(crate) fn resolve_managed_cli_invocation_with(
         Ok(ManagedCliInvocation {
             program: bin.to_path_buf(),
             args: args.iter().copied().map(std::ffi::OsString::from).collect(),
+            env: Vec::new(),
         })
     }
 }
@@ -1222,7 +1298,13 @@ pub(crate) fn build_managed_cli_command_tokio(
     let invocation = resolve_managed_cli_invocation(bin, args)?;
     let mut cmd = tokio::process::Command::new(&invocation.program);
     cmd.args(&invocation.args);
-    // PYTHONHOME / PYTHONPATH left alone, for the reason in the blocking flavour.
+    // The same environment `to_command` applies, so a bundled runtime is importable
+    // whichever builder a call site reached for.
+    for (name, value) in &invocation.env {
+        cmd.env(name, value);
+    }
+    // PYTHONHOME / PYTHONPATH left alone otherwise, for the reason in the blocking
+    // flavour.
     Ok(cmd)
 }
 
@@ -2186,7 +2268,37 @@ fn apply_managed_cli_context_inner(
         cmd.env_remove(name);
     }
     cmd.env(DESKTOP_MANAGED_ENV, "1");
+    apply_bundled_runtime_env(cmd);
     Ok(())
+}
+
+/// Re-assert the bundled runtime's own variables, last.
+///
+/// PYTHONPATH is in `PATH_LIST_ENV`, so a user with a relative entry in theirs gets
+/// it rewritten and pinned onto the child by the pins above -- which would replace
+/// the bundled search path and leave every Python process the backend spawns unable
+/// to import the bundled distributions. The bundle owns the names it sets, so it
+/// speaks after the pins. Nothing is lost: `child_env` only fills in
+/// UNSLOTH_LLAMA_CPP_PATH / UNSLOTH_WHISPER_CPP_PATH when the user has set neither,
+/// so a pinned user value for those is never overruled, and PATH is deliberately
+/// not pinned at all.
+///
+/// A no-op without a bundled runtime, which is every build that installs.
+fn apply_bundled_runtime_env(cmd: &mut Command) {
+    if let Some(runtime) = crate::bundled_runtime::bundled_runtime() {
+        for (name, value) in runtime.child_env() {
+            cmd.env(name, value);
+        }
+    }
+}
+
+/// Tokio twin of [`apply_bundled_runtime_env`].
+fn apply_bundled_runtime_env_tokio(cmd: &mut tokio::process::Command) {
+    if let Some(runtime) = crate::bundled_runtime::bundled_runtime() {
+        for (name, value) in runtime.child_env() {
+            cmd.env(name, value);
+        }
+    }
 }
 
 pub(crate) fn apply_managed_cli_context_tokio(
@@ -2206,6 +2318,7 @@ pub(crate) fn apply_managed_cli_context_tokio(
         cmd.env_remove(name);
     }
     cmd.env(DESKTOP_MANAGED_ENV, "1");
+    apply_bundled_runtime_env_tokio(cmd);
     Ok(())
 }
 
@@ -2623,6 +2736,111 @@ mod tests {
             vec![OsString::from("studio"), OsString::from("--api-only")]
         );
         assert!(cmd.get_envs().next().is_none());
+    }
+
+    /// The whole seam, both ways round. `find_unsloth_binary_with` and
+    /// `resolve_managed_cli_invocation_for` take the runtime explicitly so this can
+    /// be asserted without the process-wide `OnceLock` the app sets once at startup.
+    #[test]
+    fn a_bundled_runtime_replaces_the_managed_install_and_its_absence_changes_nothing() {
+        let payload = crate::bundled_runtime::payload("process-resolution");
+        let runtime = payload.runtime();
+
+        // A managed install under the profile, exactly as today.
+        let home = std::env::temp_dir().join(format!(
+            "unsloth-bundle-vs-managed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        let studio = home.join(".unsloth").join("studio");
+        #[cfg(windows)]
+        let managed_bin = {
+            let scripts = studio.join("unsloth_studio").join("Scripts");
+            fs::create_dir_all(&scripts).unwrap();
+            fs::write(scripts.join("python.exe"), "").unwrap();
+            let bin = scripts.join("unsloth.exe");
+            fs::write(&bin, "").unwrap();
+            bin
+        };
+        #[cfg(unix)]
+        let managed_bin = {
+            let scripts = studio.join("unsloth_studio").join("bin");
+            fs::create_dir_all(&scripts).unwrap();
+            let bin = scripts.join("unsloth");
+            fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+            bin
+        };
+
+        // Bundle absent: byte for byte what this function answered before.
+        assert_eq!(
+            find_unsloth_binary_with(None, Some(&home)),
+            Some(managed_bin.clone())
+        );
+        let managed = resolve_managed_cli_invocation_for(
+            None,
+            &managed_bin,
+            &["studio", "--api-only"],
+            Isolation::Inherit,
+        )
+        .unwrap();
+        assert_eq!(
+            managed.program,
+            resolve_managed_cli_invocation(&managed_bin, &["studio", "--api-only"])
+                .unwrap()
+                .program
+        );
+        // And nothing is injected into that child's environment.
+        assert!(managed.env.is_empty());
+
+        // Bundle present: the bundled interpreter wins even though the managed
+        // install is right there and perfectly usable.
+        assert_eq!(
+            find_unsloth_binary_with(Some(&runtime), Some(&home)),
+            Some(runtime.interpreter())
+        );
+        let bundled = resolve_managed_cli_invocation_for(
+            Some(&runtime),
+            &managed_bin,
+            &["studio", "--api-only"],
+            Isolation::Inherit,
+        )
+        .unwrap();
+        assert_eq!(bundled.program, runtime.interpreter());
+        assert_ne!(bundled.program, managed_bin);
+        assert_eq!(bundled.args, runtime.cli_args(&["studio", "--api-only"]));
+        // The environment travels with the invocation, so `to_command` cannot
+        // produce a child that has the argument vector and not the search path.
+        let cmd = bundled.to_command();
+        for name in [
+            crate::bundled_runtime::SITE_PACKAGES_ENV,
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONDONTWRITEBYTECODE",
+        ] {
+            assert!(
+                cmd.get_envs()
+                    .any(|(key, value)| key == std::ffi::OsStr::new(name) && value.is_some()),
+                "{name} must reach the bundled child"
+            );
+        }
+        // The interpreter also has to be the interpreter, not the launcher path
+        // the managed layout would have handed back.
+        assert_eq!(cmd.get_program(), runtime.interpreter().as_os_str());
+
+        // A bundle whose interpreter is gone fails closed rather than quietly
+        // running the managed install this build was never tested against.
+        fs::remove_file(runtime.interpreter()).unwrap();
+        let error = resolve_managed_cli_invocation_for(
+            Some(&runtime),
+            &managed_bin,
+            &["-h"],
+            Isolation::Inherit,
+        )
+        .unwrap_err();
+        assert!(error.contains("Reinstall the app"), "{error}");
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[cfg(not(windows))]

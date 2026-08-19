@@ -295,6 +295,26 @@ fn run_backend_update_with_terminal_events(
         update.current_attempt = Some(attempt.clone());
     }
 
+    // `unsloth studio update` rewrites the environment it runs in. When that
+    // environment is inside a signed, read-only app bundle there is nothing it can
+    // legitimately do: the writes fail, or worse succeed and invalidate the
+    // bundle's resource validation. The runtime changes when the app does, so the
+    // desktop updater (desktop_updater.rs / desktop_update_policy.rs) is the whole
+    // mechanism and this path refuses rather than pretending.
+    if let Some(runtime) = crate::bundled_runtime::bundled_runtime() {
+        let msg = BUNDLED_RUNTIME_UPDATE_REFUSAL.to_string();
+        warn!(
+            "[update] Refusing to update the runtime inside the app bundle at {}",
+            runtime.root().display()
+        );
+        diagnostics::finish_attempt(&diagnostics, &attempt, None, false, Some(msg.clone()));
+        clear_current_attempt(&state);
+        if terminal_events {
+            let _ = app.emit("update-failed", &msg);
+        }
+        return Err(msg);
+    }
+
     let bin = match crate::process::find_unsloth_binary() {
         Some(bin) => bin,
         None => {
@@ -431,6 +451,11 @@ pub fn record_update_intentional_stop(state: &UpdateState, diagnostics: &Diagnos
 }
 
 pub const UPDATE_STOPPED: &str = "Update stopped.";
+
+/// What the user is told when the Python runtime lives inside the app.
+pub(crate) const BUNDLED_RUNTIME_UPDATE_REFUSAL: &str =
+    "Unsloth's Python runtime ships inside this app, so it updates with the app itself. \
+     Check for an app update instead.";
 
 pub fn stop_update(state: &UpdateState) -> Result<(), String> {
     let mut child = {

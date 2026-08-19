@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_layout;
+mod bundled_runtime;
 mod commands;
 mod desktop_auth;
 mod desktop_backend_owner;
@@ -1926,7 +1927,21 @@ fn main() {
 
             initialize_close_to_tray(app.handle());
             reconcile_autostart_entry(app.handle());
-            // Recover legacy desktop installs before the first preflight.
+            // First, and before anything can ask: process::find_unsloth_binary and
+            // every preflight branch on whether this app carries its own runtime.
+            bundled_runtime::init(app.handle());
+            // The whole of "first launch prepares state" for a bundled runtime.
+            // Only when there is one: on a build that still installs, install.sh
+            // owns this directory, and creating it early would tell every "is
+            // Unsloth installed" heuristic that looks for it a different story.
+            if bundled_runtime::bundled_runtime().is_some() {
+                if let Err(error) = bundled_runtime::ensure_writable_state_root() {
+                    warn!("Could not prepare the Unsloth data directory: {error}");
+                }
+            }
+            // Recover legacy desktop installs before the first preflight. With a
+            // bundled runtime this is also what creates the ownership id on a first
+            // launch, since find_unsloth_binary() now answers yes from the bundle.
             if let Err(error) = desktop_backend_owner::ensure_installed_studio_root_id() {
                 warn!("Desktop backend ownership id unavailable: {error}");
             }
