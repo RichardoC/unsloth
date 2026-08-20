@@ -30,10 +30,15 @@
 # one, grown, mounted, written into, and converted back compressed -- the layout is
 # carried through untouched and only files are added.
 #
-# The app inside is left UNSIGNED here. Injecting into a signed bundle invalidates
-# its signature, so signing must happen after this step; that is stage 2's problem
-# and release-desktop.yml's file. This script refuses to touch an app that is
-# already signed rather than silently breaking it.
+# The app inside carries no REAL signature when this finishes. A Developer ID
+# signature must be applied after this step, never before, because injecting into a
+# signed bundle invalidates it -- so an app that already carries one is refused.
+#
+# An ad-hoc seal is the exception, and is not optional: tauri applies one on Apple
+# Silicon whether or not any Apple credential is present, because arm64 will not
+# execute unsigned code. Injection invalidates it, so it is re-applied here and the
+# bundle stays launchable. That is why the check below reads Signature= rather than
+# just asking whether codesign succeeds.
 #
 # USAGE
 #
@@ -89,13 +94,44 @@ copy_tree() {
 RESOURCES="$APP/Contents/Resources"
 [ -d "$RESOURCES" ] || die "$APP has no Contents/Resources; is this a macOS app bundle?"
 
-# Refuse to invalidate an existing signature rather than doing it quietly.
+# Refuse to invalidate a REAL signature rather than doing it quietly -- but an ad-hoc
+# one is not a real signature and must not be treated as one.
+#
+# tauri ad-hoc signs the bundle on Apple Silicon whether or not any Apple credential
+# is present, because arm64 refuses to execute unsigned code at all. So every build
+# arrives here signed: the dev build with nothing but an ad-hoc seal, and the release
+# build too, since its Apple credentials moved to a later signing step. Refusing on
+# `codesign -dv` succeeding therefore refused everything, which is how it failed.
+#
+# An ad-hoc seal carries no identity and asserts nothing about origin; it exists so
+# the code can run. Injecting invalidates it, so it is re-applied at the end of this
+# script and the app stays launchable. A Developer ID signature is a different thing
+# and is still refused: it must be applied after injection, never before.
+ADHOC_SIGNED=0
 if command -v codesign >/dev/null 2>&1; then
     if codesign -dv "$APP" >/dev/null 2>&1; then
-        die "$APP is already signed. Injecting the runtime would invalidate that signature; \
-inject before signing."
+        SIGNATURE="$(codesign -dv "$APP" 2>&1 | sed -n 's/^Signature=//p' | head -n 1)"
+        if [ "$SIGNATURE" = "adhoc" ]; then
+            ADHOC_SIGNED=1
+            echo "    note: $APP is ad-hoc signed; re-sealing ad-hoc after injection"
+        else
+            die "$APP carries a real code signature (Signature=${SIGNATURE:-unknown}). \
+Injecting the runtime would invalidate it; inject before signing."
+        fi
     fi
 fi
+
+# Re-apply the ad-hoc seal so the bundle's resource manifest covers the payload and
+# the app still launches on Apple Silicon. Not --deep: it does not sign Mach-Os under
+# Contents/Resources anyway, and the payload's own wheels arrive ad-hoc signed from
+# the build that produced them. A real release signature replaces this wholesale in
+# the signing step that follows.
+reseal_adhoc() {
+    [ "$ADHOC_SIGNED" = "1" ] || return 0
+    command -v codesign >/dev/null 2>&1 || return 0
+    codesign --force --sign - "$1" >/dev/null 2>&1 \
+        || die "could not re-apply the ad-hoc signature to $1"
+}
 
 echo "==> injecting the runtime payload into $APP"
 copy_tree "$PAYLOAD" "$RESOURCES/runtime"
@@ -150,6 +186,7 @@ if command -v file >/dev/null 2>&1; then
 $(file -L "$RESOURCES/$executable")"
     done
 fi
+reseal_adhoc "$APP"
 echo "    ok: $(du -sh "$RESOURCES/runtime" 2>/dev/null | cut -f1) in Contents/Resources/runtime"
 
 if [ -z "$DMG" ]; then
@@ -187,6 +224,7 @@ MOUNTED_APP="$(find "$MOUNT" -maxdepth 1 -name '*.app' -print -quit)"
 copy_tree "$PAYLOAD" "$MOUNTED_APP/Contents/Resources/runtime"
 [ -x "$MOUNTED_APP/Contents/Resources/runtime/python/bin/python3" ] || die \
     "the injected interpreter is not executable inside the mounted image"
+reseal_adhoc "$MOUNTED_APP"
 detach
 
 # ULFO (lzfse) rather than UDZO (zlib): measurably smaller for a payload that is

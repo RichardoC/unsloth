@@ -772,11 +772,37 @@ class TestLayoutContract:
             assert binary in block, f"the executability loop does not cover {binary}"
         assert "not executable inside the app bundle" in text
 
-    def test_the_injection_script_refuses_to_break_an_existing_signature(self):
+    def test_the_injection_script_refuses_to_break_a_real_signature(self):
+        """A Developer ID signature must be applied after injection, never before, so an
+        app already carrying one is refused rather than quietly invalidated."""
         text = INJECT_SCRIPT.read_text(encoding = "utf-8")
-        assert "codesign -dv" in text and "already signed" in text, (
+        assert "codesign -dv" in text, "the script no longer inspects the signature"
+        assert "real code signature" in text, (
             "injecting into a signed bundle invalidates its signature; the script must "
             "refuse rather than do it quietly"
+        )
+
+    def test_the_injection_script_accepts_an_adhoc_seal_and_re_applies_it(self):
+        """tauri ad-hoc signs on Apple Silicon whether or not an Apple credential is
+        present, because arm64 will not execute unsigned code -- so every build arrives
+        at injection already signed. Treating that as a real signature refused every
+        build, dev and release alike, which is exactly how this failed. An ad-hoc seal
+        carries no identity, so it is accepted; injection invalidates it, so it must be
+        re-applied or the bundle will not launch."""
+        text = INJECT_SCRIPT.read_text(encoding = "utf-8")
+        assert re.search(r"Signature=", text), (
+            "the script must read Signature= to tell an ad-hoc seal from a real "
+            "identity; `codesign -dv` succeeding is true of both"
+        )
+        assert re.search(r'=\s*"adhoc"', text), "the ad-hoc case is not distinguished"
+        assert "codesign --force --sign -" in text, (
+            "an invalidated ad-hoc seal is not re-applied, so the injected app cannot "
+            "launch on Apple Silicon"
+        )
+        # Both bundles: the copy inside the .dmg is a separate bundle on a separate
+        # filesystem, so resealing the staging app does not cover it.
+        assert text.count("reseal_adhoc \"") >= 2, (
+            "the app and the copy inside the .dmg must both be re-sealed"
         )
 
     def test_the_manifest_is_part_of_the_contract(self, pins):
