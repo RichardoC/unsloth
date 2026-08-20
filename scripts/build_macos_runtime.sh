@@ -327,7 +327,16 @@ uv_common=(
 # The pure-Python sdist-only requirements, read out of install_python_stack.py so
 # the list cannot drift. See gen_macos_bundle_lock.sh for why building these, and
 # only these, is sound on a foreign host.
-mapfile -t SDIST_ONLY < <(
+#
+# Read with a while loop rather than `mapfile`: this script's whole point is to run
+# on macOS, where /bin/bash is 3.2 and mapfile does not exist. It is a bash 4
+# builtin, so it works on a Linux runner and dies with "mapfile: command not found"
+# on the platform we are building for -- which is exactly how it shipped broken.
+SDIST_ONLY=()
+while IFS= read -r _sdist_name; do
+    [ -n "$_sdist_name" ] || continue
+    SDIST_ONLY+=("$_sdist_name")
+done < <(
     "$PYTHON_BIN" - "$STUDIO_DIR/install_python_stack.py" <<'PY'
 import pathlib
 import re

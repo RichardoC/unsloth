@@ -1469,3 +1469,59 @@ class TestTheAppResolvesTheBundledCopy:
         ordinary = tmp_path / ".unsloth" / "stable-diffusion.cpp"
         ordinary.mkdir(parents = True)
         assert module.is_bundled_runtime_target(ordinary) is False
+
+
+class TestTheBuildScriptsRunOnTheOsTheyBuildFor:
+    """These scripts exist to produce a macOS payload, and macOS ships bash 3.2 as
+    /bin/bash -- the shell GitHub's `run:` steps use by default. A bash 4 builtin
+    therefore passes every Linux check and dies only on the platform being built for.
+
+    That is not hypothetical: `mapfile -t` shipped in build_macos_runtime.sh and every
+    bundled build failed with "mapfile: command not found" at exit 127, after
+    downloading and verifying the whole prebuilt set. Cheap to assert, and the failure
+    mode is expensive to find.
+    """
+
+    # Builtins and expansions that do not exist in bash 3.2. Matched on the shell
+    # syntax rather than a version probe, because the script may be run by hand from a
+    # user's own newer bash and still has to work under /bin/bash in CI.
+    BASH4_ONLY = (
+        (r"\bmapfile\b", "mapfile is bash 4; use `while IFS= read -r` with a process substitution"),
+        (r"\breadarray\b", "readarray is bash 4; same fix as mapfile"),
+        (r"\bdeclare\s+-A\b", "associative arrays are bash 4"),
+        (r"\blocal\s+-A\b", "associative arrays are bash 4"),
+        (r"\blocal\s+-n\b", "namerefs are bash 4.3"),
+        (r"\bdeclare\s+-g\b", "declare -g is bash 4.2"),
+        (r"\$\{[A-Za-z_][A-Za-z0-9_]*\^\^", "${var^^} is bash 4; use tr"),
+        (r"\$\{[A-Za-z_][A-Za-z0-9_]*,,", "${var,,} is bash 4; use tr"),
+        (r"&>>", "&>> is bash 4; use >>file 2>&1"),
+    )
+
+    MACOS_BUILD_SCRIPTS = (
+        "scripts/build_macos_runtime.sh",
+        "scripts/inject_macos_runtime.sh",
+        "scripts/gen_macos_bundle_lock.sh",
+    )
+
+    def test_no_macos_build_script_uses_a_bash_4_only_construct(self):
+        offenders = {}
+        for relative in self.MACOS_BUILD_SCRIPTS:
+            path = REPO_ROOT / relative
+            if not path.is_file():
+                continue
+            for number, line in enumerate(path.read_text(encoding = "utf-8").splitlines(), 1):
+                # Comments are where we explain the ban, so they must not trip it.
+                if line.lstrip().startswith("#"):
+                    continue
+                for pattern, fix in self.BASH4_ONLY:
+                    if re.search(pattern, line):
+                        offenders.setdefault(relative, []).append(f"{number}: {fix}")
+        assert not offenders, (
+            f"bash 4 only syntax in a script that must run under macOS /bin/bash 3.2: "
+            f"{offenders}"
+        )
+
+    def test_the_guard_would_have_caught_the_mapfile_regression(self):
+        """A guard nobody has seen fail is a guard nobody should trust."""
+        sample = 'mapfile -t NAMES < <(printf "a\\nb\\n")'
+        assert any(re.search(pattern, sample) for pattern, _ in self.BASH4_ONLY)
