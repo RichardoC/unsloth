@@ -173,7 +173,11 @@ jobs:
             echo "backend unpinned (dev behaviour: first run tracks latest)"
             unset UNSLOTH_DESKTOP_BACKEND_VERSION
           fi
-          npx --prefix studio tauri build --target aarch64-apple-darwin --bundles dmg
+          # app AND dmg, not dmg alone: `--bundles dmg` asks tauri for the disk image
+          # only, and it does not leave the .app behind in bundle/macos -- the next
+          # step needs it, because the payload is injected into both so a developer
+          # poking at target/ sees the same bundle a user mounts.
+          npx --prefix studio tauri build --target aarch64-apple-darwin --bundles app,dmg
 
       - name: Locate the .dmg and rename it for this commit
         id: dmg

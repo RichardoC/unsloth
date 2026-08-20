@@ -1525,3 +1525,23 @@ class TestTheBuildScriptsRunOnTheOsTheyBuildFor:
         """A guard nobody has seen fail is a guard nobody should trust."""
         sample = 'mapfile -t NAMES < <(printf "a\\nb\\n")'
         assert any(re.search(pattern, sample) for pattern, _ in self.BASH4_ONLY)
+
+    def test_the_dev_build_asks_tauri_for_the_app_as_well_as_the_dmg(self):
+        """`--bundles dmg` builds the disk image and leaves no .app in bundle/macos, so
+        the inject step has nothing to put the payload into. That failed a build with
+        "no .app was produced alongside the .dmg" after a full Rust compile, which is
+        the second-most expensive place to find out."""
+        workflow = REPO_ROOT / ".github/workflows/desktop-dev-build.yml"
+        build = [
+            line for line in workflow.read_text(encoding = "utf-8").splitlines()
+            if "tauri build" in line and not line.lstrip().startswith("#")
+        ]
+        assert build, "the dev build no longer invokes tauri build"
+        for line in build:
+            if "--bundles" not in line:
+                continue
+            bundles = line.split("--bundles", 1)[1].split()[0]
+            assert "app" in bundles.split(","), (
+                f"tauri build requests --bundles {bundles}, which does not include the "
+                f"app; the payload injection needs the .app tauri leaves in bundle/macos"
+            )
