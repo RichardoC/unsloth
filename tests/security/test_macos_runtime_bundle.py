@@ -1207,7 +1207,7 @@ class TestDevBuildWorkflow:
         run = str(step.get("run", ""))
         assert "hdiutil attach" in run, "the check must run against the .dmg's own copy"
         assert "Contents/Resources/runtime" in run
-        assert "-I -P -c 'import fastapi, transformers; print(\"ok\")'" in run, (
+        assert 'import fastapi, transformers' in run, (
             "the workflow must import the stack with the bundled interpreter"
         )
         for module in ("torch", "mlx", "diffusers", "datasets", "uvicorn", "pymupdf", "bitsandbytes"):
@@ -1216,7 +1216,12 @@ class TestDevBuildWorkflow:
             "the app runs the payload read-only; anything needing to write a .pyc must "
             "fail here rather than on a user's Mac"
         )
-        assert "unsloth_cli --help" in run
+        # The CLI is proven by importing its entrypoint, not by `-m unsloth_cli`:
+        # -I discards the variable that puts site-packages on the path, so -m cannot
+        # find the module. This is the same import bundled_runtime.rs performs.
+        assert "from unsloth_cli import app" in run, (
+            "nothing proves the bundle carries a runnable CLI"
+        )
 
     def test_the_workflow_asserts_llama_server_is_an_executable_arm64_binary(self, dev_workflow):
         step = next(
@@ -1570,4 +1575,25 @@ class TestTheBuildScriptsRunOnTheOsTheyBuildFor:
             assert "app" in bundles.split(","), (
                 f"tauri build requests --bundles {bundles}, which does not include the "
                 f"app; the payload injection needs the .app tauri leaves in bundle/macos"
+            )
+
+    def test_the_proof_step_reaches_site_packages_the_way_the_app_does(self):
+        """`-I` implies `-E`, so PYTHONPATH is discarded. site-packages sits outside the
+        interpreter's prefix, so under -I the only route to it is a bootstrap reading a
+        variable -E knows nothing about -- which is what bundled_runtime.rs does. A probe
+        that exports PYTHONPATH instead fails with ModuleNotFoundError while the app
+        itself is fine, reporting a payload bug that does not exist."""
+        workflow = (REPO_ROOT / ".github/workflows/desktop-dev-build.yml").read_text(encoding = "utf-8")
+        rust = (REPO_ROOT / "studio/src-tauri/src/bundled_runtime.rs").read_text(encoding = "utf-8")
+        env_name = "UNSLOTH_BUNDLED_SITE_PACKAGES"
+        assert env_name in rust, "the Rust side no longer names the site-packages variable"
+        assert env_name in workflow, (
+            f"the proof step must reach site-packages through {env_name}, the way the app "
+            f"does, not through PYTHONPATH which -I discards"
+        )
+        probe = [line for line in workflow.splitlines() if '-I -B -c' in line or '-I -P -c' in line]
+        assert probe, "the proof step no longer runs the bundled interpreter"
+        for line in probe:
+            assert "-P" not in line.split("-c")[0], (
+                f"-P is redundant under -I and 3.11+ only; the app does not use it: {line.strip()}"
             )

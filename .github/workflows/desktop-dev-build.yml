@@ -253,8 +253,10 @@ jobs:
         # The point of the whole payload is that copying the app off the .dmg is the
         # entire installation, so this asserts against the .dmg's own copy -- not the
         # staging directory, not the target/ tree -- and it RUNS things rather than
-        # checking that files exist. `-I -P` is the isolated, no-cwd-on-path form the
-        # app itself uses, so a passing import here is an import the app can make.
+        # checking that files exist. It uses the app's own flags and its own
+        # site-packages mechanism, so a passing import here is an import the app can
+        # make -- see the note at the interpreter invocation for why PYTHONPATH is not
+        # that mechanism.
         #
         # No writes to the mounted image (it is attached read-only) and
         # PYTHONDONTWRITEBYTECODE=1, because that is how the app runs it: the payload
@@ -337,15 +339,31 @@ jobs:
           # network and no install.
           py="$runtime/python/bin/python3"
           test -x "$py"
+          # The flags and the path mechanism the app itself uses, not a bespoke pair.
+          # `-I` implies `-E`, so PYTHONPATH is DISCARDED -- site-packages sits outside
+          # the interpreter's prefix, so under -I the only route to it is a bootstrap
+          # that reads a variable -E knows nothing about. Probing with `-I -P` plus
+          # PYTHONPATH therefore failed with ModuleNotFoundError while the app itself
+          # was fine, which is a probe bug masquerading as a payload bug. -B replaces
+          # PYTHONDONTWRITEBYTECODE for the same reason. See BUNDLED_CLI_ENTRYPOINT in
+          # studio/src-tauri/src/bundled_runtime.rs.
+          export UNSLOTH_BUNDLED_SITE_PACKAGES="$runtime/site-packages"
+          # Exported because the app exports them for the Python subprocesses the
+          # backend spawns; both are inert for these -I invocations.
           export PYTHONHOME="$runtime/python"
-          export PYTHONPATH="$runtime/site-packages"
           export PYTHONDONTWRITEBYTECODE=1
-          "$py" -I -P -c 'import sys; print(sys.version)'
-          "$py" -I -P -c 'import fastapi, transformers; print("ok")'
-          "$py" -I -P -c 'import torch; print("torch", torch.__version__, "mps", torch.backends.mps.is_available())'
-          "$py" -I -P -c 'import mlx.core as mx; print("mlx", mx.default_device())'
-          "$py" -I -P -c 'import diffusers, datasets, uvicorn, pymupdf, bitsandbytes, unsloth_zoo; print("stack ok")'
-          "$py" -I -P -m unsloth_cli --help >/dev/null && echo "unsloth_cli ok"
+          boot='import os, sys; sys.path.append(os.environ["UNSLOTH_BUNDLED_SITE_PACKAGES"])'
+          "$py" -X utf8 -I -B -c "$boot; print(sys.version)"
+          "$py" -X utf8 -I -B -c "$boot; import fastapi, transformers; print(\"ok\")"
+          "$py" -X utf8 -I -B -c "$boot; import torch; print(\"torch\", torch.__version__, \"mps\", torch.backends.mps.is_available())"
+          # The entrypoint the app actually calls, imported the way the app imports it.
+          # If this resolves, `unsloth studio` has a CLI to run from the bundle.
+          "$py" -X utf8 -I -B -c "$boot; sys.argv[0] = \"unsloth\"; from unsloth_cli import app; print(\"cli ok\")"
+          "$py" -X utf8 -I -B -c "$boot; import mlx.core as mx; print(\"mlx\", mx.default_device())"
+          "$py" -X utf8 -I -B -c "$boot; import diffusers, datasets, uvicorn, pymupdf, bitsandbytes, unsloth_zoo; print(\"stack ok\")"
+          # -m cannot work here: -I discards the variable that puts site-packages on
+          # the path, so the module is unimportable. The app runs -c with a bootstrap
+          # for exactly this reason; the CLI import above is the equivalent proof.
 
           # Node runs the OXC validator against the prefetched, darwin-arm64
           # node_modules. A Linux binding would fail exactly here.
