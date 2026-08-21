@@ -40,6 +40,18 @@
 # likely to fail (a moved wheel, a bumped pin, an unreachable release), and failing
 # it before the ~20-minute Rust compile is worth more than the little parallelism
 # lost.
+#
+# AND THE BACKEND IN IT IS THIS COMMIT'S
+#
+# The payload's `unsloth` is built from the checkout, not installed from PyPI (see
+# scripts/build_macos_runtime.sh step 3). That is what makes this workflow evidence at
+# all: while the payload carried the published wheel, every dev build was testing a new
+# Rust shell against last release's Python backend, and a backend-side regression could
+# not be caught here even in principle. It shipped exactly that way once -- the bundled
+# CLI had no _serves_backend_in_process, so the app started the backend and got
+# "Unsloth Studio not set up. Run install.sh first." The proof step below therefore does
+# not just import the CLI; it asks the CLI, inside the mounted .dmg, whether it knows it
+# is the bundled runtime.
 
 name: Desktop dev build (unsigned)
 
@@ -284,6 +296,7 @@ jobs:
           # advertise itself as incomplete.
           python3 - "$runtime/BUNDLE_MANIFEST.json" <<'PY'
           import json
+          import os
           import sys
 
           manifest = json.load(open(sys.argv[1]))
@@ -302,8 +315,30 @@ jobs:
               manifest["components"]["sd_cpp"]
           )
           assert not manifest["incomplete"], manifest["incomplete"]
+          # The payload's `unsloth` must be THIS commit's, built from the checkout, and
+          # the manifest must say so rather than let `locks` imply the whole payload came
+          # hash-verified off an index. A payload whose backend is the published wheel is
+          # a payload nobody's changes were tested in.
+          local = manifest["local_provenance"]
+          assert local["index_verified"] is False, local
+          entry = next(item for item in local["distributions"] if item["name"] == "unsloth")
+          assert entry["provenance"] == "local-checkout", entry
+          assert entry["index_verified"] is False, entry
+          assert entry["wheel_tag"] == "py3-none-any", entry
+          assert entry["wheel_sha256"], entry
+          expected_commit = os.environ["GITHUB_SHA"]
+          assert entry["repo_commit"] == expected_commit, (
+              f'the payload records unsloth built from {entry["repo_commit"]!r}, but this '
+              f'build is {expected_commit!r}'
+          )
+          assert manifest["components"]["unsloth_local_wheel"]["repo_commit"] == expected_commit
+          assert manifest["distributions"]["unsloth"] == entry["version"], (
+              manifest["distributions"]["unsloth"], entry["version"]
+          )
           print(f"manifest ok: {manifest['distribution_count']} distributions, "
-                f"python {manifest['python']['version']}")
+                f"python {manifest['python']['version']}, "
+                f"unsloth {entry['version']} built from {entry['repo_commit'][:12]} "
+                f"(index copy {entry['replaced_index_version']} replaced)")
           PY
 
           # llama.cpp is there AND executable, in the layout the installer uses.
@@ -365,6 +400,39 @@ jobs:
           # the path, so the module is unimportable. The app runs -c with a bootstrap
           # for exactly this reason; the CLI import above is the equivalent proof.
 
+          # THE SEAM, from inside the mounted .dmg. Everything above passed on the build
+          # that shipped broken: the payload imported fine, and then the CLI decided it
+          # was an ordinary install with no studio venv and printed "Unsloth Studio not
+          # set up. Run install.sh first." So ask the two questions that decide it --
+          # does the CLI recognise this interpreter as the bundled runtime, and does the
+          # launch path therefore serve the backend in-process -- with the same
+          # environment the app hands the backend process.
+          test -f "$runtime/site-packages/unsloth_cli/_bundled_runtime.py"
+          test -f "$runtime/site-packages/studio/backend/utils/bundled_runtime.py"
+          "$py" -X utf8 -I -B -c "$boot
+          from pathlib import Path
+          from unsloth_cli import _bundled_runtime
+          from unsloth_cli.commands import studio as studio_cmd
+          root = _bundled_runtime.bundled_runtime_root()
+          assert root == Path(os.environ['UNSLOTH_BUNDLED_SITE_PACKAGES']).resolve().parent, root
+          assert _bundled_runtime.bundled_site_packages().is_dir()
+          assert studio_cmd._serves_backend_in_process() is True, (
+              'the bundled CLI does not know it carries the backend; unsloth studio '
+              'would exit with \"Unsloth Studio not set up. Run install.sh first.\"'
+          )
+          assert studio_cmd._in_managed_studio_venv() is False, (
+              'a bundled runtime is not the managed venv, and must not be mistaken for one'
+          )
+          print('seam ok:', root)"
+          # And the backend's own mirror of the same predicate: it runs from interpreters
+          # with no unsloth_cli on sys.path, so it carries its own copy and the two must
+          # agree about the same payload.
+          "$py" -X utf8 -I -B -c "$boot
+          from studio.backend.utils import bundled_runtime as backend_seam
+          from unsloth_cli import _bundled_runtime
+          assert backend_seam.bundled_runtime_root() == _bundled_runtime.bundled_runtime_root()
+          print('backend seam ok')"
+
           # Node runs the OXC validator against the prefetched, darwin-arm64
           # node_modules. A Linux binding would fail exactly here.
           #
@@ -423,6 +491,17 @@ jobs:
           print(f"Python {manifest['python']['version']}, "
                 f"{manifest['distribution_count']} distributions, no venv. "
                 f"First launch installs nothing.")
+          print()
+          # Which `unsloth` is in there. Not a detail: while this said "from PyPI" the
+          # dev build was proving nothing about the backend in the commit under test.
+          local = next(
+              item for item in manifest["local_provenance"]["distributions"]
+              if item["name"] == "unsloth"
+          )
+          print(f"Backend in the payload: `unsloth {local['version']}` built from this "
+                f"checkout (`{(local['repo_commit'] or 'unknown')[:12]}`), replacing the "
+                f"index copy `{local['replaced_index_version']}`. Every other "
+                f"distribution came from the locks under `--require-hashes`.")
           print()
           print("| component | installed |")
           print("| --- | --- |")

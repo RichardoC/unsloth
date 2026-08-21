@@ -72,6 +72,7 @@ SD_BACKEND = STUDIO_DIR / "backend" / "core" / "inference" / "sd_cpp_backend.py"
 SD_INSTALLER = STUDIO_DIR / "install_sd_cpp_prebuilt.py"
 DEV_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "desktop-dev-build.yml"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release-desktop.yml"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # A requirement line starts at column zero; uv indents hashes and annotations.
@@ -967,9 +968,11 @@ class TestBuildScripts:
             head = block.split("|| die", 1)[0]
             if "--require-hashes" in head:
                 continue
-            assert "$plugin" in head or "file://$ARCHIVE" in head, (
-                f"an unhashed uv install that is not a local path: {head.strip()[:200]}"
-            )
+            assert (
+                "$plugin" in head
+                or "file://$ARCHIVE" in head
+                or "$LOCAL_WHEEL" in head
+            ), f"an unhashed uv install that is not a local path: {head.strip()[:200]}"
 
     def test_the_build_script_installs_every_lock_this_repo_ships(self):
         """A lock that exists but is never installed is a lock that is not in the
@@ -1132,6 +1135,261 @@ class TestBuildScripts:
         assert "resolve_release_asset" in body, (
             "the pinned asset must be checked through the installer's own host->asset "
             "function, so it is provably what a Mac would pick"
+        )
+
+
+# ── 6b. the backend inside the payload ───────────────────────────────────────
+#
+# The payload used to install `unsloth` from PyPI, so the .dmg shipped published
+# backend code inside an app built from a different commit. That is how a release went
+# out whose bundled CLI had no _serves_backend_in_process: the Rust side reported the
+# preflight Ready, the CLI then took the managed-venv path, found no
+# <STUDIO_HOME>/unsloth_studio/bin/python (there is never going to be one on a machine
+# that installed the app by copying it) and printed "Unsloth Studio not set up. Run
+# install.sh first." before exiting 1.
+#
+# It also meant the dev build could not catch ANY backend-side regression, because the
+# backend it exercised was last release's.
+
+
+class TestTheBackendInThePayloadIsThisCheckout:
+    @pytest.fixture(scope = "class")
+    def build_text(self) -> str:
+        assert BUILD_SCRIPT.is_file(), f"{BUILD_SCRIPT} is missing"
+        return BUILD_SCRIPT.read_text(encoding = "utf-8")
+
+    def test_the_payload_builds_unsloth_from_the_working_tree(self, build_text):
+        assert "$UV_BIN\" build \\" in build_text or '"$UV_BIN" build' in build_text, (
+            "the payload's own unsloth must be built from this checkout; without that the "
+            "app ships a published wheel and the commit under test is never exercised"
+        )
+        assert "--out-dir \"$LOCAL_WHEEL_DIR\"" in build_text
+        assert '"$REPO_ROOT" \\' in build_text.split('"$UV_BIN" build', 1)[1][:400], (
+            "the wheel must be built from the repository root, not from a download"
+        )
+
+    def test_the_local_wheel_is_installed_after_every_lock(self, build_text):
+        """Order is the whole mechanism. The locks place the closure; the overlay then
+        replaces one distribution inside it. Reversed, the index copy would win.
+        """
+        lock_loop = build_text.rindex('for lock in "${LOCK_STEPS[@]}"')
+        overlay = build_text.index('"$LOCAL_WHEEL" \\')
+        assert lock_loop < overlay, (
+            "the local unsloth wheel is installed before the locks, so the lock's index "
+            "copy would overwrite it"
+        )
+
+    def test_the_local_wheel_cannot_perturb_the_resolved_closure(self, build_text):
+        """--no-deps, and no index install of unsloth by name anywhere.
+
+        The local wheel's metadata carries unpinned requirements (typer, rich, click...).
+        Resolving those here would put versions in the payload that no lock reviewed.
+        """
+        invocations = [
+            block.split("|| die", 1)[0]
+            for block in build_text.split('"$UV_BIN" pip install')[1:]
+        ]
+        overlay = [block for block in invocations if '"$LOCAL_WHEEL"' in block]
+        assert len(overlay) == 1, "expected exactly one install of the local wheel"
+        assert "uv_common" in overlay[0], (
+            "the local wheel must be installed with the shared uv flags, which is where "
+            "--no-deps and --target live"
+        )
+        assert "--no-deps" in build_text.split("uv_common=(", 1)[1].split(")", 1)[0]
+        assert not any(
+            "unsloth==" in block and "$LOCAL_WHEEL" not in block for block in invocations
+        ), (
+            "nothing here may install unsloth from an index by name; the lock is where "
+            "the pin lives and the checkout is where the payload's copy comes from"
+        )
+
+    def test_the_index_copy_is_removed_through_its_own_record_first(self, build_text):
+        """`uv pip install --target` writes over what is there and leaves the rest, so a
+        wheel that dropped a file would leave the old one in the payload -- and with the
+        lock and the checkout at the same version, invisibly.
+        """
+        remove_at = build_text.index("removing the index-installed unsloth")
+        install_at = build_text.index('"$LOCAL_WHEEL" \\')
+        assert remove_at < install_at, "the index copy is removed after the overlay install"
+        removal = build_text[remove_at:install_at]
+        assert 'record = info / "RECORD"' in removal, (
+            "the removal must follow the installed distribution's own RECORD rather than "
+            "globbing paths it guesses at"
+        )
+        assert "site not in target.parents" in removal or "site in target.parents" in removal, (
+            "a RECORD entry pointing outside site-packages must not be followed"
+        )
+
+    def test_the_overlay_proves_it_replaced_rather_than_landed_beside(self, build_text):
+        assert "no orphans" in build_text
+        assert "the index copy was written over rather than" in build_text, (
+            "after the overlay, every file under the local wheel's own trees must be a "
+            "file the local wheel ships"
+        )
+
+    def test_only_unsloth_comes_from_the_checkout(self, build_text, lock_text):
+        """unsloth-zoo is a separate upstream project. It stays exactly as the lock pins
+        it, and the lock's unsloth pin stays too -- the closure has to be resolved
+        against some version of it, and deleting the pin would be a different, worse fix.
+        """
+        assert re.search(r"^unsloth==", lock_text, re.MULTILINE), (
+            "darwin-arm64-bundle.lock.txt no longer pins unsloth; the closure is resolved "
+            "against it, and the payload replaces the installed files afterwards"
+        )
+        assert re.search(r"^unsloth-zoo==", lock_text, re.MULTILINE)
+        removal = build_text.split("removing the index-installed unsloth", 1)[1]
+        removal = removal.split('"$LOCAL_WHEEL" \\', 1)[0]
+        assert 'distribution_name(info) == "unsloth"' in removal, (
+            "the removal must select the distribution named exactly `unsloth`; matched by "
+            "prefix it would take unsloth-zoo with it"
+        )
+        # And the wheel it is replaced with cannot reach unsloth-zoo either: the local
+        # package does not ship it.
+        packaging = PYPROJECT.read_text(encoding = "utf-8")
+        include = packaging.split("[tool.setuptools.packages.find]", 1)[1].split("include = ", 1)[1]
+        include = include.split("]", 1)[0]
+        assert "unsloth_zoo" not in include, (
+            "the local wheel would overwrite unsloth-zoo, which the lock pins and this "
+            "repo does not build"
+        )
+
+    def test_the_wheel_must_be_pure_python_for_a_foreign_host_to_build_it(self, build_text):
+        """The one assumption that makes building the payload's backend on a Linux runner
+        sound. Asserted against the artifact, not assumed: a platform tag or a compiled
+        object in the wheel means the bytes are for the build host, not for macOS arm64.
+        """
+        assert "py3-none-any" in build_text
+        assert '".so", ".dylib", ".pyd"' in build_text, (
+            "the wheel must be checked for compiled objects before it is trusted"
+        )
+        assert "A platform-tagged build cannot be produced for macOS arm64" in build_text
+
+    def test_the_wheel_build_is_immune_to_a_stale_build_directory(self, build_text):
+        """setuptools copies sources into <build_base>/lib and never prunes it, so a
+        build/lib left in a checkout by an earlier build re-ships files the working tree
+        no longer has (measured: a stray file planted in build/lib landed in the wheel).
+        The build base therefore lives in the script's work dir.
+        """
+        assert "DIST_EXTRA_CONFIG" in build_text
+        assert "build_base = %s" in build_text and "egg_base = %s" in build_text, (
+            "both setuptools scratch directories must live in the work dir, so a payload "
+            "build leaves nothing behind in the checkout it built from"
+        )
+        assert "$LOCAL_BUILD_BASE" in build_text and "$LOCAL_EGG_BASE" in build_text
+        assert "never prunes that directory" in build_text, (
+            "the reason this indirection exists must stay written down; without it "
+            "somebody simplifies it away"
+        )
+
+    def test_the_assembly_refuses_a_payload_without_the_bundled_runtime_seam(self, build_text):
+        """The check that makes the shipped failure unshippable, in the BUILD rather than
+        only in a test: a payload whose unsloth_cli cannot tell that it IS the bundled
+        runtime produces an app that starts the backend and is told to run install.sh.
+
+        Twice on purpose -- once in the overlay step, so it fails within seconds of the
+        cause, and once on the finished payload after pruning, so nothing downstream can
+        remove it.
+        """
+        for symbol in ("_bundled_runtime.py", "_serves_backend_in_process"):
+            assert build_text.count(symbol) >= 2, (
+                f"{symbol} must be asserted both at overlay time and on the finished "
+                f"payload"
+            )
+        # The post-prune copy: after the prune step, inside the manifest/contract block.
+        prune_at = build_text.index("==> 6/7 pruning")
+        assert build_text.index("seam_failures", prune_at) > prune_at, (
+            "the finished-payload seam assertion must run after pruning"
+        )
+        assert 'site / "studio" / "backend" / "utils" / "bundled_runtime.py"' in build_text, (
+            "the backend carries its own mirror of the seam (it runs from interpreters "
+            "with no unsloth_cli on sys.path); a payload with one and not the other is "
+            "half converted"
+        )
+        assert "Unsloth Studio not set up" in build_text, (
+            "the failure the assertion prevents should be named in the error, so whoever "
+            "hits it knows what it looked like on a user's Mac"
+        )
+
+    def test_the_assembly_refuses_a_payload_whose_unsloth_is_not_the_local_one(self, build_text):
+        assert 'distributions.get("unsloth")' in build_text
+        assert 'local_unsloth["version"]' in build_text, (
+            "the version installed in the payload must be compared against the wheel this "
+            "build produced; otherwise a leftover index copy passes every other check"
+        )
+
+    def test_the_manifest_records_the_local_provenance_honestly(self, build_text):
+        """A manifest that lists seven hash-verified locks and says nothing about the one
+        distribution built from a working tree is a manifest that misleads an auditor.
+        """
+        assert '"local_provenance": local_provenance' in build_text
+        assert 'components["unsloth_local_wheel"]' in build_text
+        assert '"locks_note"' in build_text, (
+            "the locks section must say that unsloth is the deliberate exception to it"
+        )
+        for field in (
+            '"provenance": "local-checkout"',
+            '"index_verified": False',
+            '"wheel_sha256": digest',
+            '"repo_commit": commit',
+            '"worktree_dirty": dirty',
+            '"replaced_index_version": lock_version',
+        ):
+            assert field in build_text, f"the provenance record is missing {field}"
+        assert "LOCK_UNSLOTH_VERSION=" in build_text and "$BUNDLE_LOCK" in build_text, (
+            "the replaced version must be read out of the lock rather than written here "
+            "a second time"
+        )
+
+    def test_a_payload_that_cannot_name_its_commit_is_refused(self, build_text):
+        """The local wheel's only identity is the commit, and pyproject builds its package
+        data through setuptools-scm's file finder -- which asks `git ls-files`. So a
+        git-less build is both unauditable and quietly incomplete, and must not produce a
+        payload at all.
+        """
+        assert "is not a usable git checkout" in build_text
+        assert "setuptools-scm's file finder" in build_text, (
+            "the silent half of the failure -- missing package data -- must stay written "
+            "down, or the check looks like paperwork and gets relaxed"
+        )
+
+    def test_the_two_local_plugins_are_recorded_as_local_too(self, build_text):
+        """They were always built from the checkout and never appeared in the manifest.
+        The same record now covers them, so `local_provenance` is the complete answer to
+        "what in here did not come from an index".
+        """
+        assert "plugin_dirs" in build_text
+        assert '"${DD_PLUGINS[@]}"' in build_text.split("LOCAL_WHEEL=", 1)[1][:600], (
+            "the provenance record must be handed the local plugin directories"
+        )
+
+    def test_the_generator_version_says_the_payload_shape_changed(self, build_text):
+        """An auditor reading an older BUNDLE_MANIFEST.json has to be able to tell that
+        its payload's unsloth came from PyPI and this one's does not.
+        """
+        assert 'GENERATOR_VERSION="3"' in build_text
+        assert "no longer comes from the index" in build_text
+
+    def test_the_duplicate_frontend_a_local_wheel_also_ships_is_still_pruned(self, pins):
+        """The published wheel embedded the whole Studio frontend, and so does a wheel
+        built here: pyproject ships studio/frontend as package data. The 108 MiB prune
+        therefore still has something to remove, and must stay non-optional -- if that
+        path ever stops existing the packaging changed and somebody should look.
+        """
+        entry = next(
+            item for item in pins["prune"]["entries"]
+            if item["path"] == "site-packages/studio/frontend"
+        )
+        assert entry["optional"] is False, entry
+        assert PYPROJECT.is_file(), f"{PYPROJECT} is missing"
+        packaging = PYPROJECT.read_text(encoding = "utf-8")
+        assert '"frontend/dist/**/*"' in packaging, (
+            "the studio package no longer ships frontend/dist, so the payload's biggest "
+            "prune may be pruning nothing; check what the wheel actually contains before "
+            "relaxing this"
+        )
+        assert (STUDIO_DIR / "frontend").is_dir(), (
+            "studio/frontend is gone from the checkout, so a locally built wheel cannot "
+            "carry it and the non-optional prune entry would fail the build"
         )
 
 
@@ -1301,6 +1559,54 @@ class TestDevBuildWorkflow:
             "a payload built with --skip-diffusers-pin must not pass as shippable"
         )
 
+    def test_the_workflow_asserts_the_payload_backend_is_this_commit(self, dev_workflow):
+        """While the payload carried the published wheel, a dev build proved nothing
+        about the backend in the commit under test -- it tested a new Rust shell against
+        last release's Python. So the manifest's provenance record is checked against
+        this run's SHA, not merely for being present.
+        """
+        step = next(
+            item
+            for item in _dev_steps(dev_workflow)
+            if "Prove the bundled runtime works" in str(item.get("name", ""))
+        )
+        run = str(step.get("run", ""))
+        assert 'manifest["local_provenance"]' in run
+        assert 'entry["provenance"] == "local-checkout"' in run
+        assert 'entry["repo_commit"] == expected_commit' in run, (
+            "the payload's unsloth must be built from the commit being built, and the "
+            "workflow must compare the two rather than trust the label"
+        )
+        assert 'os.environ["GITHUB_SHA"]' in run
+        assert 'entry["index_verified"] is False' in run, (
+            "the manifest must not claim the local wheel was verified against an index"
+        )
+
+    def test_the_workflow_asks_the_bundled_cli_whether_it_knows_it_is_bundled(self, dev_workflow):
+        """The assertion the shipped failure would have flunked, and the only one that
+        would have: every import in this step already passed on the broken build. What
+        failed was a decision -- the CLI concluded it was an ordinary install with no
+        studio venv and printed "Unsloth Studio not set up. Run install.sh first."
+        """
+        step = next(
+            item
+            for item in _dev_steps(dev_workflow)
+            if "Prove the bundled runtime works" in str(item.get("name", ""))
+        )
+        run = str(step.get("run", ""))
+        assert "site-packages/unsloth_cli/_bundled_runtime.py" in run
+        assert "bundled_runtime_root()" in run
+        assert "_serves_backend_in_process() is True" in run, (
+            "nothing in the workflow asks the bundled CLI the question whose wrong answer "
+            "made the app unstartable"
+        )
+        assert "_in_managed_studio_venv() is False" in run, (
+            "a bundled runtime is not the managed venv and must not be mistaken for one"
+        )
+        # And the backend's own mirror of the predicate, which runs from interpreters that
+        # have no unsloth_cli on sys.path.
+        assert "studio.backend.utils" in run and "backend_seam" in run
+
     def test_the_workflow_asserts_the_prune_actually_applied(self, dev_workflow):
         step = next(
             item
@@ -1341,6 +1647,11 @@ class TestDevBuildWorkflow:
         # And the per-component breakdown, so a jump can be attributed.
         assert "sizes_bytes" in str(summary.get("run", ""))
         assert "bytes_freed" in str(summary.get("run", ""))
+        # And which unsloth is in the payload. It read "from PyPI" for as long as the
+        # payload shipped one, and nobody noticed; the commit makes it checkable.
+        assert "local_provenance" in str(summary.get("run", "")), (
+            "the job summary must say which backend the payload carries"
+        )
 
     def test_the_dmg_digest_is_recorded_after_injection(self, dev_workflow):
         """The uploaded .dmg is the injected one, so a digest taken before injection
