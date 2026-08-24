@@ -19,6 +19,8 @@ import ast
 import pathlib
 import re
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 REQ_ROOT = REPO_ROOT / "studio" / "backend" / "requirements"
 PIN_FILE = REQ_ROOT / "diffusers-pin.txt"
