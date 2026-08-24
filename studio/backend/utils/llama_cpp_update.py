@@ -42,6 +42,7 @@ import structlog
 from utils.llama_cpp_freshness import (
     _INSTALL_MARKER_NAME,
     check_prebuilt_freshness,
+    install_target_tag,
     latest_published_release,
     latest_release_assets,
     parse_base_build,
@@ -287,9 +288,38 @@ def _active_install_is_local_link(binary: Optional[str]) -> bool:
     return _flow.active_install_is_local_link(binary, dir_name = "llama.cpp")
 
 
+def _active_install_is_immutable_runtime(binary: Optional[str]) -> bool:
+    """True when the active llama-server is the copy that ships inside the macOS
+    app bundle, so no update or backend switch may write to it.
+
+    Asked of exactly the root an apply would install into -- ``_llama_install_root``
+    is the marker's own directory when there is one and the discovery root
+    otherwise -- because "may we write here?" has to be answered about the
+    directory that would actually be written, not about the binary that led us to
+    it. The bundled copy carries a normal UNSLOTH_PREBUILT_INFO.json marker (the
+    payload build writes one) and UNSLOTH_LLAMA_CPP_PATH points at it, so every
+    existing check says "managed" and means it; see
+    update_flow.immutable_runtime_root for what that leaves out.
+    """
+    return _flow.immutable_runtime_root(_llama_install_root(binary))
+
+
 def _local_link_status() -> dict:
     """Status payload for a local-link install: unmanaged, no update offered."""
     return _flow.local_link_status(_job, _job_lock)
+
+
+def _immutable_runtime_status(binary: Optional[str]) -> dict:
+    """Status payload for the bundled llama.cpp: no update ever offered.
+
+    Offering one would be the same bug the release pin already had -- a button
+    whose only possible outcome is a failed install -- except worse, because the
+    install that "worked" would have broken the app's code signature.
+    """
+    marker = read_install_marker(binary) or {}
+    return _flow.immutable_runtime_status(
+        _job, _job_lock, installed_tag = marker.get("release_tag") or marker.get("tag")
+    )
 
 
 def _whisper_chain_status(
@@ -364,6 +394,11 @@ def _llama_only_status(
     # replace it. Bail before any network/freshness work.
     if _active_install_is_local_link(binary):
         return _local_link_status()
+    # Same for the copy inside the app bundle: read-only and signed, so there is
+    # nothing to offer. Also before any network work -- a release check whose
+    # answer can never be acted on is a wasted round trip.
+    if _active_install_is_immutable_runtime(binary):
+        return _immutable_runtime_status(binary)
     marker = read_install_marker(binary)
 
     with _job_lock:
@@ -385,8 +420,12 @@ def _llama_only_status(
 
     repo = (marker or {}).get("published_repo") or DEFAULT_PUBLISHED_REPO
 
-    if force_refresh and repo:
-        # Prime the cache so the freshness read below sees the newest tag.
+    if force_refresh and repo and not install_target_tag(repo):
+        # Prime the cache so the freshness read below sees the newest tag. Under
+        # the release pin there is nothing to prime -- the target is the pinned
+        # tag and the freshness read makes no GitHub call at all -- so an
+        # explicit "check now" must not spend a network round trip on an answer
+        # it will not use.
         try:
             latest_published_release(repo, force_refresh = True)
         except Exception as exc:  # pragma: no cover - network defensive
@@ -464,6 +503,11 @@ def _switch_support(binary: Optional[str], marker: Optional[dict]) -> Optional[s
         return "not_installed"
     if _active_install_is_local_link(binary):
         return "local_link"
+    # A switch reinstalls the bundle in place, so the picker must not offer one for
+    # a tree that cannot be written. Reported as a reason rather than left to fail
+    # at apply time: the frontend disables the picker and says why.
+    if _active_install_is_immutable_runtime(binary):
+        return _flow.IMMUTABLE_RUNTIME_REASON
     if marker is None:
         return "source_build"
     if _install_dir_for(binary) is None:
@@ -786,6 +830,14 @@ def _plan_llama_phase(backend_request: Optional[str] = None) -> dict:
                 ),
             },
         }
+    # Refuse to write into the runtime that ships inside the app bundle. Checked
+    # here as well as in the status above, because a direct POST reaches this
+    # planner without ever reading the status that would have withheld the button.
+    if _active_install_is_immutable_runtime(binary):
+        return {
+            "skip_reason": _flow.IMMUTABLE_RUNTIME_REASON,
+            "refusal": _flow.immutable_runtime_refusal("llama.cpp"),
+        }
     marker = read_install_marker(binary)
     script = _installer_script()
     if script is None:
@@ -839,6 +891,25 @@ def _plan_llama_phase(backend_request: Optional[str] = None) -> dict:
         wanted_tag = (
             installed_release_tag if backend_request is not None else status.get("latest_tag")
         )
+        # An explicit Update click installs the PINNED release, never past it.
+        # status["latest_tag"] is already the pin (llama_cpp_freshness
+        # .target_release_tag), so this is a guard rather than the mechanism: a
+        # direct POST, a banner rendered before the pin moved, or a status read
+        # under different env can still carry GitHub's newest, and installing it
+        # would take the app off the baseline it was built and tested against
+        # with nothing anywhere saying so. Deliberately not "ask the user": the
+        # honest opt-out already exists and is documented in the pins file --
+        # UNSLOTH_PREBUILT_ALLOW_LATEST=1, or UNSLOTH_LLAMA_RELEASE_TAG=<tag> --
+        # and both make install_target_tag stop pinning here too.
+        # A backend switch is exempt: it reinstalls the marker's own release.
+        pinned_target = None if backend_request is not None else install_target_tag(repo)
+        if pinned_target and wanted_tag != pinned_target:
+            logger.info(
+                "llama update: clamped to the pinned release",
+                requested = wanted_tag,
+                pinned = pinned_target,
+            )
+            wanted_tag = pinned_target
         pin_release_tag = None if sys.platform == "darwin" else wanted_tag
     elif backend_request is not None:
         # Never replace a user-managed tree with a prebuilt implicitly.

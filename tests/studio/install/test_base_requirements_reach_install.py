@@ -188,8 +188,20 @@ class TestCorePackageOwnership:
         ]
         assert len(calls) == 2
         for call in calls:
-            values = [arg.value for arg in call.args if isinstance(arg, ast.Constant)]
-            assert "unsloth" in values and "unsloth-zoo" in values
+            # unsloth reaches the update branch through `unsloth_spec` rather than a
+            # literal: it is "unsloth" unpinned and "unsloth==<version>" when a
+            # desktop release build pins the backend, which is what keeps one .dmg on
+            # one Python stack (tests/security/test_backend_pin_update_path.py).
+            # What this test is about is unchanged: the distributions are named on the
+            # command line, not pulled in from a requirements file.
+            named = {
+                arg.value if isinstance(arg, ast.Constant)
+                else arg.id if isinstance(arg, ast.Name)
+                else None
+                for arg in call.args
+            }
+            assert "unsloth" in named or "unsloth_spec" in named
+            assert "unsloth-zoo" in named
             assert not any(keyword.arg == "req" for keyword in call.keywords)
 
     def test_base_file_does_not_own_core_distributions(self):

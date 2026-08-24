@@ -852,6 +852,7 @@ export const de = {
           notInstalled: "Es wurde keine von Unsloth verwaltete llama.cpp-Installation gefunden, daher gibt es kein Backend zum Wechseln.",
           localLink: "llama.cpp ist ein selbst verknüpftes lokales Verzeichnis, das Unsloth nicht ersetzt.",
           sourceBuild: "Dieses llama.cpp wurde aus dem Quellcode gebaut; sein Backend lässt sich hier nicht wechseln.",
+          immutableRuntime: "llama.cpp ist Teil der Unsloth-App und daher schreibgeschützt. Aktualisiere die App, um es zu ändern.",
           unresolved: "Die verfügbaren Backends konnten nicht geprüft werden. Prüfe deine Verbindung und versuche es erneut.",
         },
         // Wird nicht angezeigt: zusätzliche Begriffe für die Einstellungssuche.

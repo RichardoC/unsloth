@@ -196,11 +196,28 @@ def test_verify_sha256_rejects_mismatch(tmp_path):
         _verify_sha256(f, bad)
 
 
-def test_verify_sha256_skips_when_absent_or_unknown(tmp_path):
+def test_verify_sha256_fails_closed_when_absent_or_unknown(tmp_path):
+    # This archive is about to be extracted and EXECUTED, so "no digest published"
+    # and "a digest we cannot check" are both "unverified download", and neither is
+    # a state to proceed from -- a warning on a lazy background install is a line
+    # nobody reads. The named hatch is the only way through.
     f = tmp_path / "asset.zip"
     f.write_bytes(b"x")
-    _verify_sha256(f, None)  # no digest published -> warn + proceed (no raise)
-    _verify_sha256(f, "md5:abc")  # unrecognised algo -> skip (no raise)
+    with pytest.raises(RuntimeError, match = "cannot be verified"):
+        _verify_sha256(f, None)
+    with pytest.raises(RuntimeError, match = "cannot be verified"):
+        _verify_sha256(f, "md5:abc")
+
+
+def test_verify_sha256_unverified_hatch_restores_warn_and_proceed(tmp_path, monkeypatch):
+    monkeypatch.setenv(sdmod.ALLOW_UNVERIFIED_ENV, "1")
+    f = tmp_path / "asset.zip"
+    f.write_bytes(b"x")
+    _verify_sha256(f, None)  # no raise
+    _verify_sha256(f, "md5:abc")  # no raise
+    # ...but it never excuses a digest that was checked and disagreed.
+    with pytest.raises(RuntimeError, match = "sha256 mismatch"):
+        _verify_sha256(f, "sha256:" + hashlib.sha256(b"other").hexdigest())
 
 
 # ── _fetch_release: pinned-tag 404 -> latest fallback ───────────────────────

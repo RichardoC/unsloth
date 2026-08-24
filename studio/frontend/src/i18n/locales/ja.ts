@@ -809,6 +809,7 @@ export const ja = {
           notInstalled: "管理対象の llama.cpp インストールが見つからないため、切り替えるバックエンドがありません。",
           localLink: "llama.cpp は自分でリンクしたローカルディレクトリのため、Unsloth は置き換えません。",
           sourceBuild: "この llama.cpp はソースからビルドされているため、ここではバックエンドを切り替えられません。",
+          immutableRuntime: "llama.cpp は Unsloth アプリに同梱されているため読み取り専用です。変更するにはアプリを更新してください。",
           unresolved: "利用可能なバックエンドを確認できませんでした。接続を確認して再試行してください。",
         },
         // 非表示: 設定検索用の追加キーワード。

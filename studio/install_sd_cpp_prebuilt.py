@@ -43,7 +43,10 @@ from typing import Optional, Sequence
 DEFAULT_REPO = "unslothai/stable-diffusion.cpp"
 # Fallback when the mirror cannot serve this host (release missing, or a host we do not build).
 UPSTREAM_FALLBACK_REPO = "leejet/stable-diffusion.cpp"
-# Pinned for reproducibility; UNSLOTH_SD_CPP_TAG overrides (empty tracks latest). A missing tag falls back to latest.
+# Pinned for reproducibility; UNSLOTH_SD_CPP_TAG overrides (empty tracks latest). A pinned tag
+# that no longer resolves is a hard failure, NOT a quiet fall back to latest: a release that
+# vanished from under a pin is a signal (retagged, deleted, republished), and routing around it
+# installs an unreviewed build under the name of a reviewed one.
 #
 # The -u<id> suffix means the mirror built upstream master-813-bfbef5b plus the patch set in its
 # patches/ directory, and the id is the hash of that set. MiniMax-H3 needs it: an unpatched build
@@ -61,6 +64,23 @@ REPO = DEFAULT_REPO
 
 # ``master-<n>-<sha>-u<id>``: the mirror's marker for "upstream tree plus our patches/".
 _MIRROR_ONLY_TAG_RE = re.compile(r"^master-\d+-[0-9a-f]+-u[0-9a-f]+$")
+
+# Shared escape hatches. Spelled out rather than imported from prebuilt_core: this script must
+# run standalone (it is invoked before the backend package is importable), but the NAMES and the
+# meanings are the same ones prebuilt_core.py documents -- ALLOW_LATEST = "I accept a different
+# version", ALLOW_UNVERIFIED = "I accept bytes nothing checked".
+ALLOW_LATEST_ENV = "UNSLOTH_PREBUILT_ALLOW_LATEST"
+ALLOW_UNVERIFIED_ENV = "UNSLOTH_PREBUILT_ALLOW_UNVERIFIED"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _allow_latest() -> bool:
+    return os.environ.get(ALLOW_LATEST_ENV, "").strip().lower() in _TRUTHY
+
+
+def _allow_unverified() -> bool:
+    return os.environ.get(ALLOW_UNVERIFIED_ENV, "").strip().lower() in _TRUTHY
+
 
 # What the managed directory records about the install it holds, so a later ensure_* can tell a CPU
 # bundle from a CUDA one instead of reusing whatever binary happens to be on disk.
@@ -318,8 +338,10 @@ def _fetch_release(
     fetch latest. ``token`` is optional and lifts the API rate limit.
 
     When the pinned ``tag`` is missing (404): if ``allow_latest`` fall back to that repo's
-    latest, else return ``None`` so the caller can try the SAME pin on another repo before
-    settling for any repo's unpinned latest."""
+    latest, else return ``None`` so the caller can try the SAME pin on another repo.
+    ``_resolve_with_fallback`` passes ``allow_latest=False`` for every pinned attempt and
+    only offers an unpinned latest when there is no pin at all (or the caller opted into
+    drift), so the fallback below is not a way around a pin."""
     repo = repo or _repo()
     token = token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 
@@ -351,18 +373,45 @@ def _fetch_latest_release(*, token: Optional[str] = None, timeout: float = 30.0)
 
 
 def _verify_sha256(path: Path, expected_digest: Optional[str]) -> None:
-    """Verify ``path`` against a GitHub asset ``digest`` ('sha256:<hex>'). Integrity check
-    against a corrupted/tampered download before we extract + execute the binary. When the
-    release publishes no digest (older releases), warn and proceed rather than hard-fail."""
+    """Verify ``path`` against a GitHub asset ``digest`` ('sha256:<hex>').
+
+    Fails closed. This archive is about to be extracted and its contents EXECUTED, so
+    "no digest published" and "a digest in some algorithm we do not implement" are both
+    "this download was not verified", and neither is a state to proceed from -- a warning
+    on a lazy background install is a line nobody reads. Older releases that publish no
+    digest therefore stop the install instead of installing unverified bytes; set
+    ``UNSLOTH_PREBUILT_ALLOW_UNVERIFIED=1`` to accept that risk deliberately (the same
+    hatch the llama/whisper checksum-index pin uses, named after Node's
+    UNSLOTH_NODE_ALLOW_UNVERIFIED)."""
     if not expected_digest:
-        print(f"sd-cli: WARNING no digest for {path.name}; cannot verify integrity", flush = True)
-        return
+        if _allow_unverified():
+            print(
+                f"sd-cli: WARNING no digest for {path.name}; installing unverified because "
+                f"{ALLOW_UNVERIFIED_ENV}=1",
+                flush = True,
+            )
+            return
+        raise RuntimeError(
+            f"{path.name} was published without a sha256 digest, so this download cannot be "
+            f"verified before sd-cli is extracted and run. Refusing to install unverified "
+            f"binaries. Pick a release that publishes digests (UNSLOTH_SD_CPP_TAG=<tag>), or "
+            f"set {ALLOW_UNVERIFIED_ENV}=1 to install it anyway."
+        )
     algo, _, want = expected_digest.partition(":")
     if algo.lower() != "sha256" or not want:
-        print(
-            f"sd-cli: WARNING unrecognised digest {expected_digest!r}; skipping check", flush = True
+        if _allow_unverified():
+            print(
+                f"sd-cli: WARNING unrecognised digest {expected_digest!r}; installing unverified "
+                f"because {ALLOW_UNVERIFIED_ENV}=1",
+                flush = True,
+            )
+            return
+        raise RuntimeError(
+            f"{path.name} carries digest {expected_digest!r}, which is not a sha256 this "
+            f"installer can check, so the download cannot be verified before sd-cli is "
+            f"extracted and run. Refusing to install unverified binaries. Set "
+            f"{ALLOW_UNVERIFIED_ENV}=1 to install it anyway."
         )
-        return
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -401,6 +450,33 @@ def default_install_dir() -> Path:
         root = root.absolute()
         is_legacy = root == legacy_studio
     return legacy if is_legacy else root / "stable-diffusion.cpp"
+
+
+# The receipt scripts/build_macos_runtime.sh writes at the root of the runtime that ships inside
+# Unsloth.app/Contents/Resources/runtime; studio/src-tauri refuses to launch a payload without it,
+# so its presence beside a component slot is what identifies that slot as part of the app bundle.
+BUNDLE_MANIFEST_NAME = "BUNDLE_MANIFEST.json"
+
+
+def is_bundled_runtime_target(target: Path) -> bool:
+    """True when ``target`` is a component slot inside the runtime that ships inside the macOS
+    app -- i.e. ``…/Unsloth.app/Contents/Resources/runtime/stable-diffusion.cpp``, where the app
+    now carries a verified sd-cli / sd-server so first-run installs nothing.
+
+    That tree is code-signed and, once the app sits in /Applications, root-owned: extracting into
+    it either fails outright or succeeds and invalidates the signature, after which Gatekeeper
+    refuses to launch the app. ``install``'s existing unowned-directory refusal would stop it
+    anyway -- the slot is non-empty and carries no ownership marker -- but it would say "remove or
+    move that directory", which is exactly the wrong advice about somebody's installed application.
+
+    Deliberately a filesystem question, not an environment variable: this script runs standalone
+    (before the backend package is importable) and cannot use utils.bundled_runtime, and a variable
+    left in a shell profile must not be able to talk it out of an install it should perform. Never
+    raises; "cannot tell" is "not the bundle", which is the behaviour every install already has."""
+    try:
+        return (target.parent / BUNDLE_MANIFEST_NAME).is_file()
+    except OSError:
+        return False
 
 
 def _make_executable(path: Path) -> None:
@@ -587,10 +663,17 @@ def _resolve_with_fallback(
     upstream fallback.
 
     Ordering guarantees reproducibility: a pinned tag is tried EXACTLY on every candidate
-    repo before any repo's unpinned latest, so a mirror that is missing the pinned release
-    prefers the pinned upstream build over an unpinned mirror-latest. Returns
+    repo, and a pin is never abandoned for somebody's ``latest``. Returns
     ``(primary, None, None)`` when nothing serves this host. Shared by ``install`` and
-    ``--print-asset`` so both honour the same fallback."""
+    ``--print-asset`` so both honour the same fallback.
+
+    Note which fallback survives and which does not. Mirror -> upstream AT THE SAME PINNED
+    VERSION stays: that one exists because the mirror does not BUILD every host (Linux
+    Vulkan/ROCm, Windows GPU), so it is about host coverage, and ``upstream_tag_for``
+    translates the mirror's ``-u<id>`` tag back to the upstream release it was built from,
+    which means the version installed is still the reviewed one. Either repo's unpinned
+    ``latest`` is gone: that one was about version drift, and it silently substituted a
+    build nobody reviewed the moment a pinned release stopped resolving."""
     tag = _pinned_tag()
     primary = _repo()
     # Only substitute upstream when no UNSLOTH_SD_CPP_REPO is pinned: an explicit repo gets exactly that repo.
@@ -599,8 +682,11 @@ def _resolve_with_fallback(
         not repo_pinned and primary == DEFAULT_REPO and DEFAULT_REPO != UPSTREAM_FALLBACK_REPO
     )
     mirror_only = is_mirror_only_tag(tag)
+    # "I accept drift", the same switch llama.cpp/whisper.cpp honour. Only this restores the
+    # latest-fallback; without it a vanished pin is an error the caller has to see.
+    drift_ok = _allow_latest()
 
-    # (repo, tag_to_fetch, allow_latest): with a pin, try the exact pin on every repo first, then each repo's latest.
+    # (repo, tag_to_fetch, allow_latest): with a pin, try the exact pin on every candidate repo.
     attempts: list[tuple[str, Optional[str], bool]] = []
     if tag:
         attempts.append((primary, tag, False))
@@ -611,9 +697,10 @@ def _resolve_with_fallback(
             # This supersedes simply skipping the attempt for a mirror-only tag: skipping kept the
             # round trip cheap but dropped the pin entirely on those hosts.
             attempts.append((UPSTREAM_FALLBACK_REPO, upstream_tag_for(tag), False))
-        attempts.append((primary, None, True))
-        if allow_upstream:
-            attempts.append((UPSTREAM_FALLBACK_REPO, None, True))
+        if drift_ok:
+            attempts.append((primary, None, True))
+            if allow_upstream:
+                attempts.append((UPSTREAM_FALLBACK_REPO, None, True))
     else:
         attempts.append((primary, None, True))
         if allow_upstream:
@@ -648,6 +735,38 @@ def _resolve_with_fallback(
     return primary, None, None
 
 
+def _no_prebuilt_message(used_repo: str, accelerator: str) -> str:
+    """Why nothing could be installed, in terms the reader can act on.
+
+    sd.cpp is installed LAZILY, at the first image generation rather than during
+    first-run bootstrap, so this text does not appear in an install log next to the
+    command that caused it -- it appears in the middle of someone trying to generate a
+    picture. It therefore has to say what failed, that the rest of Studio is fine, and
+    which knob unsticks it."""
+    base = (
+        f"No prebuilt sd-cli for {platform.system()}/{platform.machine()} "
+        f"(accelerator={accelerator}) from {used_repo}"
+    )
+    tag = _pinned_tag()
+    if not tag or _allow_latest():
+        return f"{base}. Build from source: https://github.com/{used_repo}"
+    repo_pinned = bool((os.environ.get("UNSLOTH_SD_CPP_REPO") or "").strip())
+    tried = [f"{used_repo}@{tag}"]
+    if not repo_pinned and used_repo == DEFAULT_REPO and DEFAULT_REPO != UPSTREAM_FALLBACK_REPO:
+        tried.append(f"{UPSTREAM_FALLBACK_REPO}@{upstream_tag_for(tag)}")
+    return (
+        f"{base} at its pinned tag {tag} (tried {', '.join(tried)}). The pinned release either "
+        f"no longer exists or publishes no asset for this host, and this installer does not "
+        f"quietly install a different one instead: a pin that stopped resolving means the "
+        f"release was deleted, retagged or republished, and settling for 'latest' would run a "
+        f"build nobody reviewed. Only native sd.cpp image generation is affected; the rest of "
+        f"Studio is unchanged. To proceed, set UNSLOTH_SD_CPP_TAG=<tag> to install a specific "
+        f"release, UNSLOTH_SD_CPP_TAG= (empty) to track that repo's latest, or "
+        f"{ALLOW_LATEST_ENV}=1 to restore the old latest-fallback. The pin itself is DEFAULT_TAG "
+        f"in studio/install_sd_cpp_prebuilt.py. Build from source: https://github.com/{used_repo}"
+    )
+
+
 def install(
     *,
     install_dir: Optional[Path] = None,
@@ -658,11 +777,23 @@ def install(
 
     Resolves against the Unsloth mirror (``DEFAULT_REPO``) first; if the mirror can't
     serve this host (release missing, or a host we don't build) AND the default repo is
-    in use, falls back to leejet upstream so native install still works. Raises
-    ``RuntimeError`` only when neither source has an asset for the host, or the archive
-    has no ``sd-cli``.
+    in use, falls back to leejet upstream AT THE SAME PINNED VERSION so native install
+    still works. Raises ``RuntimeError`` when neither source has an asset for the host
+    (including when the pinned release no longer resolves anywhere -- it is never
+    replaced by an unpinned ``latest``), when the download cannot be verified against a
+    published sha256, when the archive has no ``sd-cli``, or when the target is the copy
+    that ships inside the macOS app bundle (see ``is_bundled_runtime_target``).
     """
     target = install_dir or default_install_dir()
+    # The one target that is never installable: the copy that ships inside the app. Checked before
+    # anything is claimed, downloaded or written, because none of that has a reason to happen.
+    if is_bundled_runtime_target(target):
+        raise RuntimeError(
+            f"stable-diffusion.cpp ships inside the Unsloth app ({target}), which is read-only "
+            f"and code-signed; Unsloth won't write there. Updating the app is how this "
+            f"stable-diffusion.cpp changes. To install a separate copy anyway, pass a writable "
+            f"--install-dir."
+        )
     # Claim ownership of `target` only if we created it, it was empty, or it is already marked: adopting a user's non-empty dir would let a later uninstall wipe it.
     marker = target / ".unsloth-studio-owned"
     _may_own = True
@@ -686,11 +817,7 @@ def install(
     used_repo, release, chosen = _resolve_with_fallback(accelerator, token)
 
     if release is None or not chosen:
-        raise RuntimeError(
-            f"No prebuilt sd-cli for {platform.system()}/{platform.machine()} "
-            f"(accelerator={accelerator}) from {used_repo}. Build from source: "
-            f"https://github.com/{used_repo}"
-        )
+        raise RuntimeError(_no_prebuilt_message(used_repo, accelerator))
     print(f"sd-cli: source {used_repo} release {release.get('tag_name', '?')}", flush = True)
     asset = next(a for a in release["assets"] if a["name"] == chosen)
     url = asset["browser_download_url"]
@@ -831,6 +958,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.print_asset:
         # Same primary/fallback resolution as install(), so a host the mirror skips reports the upstream asset, not a false miss.
         _used, _release, chosen = _resolve_with_fallback(args.accelerator, None)
+        if not chosen:
+            # stdout stays the one asset line this flag documents; the reason (which
+            # now includes "the pinned release no longer resolves") goes to stderr.
+            print(_no_prebuilt_message(_used, args.accelerator), file = sys.stderr, flush = True)
         print(chosen or "(no matching prebuilt; build from source)")
         return 0 if chosen else 2
 

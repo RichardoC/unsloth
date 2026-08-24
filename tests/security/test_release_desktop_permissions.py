@@ -27,6 +27,50 @@ def test_only_publish_job_can_write_repository_contents():
     assert write_jobs == ["publish-release"]
 
 
+def test_provenance_signing_scopes_stay_on_the_publish_job():
+    """Attesting needs an OIDC token; only the job that publishes may hold one.
+
+    `id-token: write` mints a token that identifies this repository to Sigstore,
+    and `attestations: write` stores what it signs. Granted at workflow level
+    they would reach the build matrix, which runs third-party build tooling and
+    downloads pinned binaries -- exactly the job that must not be able to sign
+    for the repository. So they live beside `contents: write`, on the one job
+    that already publishes, and nowhere else.
+    """
+    workflow = _workflow()
+    assert "id-token" not in workflow["permissions"]
+    assert "attestations" not in workflow["permissions"]
+
+    for name, job in workflow["jobs"].items():
+        permissions = job.get("permissions", {})
+        signing = {scope: permissions.get(scope) for scope in ("id-token", "attestations")}
+        if name == "publish-release":
+            assert signing == {"id-token": "write", "attestations": "write"}
+        else:
+            assert signing == {"id-token": None, "attestations": None}, name
+
+    steps = workflow["jobs"]["publish-release"]["steps"]
+    attest = [
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/attest-build-provenance@")
+    ]
+    assert len(attest) == 1, [step.get("name") for step in steps]
+    # Pinned to a commit, like every other action here, and over the staged set.
+    assert re.fullmatch(
+        r"actions/attest-build-provenance@[0-9a-f]{40}", attest[0]["uses"]
+    ), attest[0]["uses"]
+    assert attest[0]["with"]["subject-path"] == "${{ runner.temp }}/desktop-release-assets/*"
+
+    # No other job may attest, whatever its permissions say.
+    for name, job in workflow["jobs"].items():
+        if name == "publish-release":
+            continue
+        assert not any(
+            "attest" in str(step.get("uses", "")) for step in job["steps"]
+        ), name
+
+
 def _poll_loop_body(script):
     """Return the body of the first live `while ...; do ... done` loop.
 

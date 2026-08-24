@@ -1,0 +1,22 @@
+# GENERATED FILE -- DO NOT EDIT. See scripts/gen_python_locks.sh.
+#
+# Carved out of extras-no-deps.txt and its lock: a universal lock names one version per
+# package, and these bounds are deliberately NOT exact because the axis that
+# decides the right version (musl vs glibc, the macOS deployment target a wheel
+# was built against) has no PEP 508 marker. Pinning them would push those hosts
+# onto the one release carrying an sdist and into a source build.
+#
+# install_python_stack.py installs this file UNCONSTRAINED BY HASHES, with the
+# shared constraints applied, immediately after the lock for the same step.
+#
+# No macOS x86_64 wheel at any version, so uv falls back to an sdist that shells out to
+# cmake. Skipping it on Intel Macs keeps that install compiler-free.
+#
+# Capped rather than pinned, because which version is installable varies along two
+# axes PEP 508 markers cannot express. 1.4.1 has no musllinux wheel (1.1.0 is the
+# newest that does), and its arm64 wheel is macosx_14_0, so a macOS 13 host needs
+# 1.2.0 while macOS 14+ takes 1.4.1. An exact pin would force a musl host or an
+# older Mac onto the one release carrying an sdist and hand them the cmake build
+# this file is written to avoid. The cap keeps the resolver's fallback while
+# bounding it at the newest audited release.
+pytorch_tokenizers<=1.4.1; sys_platform != "darwin" or platform_machine == "arm64"

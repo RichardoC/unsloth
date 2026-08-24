@@ -74,6 +74,7 @@ from core.inference.sd_cpp_engine import (
     NATIVE_GENERATION_TIMEOUT_S,
     SdCppCancelled,
     SdCppEngine,
+    bundled_install_root,
     find_sd_cpp_binary,
     find_sd_server_binary,
     help_text_identifies_sd_cpp,
@@ -85,6 +86,7 @@ from core.inference.sd_cpp_engine import (
 )
 from core.inference.sd_cpp_server import SdCppServer
 from loggers import get_logger
+from utils.bundled_runtime import path_is_inside_bundled_runtime
 from utils.subprocess_compat import windows_hidden_subprocess_kwargs
 
 logger = get_logger(__name__)
@@ -2732,10 +2734,64 @@ class SdCppDiffusionBackend:
         }
 
 
+#: Said once per process. ``_install_allowed`` is asked on every load and every engine
+#: selection, and inside one process the answer below cannot change.
+_bundled_refusal_logged = False
+
+
+def bundled_runtime_refusal() -> Optional[str]:
+    """Why no sd.cpp install may run, when the answer is the runtime inside Unsloth.app.
+    None when there is nothing to refuse, which is every ordinary install.
+
+    Two situations, one conclusion. Either the app ships stable-diffusion.cpp and this
+    process resolved it (``bundled_install_root``), in which case there is nothing to
+    download -- an install would fetch 45 MiB into ~/.unsloth that the finder then ignores,
+    because the bundled copy outranks it. Or the tree an install would write into is itself
+    inside the bundle, in which case the write either fails on a read-only, root-owned
+    directory or succeeds and invalidates the app's code signature, and Gatekeeper then
+    refuses to launch the app the user just "updated".
+
+    The same seam, and the same wording, the llama.cpp / whisper.cpp updaters use for the
+    bundled copies of their prebuilts (``utils.prebuilt.update_flow.immutable_runtime_root``
+    / ``immutable_runtime_refusal``). It is deliberately NOT reached through
+    ``is_managed_binary``: the bundled tree carries no ownership marker, so nothing here
+    would delete or overwrite it anyway -- this refuses the download as well, which is the
+    part that is otherwise pure waste.
+    """
+    bundled = bundled_install_root()
+    if bundled is not None:
+        return (
+            f"stable-diffusion.cpp ships inside the Unsloth app ({bundled}), which is "
+            f"read-only and code-signed, so there is nothing to install and Unsloth won't "
+            f"write there. Updating the app is how this stable-diffusion.cpp changes."
+        )
+    target = managed_install_root()
+    if path_is_inside_bundled_runtime(target):
+        return (
+            f"the stable-diffusion.cpp install directory resolves inside the Unsloth app "
+            f"({target}), which is read-only and code-signed; Unsloth won't write there. "
+            f"Updating the app is how this stable-diffusion.cpp changes."
+        )
+    return None
+
+
 def _install_allowed() -> bool:
-    """Whether lazy binary install is permitted (UNSLOTH_DIFFUSION_SD_CPP_INSTALL)."""
+    """Whether lazy binary install is permitted (UNSLOTH_DIFFUSION_SD_CPP_INSTALL).
+
+    Also refused for a runtime that ships inside the macOS app bundle, whatever that
+    variable says: see ``bundled_runtime_refusal``. The env switch keeps its meaning as an
+    opt-OUT, so a user who set it to 0 is still answered "no" without a bundle check."""
     val = os.environ.get("UNSLOTH_DIFFUSION_SD_CPP_INSTALL", "auto").strip().lower()
-    return val not in ("0", "off", "false", "no")
+    if val in ("0", "off", "false", "no"):
+        return False
+    refusal = bundled_runtime_refusal()
+    if refusal is None:
+        return True
+    global _bundled_refusal_logged
+    if not _bundled_refusal_logged:
+        _bundled_refusal_logged = True
+        logger.info("not installing sd.cpp: %s", refusal)
+    return False
 
 
 def _progress(

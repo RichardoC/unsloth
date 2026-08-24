@@ -28,6 +28,11 @@ const UNSUPPORTED_REASONS: Record<string, TranslationKey> = {
   local_link: "settings.resources.llamaBackend.unsupported.localLink",
   source_build: "settings.resources.llamaBackend.unsupported.sourceBuild",
   no_install_dir: "settings.resources.llamaBackend.unsupported.notInstalled",
+  // llama.cpp ships inside the app bundle, which is code-signed and read-only.
+  // Mapped rather than left to the "unresolved" fallback: this is not a check
+  // that failed, and "try again" is the wrong instruction for it.
+  immutable_runtime:
+    "settings.resources.llamaBackend.unsupported.immutableRuntime",
   unresolved: "settings.resources.llamaBackend.unsupported.unresolved",
 };
 

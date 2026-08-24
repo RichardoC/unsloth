@@ -33,6 +33,11 @@ if str(_BACKEND_DIR) not in sys.path:
 # setup.sh/setup.ps1 invoke this by path, so its directory is sys.path[0].
 import install_manifest  # noqa: E402
 
+# Same directory, same reason. Imported (rather than re-spelling its env-var names)
+# so the pins below share one definition of the escape hatches with the ggml-family
+# prebuilt installers; it is stdlib-only, so this adds no dependency.
+import prebuilt_core  # noqa: E402
+
 from backend.utils.wheel_utils import (
     flash_attn_package_version,
     flash_attn_wheel_url,
@@ -491,6 +496,86 @@ def _repair_bad_anyio() -> None:
     )
 
 
+# -- Mutable-reference pins -----------------------------------------------------
+# Steps of this installer used to name something that changes under them: a
+# republished GitHub tag (ROCm bitsandbytes), `--upgrade` with no ceiling (the MLX
+# stack), and "newest" (bootstrap pip). Each meant the same desktop build -- and the
+# same `curl | sh` -- installed different code on different days with nothing
+# reviewing the change: a supply-chain surface, not only non-determinism. The three
+# are pinned here, together, so a bump is one edit. The fourth of the set,
+# triton_kernels, is pinned to a commit in backend/requirements/triton-kernels.txt,
+# because that is where the requirement lives.
+#
+# All three answer to the shared escape hatch UNSLOTH_PREBUILT_ALLOW_LATEST=1
+# (prebuilt_core.ALLOW_LATEST_ENV, reused rather than a fourth variable): with it
+# set, every pin below reverts to exactly the pre-pin behaviour. A requirements file
+# cannot read the environment, so triton_kernels is not covered by it.
+# See studio/DETERMINISM.md.
+
+
+def _allow_latest_pins() -> bool:
+    """True when the caller opted into pre-pin "track the newest" behaviour."""
+    return prebuilt_core.allow_latest_prebuilt()
+
+
+# pip resolves every other dependency, so bootstrapping "whatever pip is newest
+# today" put a moving part underneath the entire install. Pinned exact rather than
+# bounded: pip is the resolver, its own resolution behaviour changes between
+# releases, and there is nothing to be gained from a range.
+#
+# Nothing here needs pip to be the newest release -- the code only needs *a* pip
+# (uv venvs ship none), and the two behaviours it does depend on, PEP 517 builds and
+# `--only-binary`, have been stable for years. The ensurepip path is deliberately
+# left alone: the pip CPython bundles is fixed by the pinned CPython, so it is
+# already deterministic.
+# To bump: `curl -sL https://pypi.org/pypi/pip/json | jq -r .info.version`.
+_PIP_BOOTSTRAP_VERSION = "26.2.1"  # released 2026-08-04
+
+
+def _pip_bootstrap_spec() -> str:
+    """The pip requirement to bootstrap into the venv."""
+    return "pip" if _allow_latest_pins() else f"pip=={_PIP_BOOTSTRAP_VERSION}"
+
+
+# Apple Silicon MLX stack. Ceilings, not exact pins: mlx is pre-1.0, so its breaking
+# changes land in MINOR releases, which makes <next-minor the compatible-release
+# window here. Patch releases inside each window stay admitted on purpose -- an
+# exact == would strand Apple Silicon users on a broken combination just as readily
+# as no ceiling does, and mlx-vlm in particular ships fixes as patches. The numbers
+# below are the next minor after the releases this was resolved against on
+# 2026-08-19: mlx/mlx-metal 0.32.1, mlx-lm 0.31.3, mlx-vlm 0.6.15.
+#
+# _report_mlx_stack_health() exists because a newer mlx-lm/mlx-vlm paired with the
+# Studio transformers pin has repeatedly blacked out Train; the ceilings are what stop
+# that pairing arriving unannounced.
+#
+# Deliberately no floors. With --upgrade a floor cannot change what a healthy install
+# resolves to -- the newest admissible version is already chosen -- so it would only
+# change the failing case, and change it for the worse: without uv there is no
+# UV_OVERRIDE, so mlx-vlm's own `transformers>=5.14.0` collides with the pinned
+# transformers==5.5.0 in constraints.txt, and the resolver backtracking to an older
+# mlx-vlm is the only thing that keeps that install from failing outright. A floor
+# turns a degraded-but-installed stack, which the health probe above already reports
+# and the background self-heal already retries, into a fatal install error on macOS.
+#
+# mlx pins `mlx-metal==<its own version>` on Darwin, so the mlx-metal ceiling must stay
+# identical to the mlx one or the pair becomes unsatisfiable.
+# To bump: check PyPI for each of the four and move each ceiling to the next minor.
+_MLX_STACK_SPECS: tuple[str, ...] = (
+    "mlx<0.33",
+    "mlx-metal<0.33",
+    "mlx-lm<0.32",
+    "mlx-vlm<0.7",
+)
+# Pre-pin behaviour: bare names, newest of everything.
+_MLX_STACK_UNBOUNDED: tuple[str, ...] = ("mlx", "mlx-metal", "mlx-lm", "mlx-vlm")
+
+
+def _mlx_stack_specs() -> tuple[str, ...]:
+    """The four MLX requirements to install on Apple Silicon."""
+    return _MLX_STACK_UNBOUNDED if _allow_latest_pins() else _MLX_STACK_SPECS
+
+
 # AMD Windows ROCm wheels (repo.amd.com/rocm/whl/{arch_family}/).
 # Override with UNSLOTH_ROCM_WINDOWS_MIRROR for air-gapped/mirror installs.
 _ROCM_WINDOWS_INDEX_BASE = (
@@ -523,6 +608,14 @@ _GFX_TO_AMD_INDEX_ARCH: dict[str, str] = {
 # bitsandbytes continuous-release_main wheels with the ROCm 4-bit GEMV fix
 # (bnb #1887, post-0.49.2). bnb <= 0.49.2 NaNs at decode shape on every AMD GPU;
 # PyPI 0.50.0 is the first release with the fix, so the fallback below is safe.
+#
+# NO LONGER THE DEFAULT SOURCE -- reached only under UNSLOTH_PREBUILT_ALLOW_LATEST=1
+# (see _bnb_rocm_prerelease_url). `continuous-release_main` is a rolling tag that is
+# republished in place on every merge to bnb's main, so these URLs named different
+# bytes on different days: the wheel filename says 1.33.7.preview forever while its
+# metadata version walks forward (0.50.2.dev0 as of 2026-08-19). There is no
+# immutable handle on that tag, and the fix it existed for has since shipped in a
+# real release -- see _BNB_ROCM_PINNED_SPEC.
 _BNB_ROCM_PRERELEASE_URLS: dict[str, str] = {
     "x86_64": (
         "https://github.com/bitsandbytes-foundation/bitsandbytes/releases/"
@@ -546,14 +639,55 @@ _BNB_ROCM_PRERELEASE_URLS: dict[str, str] = {
 # Keep in step with the amd extra in pyproject.toml and the install.sh fallback.
 _BNB_ROCM_PYPI_FALLBACK = "bitsandbytes>=0.50.0"
 
+# The immutable reference that replaces the rolling tag above, and the default ROCm
+# bitsandbytes source. This is not a downgrade: the shared libraries that carry the
+# ROCm (and XPU) kernels are byte-identical between the 0.50.1 release on PyPI and
+# the continuous-release_main wheel -- verified per-member sha256 over both wheels on
+# 2026-08-19, all five libbitsandbytes_rocm*.so and both libbitsandbytes_xpu*.so
+# equal. The rolling wheel's only functional difference is in
+# backends/triton/kernels_4bit.py, which bnb registers for XPU alone, never for the
+# HIP path; the CUDA libraries differ and do not matter on a ROCm host.
+#
+# Exact rather than a floor: >=0.50.0 is what the *fallback* keeps (install.sh shares
+# that constant, and a floor is the right shape for "anything at least as fixed as
+# this"), but the primary install is what every ROCm host actually gets, so it names
+# one release. To bump: confirm the new release still ships libbitsandbytes_rocm*.so
+# for the arch families in _GFX_TO_AMD_INDEX_ARCH, then move this line.
+_BNB_ROCM_PINNED_SPEC = "bitsandbytes==0.50.1"  # released 2026-08-13
+
 
 def _bnb_rocm_prerelease_url() -> str | None:
     """Return the continuous-release_main bnb wheel URL for the current arch,
     or None when no pre-release wheel is available.
+
+    None unless UNSLOTH_PREBUILT_ALLOW_LATEST=1: that tag is republished in place, so
+    installing from it silently changed the installed bytes. With the hatch off the
+    callers install _BNB_ROCM_PINNED_SPEC instead -- an immutable release carrying
+    byte-identical ROCm kernels.
     """
+    if not _allow_latest_pins():
+        return None
     arch = platform.machine().lower()
     arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(arch, arch)
     return _BNB_ROCM_PRERELEASE_URLS.get(arch)
+
+
+def _bnb_rocm_primary_spec(arch_key: str | None = None) -> str | None:
+    """What to install first for ROCm bitsandbytes, or None when there is nothing.
+
+    Default: the exact pinned release. Under UNSLOTH_PREBUILT_ALLOW_LATEST=1: the
+    rolling continuous-release_main wheel for this arch, as before the pin -- and
+    None there when the arch has no such wheel, so the caller still reaches the
+    PyPI fallback rather than installing nothing.
+
+    ``arch_key`` names the wheel table entry directly (the Windows caller knows it
+    is win_amd64 regardless of what platform.machine() says under emulation).
+    """
+    if not _allow_latest_pins():
+        return _BNB_ROCM_PINNED_SPEC
+    if arch_key is None:
+        return _bnb_rocm_prerelease_url()
+    return _BNB_ROCM_PRERELEASE_URLS.get(arch_key)
 
 
 def _bnb_rocm_arch_has_binary() -> bool:
@@ -1916,34 +2050,41 @@ _rocm_windows_torch_installed: bool = False
 
 
 def _install_bnb_windows_rocm() -> bool:
-    """Install AMD Windows BNB, pre-release wheel first. Returns True on success.
+    """Install AMD Windows BNB, pinned release first. Returns True on success.
 
-    The wheel's filename version (1.33.7.preview, PEP 440 1.33.7rc0) does not
-    match its metadata (0.50.x.dev0). uv rejects the mismatch and still mangles
-    the install under UV_SKIP_WHEEL_FILENAME_CHECK, so force plain pip, which
-    performs no such check. Per the AMD install guide
-    (https://unsloth.ai/docs/get-started/install/amd/amd-hackathon).
+    The first attempt is _BNB_ROCM_PINNED_SPEC, an exact PyPI release. Its win_amd64
+    wheel ships libbitsandbytes_rocm{714,72}.dll from 0.50.0 on, so this is a real
+    ROCm build; before 0.50.0 PyPI was CUDA-only, which is why the rolling
+    continuous-release_main wheel used to be first and why the >=0.50.0 floor below
+    is a real fallback rather than a downgrade.
 
-    When that URL is blocked, fall back to PyPI. Its win_amd64 wheel ships
-    libbitsandbytes_rocm{714,72}.dll from 0.50.0 on, so the fallback is a real
-    ROCm build; before 0.50.0 it was CUDA-only, which is why there was none.
+    UNSLOTH_PREBUILT_ALLOW_LATEST=1 puts that rolling wheel back in front. Its
+    filename version (1.33.7.preview, PEP 440 1.33.7rc0) does not match its metadata
+    (0.50.x.dev0); uv rejects the mismatch and still mangles the install under
+    UV_SKIP_WHEEL_FILENAME_CHECK, so plain pip is forced -- it performs no such
+    check. Per the AMD install guide
+    (https://unsloth.ai/docs/get-started/install/amd/amd-hackathon). force_pip stays
+    set for the pinned spec too: nothing here needs uv, and one code path that always
+    behaves the same way is worth more than a marginally faster install.
     """
-    _bnb_win_url = _BNB_ROCM_PRERELEASE_URLS.get("win_amd64")
+    _bnb_win_spec = _bnb_rocm_primary_spec("win_amd64")
     _ok = False
-    if _bnb_win_url is not None:
+    if _bnb_win_spec is not None:
         _ok = pip_install_try(
-            "bitsandbytes (AMD Windows, pre-release main)",
+            "bitsandbytes (AMD Windows, pre-release main)"
+            if _allow_latest_pins()
+            else "bitsandbytes (AMD Windows, pinned)",
             "--force-reinstall",
             "--no-cache-dir",
             "--no-deps",
-            _bnb_win_url,
+            _bnb_win_spec,
             constrain = False,
             force_pip = True,
         )
         if not _ok:
             _safe_print(
                 _red(
-                    "   bnb pre-release install failed; falling back to PyPI "
+                    "   bnb install failed; falling back to PyPI "
                     f"{_BNB_ROCM_PYPI_FALLBACK}, which carries the ROCm 4-bit fix"
                 )
             )
@@ -3266,20 +3407,25 @@ def _ensure_rocm_torch() -> None:
                 [sys.executable, "-m", "pip", "uninstall", "-y", "bitsandbytes"],
                 capture_output = True,
             )
-    # Install bitsandbytes only when torch links against ROCm. Prefers the
-    # continuous-release_main wheel (bnb PR #1887 4-bit GEMV fix), falling back
-    # to PyPI when the pre-release wheel won't install. Use pip for the
-    # pre-release wheel because uv rejects its filename/metadata version mismatch.
+    # Install bitsandbytes only when torch links against ROCm, from the exact release
+    # _BNB_ROCM_PINNED_SPEC names: its ROCm kernels are byte-identical to the
+    # continuous-release_main wheel that used to be first here (bnb PR #1887 4-bit
+    # GEMV fix), and unlike that rolling tag it cannot change underneath us.
+    # UNSLOTH_PREBUILT_ALLOW_LATEST=1 restores the wheel-first order; that wheel needs
+    # plain pip, because uv rejects its filename/metadata version mismatch. Either way
+    # the >=0.50.0 floor stays the fallback if the first attempt cannot install.
     elif rocm_torch_ready:
-        _bnb_url = _bnb_rocm_prerelease_url()
+        _bnb_spec = _bnb_rocm_primary_spec()
         _bnb_installed = False
-        if _bnb_url is not None:
+        if _bnb_spec is not None:
             _bnb_installed = pip_install_try(
-                "bitsandbytes (AMD, pre-release main)",
+                "bitsandbytes (AMD, pre-release main)"
+                if _allow_latest_pins()
+                else "bitsandbytes (AMD, pinned)",
                 "--force-reinstall",
                 "--no-cache-dir",
                 "--no-deps",
-                _bnb_url,
+                _bnb_spec,
                 constrain = False,
                 force_pip = True,
             )
@@ -3289,7 +3435,7 @@ def _ensure_rocm_torch() -> None:
                 )
                 _safe_print(
                     _red(
-                        "   bnb pre-release install failed; falling back to PyPI "
+                        "   bnb install failed; falling back to PyPI "
                         f"{_BNB_ROCM_PYPI_FALLBACK}{_fallback_note}"
                     )
                 )
@@ -3393,6 +3539,51 @@ if not _TORCH_BACKEND:
         _TORCH_BACKEND = "cuda"
 
 
+# -- Backend version pin --------------------------------------------------------
+# UNSLOTH_BACKEND_VERSION is the same input install.sh reads: a desktop release
+# build stamps its backend version (release-desktop.yml -> install.rs ->
+# update.rs) so one .dmg only ever installs one Python stack. install.sh already
+# pins the FRESH install, but it hands this script SKIP_STUDIO_BASE=1, so the
+# core-package installs below are the ones the UPDATE path takes -- and
+# `unsloth studio update` pops SKIP_STUDIO_BASE (unsloth_cli/commands/studio.py).
+# Without this, the desktop's own update button walks a pinned install forward to
+# whatever PyPI serves that day, which is exactly the drift the pin exists to stop.
+# Empty (the `curl | sh` CLI user, CI, and unstamped dev builds) = today's
+# floating "track the newest" behavior, unchanged.
+_BACKEND_VERSION_ENV = "UNSLOTH_BACKEND_VERSION"
+# release[pre][post][dev], the PEP 440 subset install.sh's grep accepts. Used with
+# re.fullmatch, never `$`: `$` also matches just before a trailing newline, which
+# would let "2026.8.18\n--index-url http://evil" through as a "valid" version.
+_BACKEND_VERSION_RE = re.compile(r"[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?")
+
+
+def _backend_version_pin(raw: "str | None" = None) -> str:
+    """Return the validated exact backend version to pin to, or "" for unpinned.
+
+    Two gates, mirroring install.sh: a character allow-list that rejects anything
+    outside [0-9a-z.] -- whitespace, newlines, `=`, `-` and `/` included, so the
+    value cannot smuggle a second argument (`--index-url ...`) or a second
+    requirement into the argv it is concatenated into -- and then the shape check.
+    The value is NOT stripped, for the same reason install.sh does not strip it:
+    a version that needs trimming is a version that came from somewhere unexpected.
+
+    Raises ValueError on a malformed value rather than falling back to unpinned:
+    silently ignoring it would turn a typo'd pin into a floating install, which is
+    the failure this whole mechanism exists to prevent.
+    """
+    value = os.environ.get(_BACKEND_VERSION_ENV, "") if raw is None else raw
+    if not value:
+        return ""
+    if not _BACKEND_VERSION_RE.fullmatch(value) or any(
+        char not in "0123456789abcdefghijklmnopqrstuvwxyz." for char in value
+    ):
+        raise ValueError(
+            f"{_BACKEND_VERSION_ENV} must be a PEP 440 release version "
+            f"(e.g. 2026.8.18); got: {value!r}"
+        )
+    return value
+
+
 def _torch_step_label(suffix: str) -> str:
     """Return a progress label like 'torch check (cuda)' using the known backend.
 
@@ -3429,6 +3620,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REQ_ROOT = SCRIPT_DIR / "backend" / "requirements"
 SINGLE_ENV = REQ_ROOT / "single-env"
 CONSTRAINTS = SINGLE_ENV / "constraints.txt"
+# Hash-verified locks, generated by scripts/gen_python_locks.sh. See _lock_for().
+LOCK_ROOT = REQ_ROOT / "locks"
 LOCAL_DD_UNSTRUCTURED_PLUGIN = (
     SCRIPT_DIR / "backend" / "plugins" / "data-designer-unstructured-seed"
 )
@@ -3436,6 +3629,10 @@ LOCAL_DD_GITHUB_PLUGIN = SCRIPT_DIR / "backend" / "plugins" / "data-designer-git
 
 # Apple Silicon: override mlx-vlm/mlx-lm's transformers pin (see overrides).
 # _uv_safe_path: uv truncates UV_OVERRIDE at the first space too (issue #6503).
+#
+# This is process-wide, so uv applies it to every install below -- including the
+# hash-verified ones, where an override's range entries are rejected outright. The
+# env for those is built without it; see _HASH_VERIFIED_HOSTILE_ENV_VARS.
 _MLX_OVERRIDES = SINGLE_ENV / "overrides-darwin-arm64.txt"
 if IS_MAC_ARM and _MLX_OVERRIDES.is_file() and "UV_OVERRIDE" not in os.environ:
     os.environ["UV_OVERRIDE"] = _uv_safe_path(_MLX_OVERRIDES)
@@ -3857,11 +4054,33 @@ def _bootstrap_uv() -> bool:
 
 
 def _filter_requirements(req: Path, skip: set[str]) -> Path:
-    """Return a temp copy, adjacent when writable, with certain packages removed."""
+    """Return a temp copy, adjacent when writable, with certain packages removed.
+
+    Continuation-aware, because this also runs over the hash-verified locks under
+    requirements/locks/. uv writes each locked requirement as a backslash-continued
+    logical line::
+
+        torchcodec==0.10.0 \\
+            --hash=sha256:... \\
+            --hash=sha256:...
+
+    Dropping only the first physical line would leave the ``--hash=`` lines behind as
+    orphans, and pip and uv both reject that file outright -- so the NO_TORCH /
+    Windows / torchcodec skips would take down the very steps they exist to rescue.
+    Trailing ``# via`` annotations are left where they are: a stray comment is inert.
+    """
     lines = req.read_text(encoding = "utf-8").splitlines(keepends = True)
-    filtered = [
-        line for line in lines if not any(line.strip().lower().startswith(pkg) for pkg in skip)
-    ]
+    filtered: list[str] = []
+    dropping = False
+    for line in lines:
+        continues = line.rstrip("\r\n").endswith("\\")
+        if dropping:
+            dropping = continues
+            continue
+        if any(line.strip().lower().startswith(pkg) for pkg in skip):
+            dropping = continues
+            continue
+        filtered.append(line)
     # Beside the source so relative -r/-c includes resolve; a read-only tree
     # (root-owned install, non-root user) falls back rather than aborting.
     kwargs = dict(
@@ -3878,6 +4097,183 @@ def _filter_requirements(req: Path, skip: set[str]) -> Path:
     tmp.writelines(filtered)
     tmp.close()
     return Path(tmp.name)
+
+
+# -- Hash-verified locks -----------------------------------------------
+#
+# A version pin is not a digest. `pip install -r studio.txt` re-resolves the whole
+# transitive closure from PyPI at install time and installs whatever bytes the index
+# returns, so 144 packages arrive with nothing to check them against. The locks under
+# requirements/locks/ are machine-generated closures of the torch-INDEPENDENT steps,
+# every version pinned and every artefact digest-listed, reviewed as a diff, and
+# installed here with --require-hashes.
+#
+# Regenerate with scripts/gen_python_locks.sh; the CI freshness lane
+# (.github/workflows/python-lock-freshness.yml) fails when a requirements edit leaves
+# one stale. See studio/DETERMINISM.md.
+
+# Requirements files that MUST have a lock. A missing one warns loudly and falls back
+# to the unlocked path rather than failing: a wheel built before the locks shipped has
+# to keep installing.
+LOCKED_REQUIREMENTS: frozenset[str] = frozenset(
+    {
+        "studio.txt",
+        "extras-no-deps.txt",
+        "no-torch-runtime.txt",
+        "data-designer-deps.txt",
+        "data-designer.txt",
+    }
+)
+
+# The requirements files this installer applies with `-r` that deliberately have NO
+# lock, each with the reason. Asserted exhaustive by tests/security/test_python_locks.py,
+# so a new requirements file cannot slip in unlocked and unexplained.
+UNLOCKED_REQUIREMENTS: dict[str, str] = {
+    "base.txt": "comment-only today; a lock of nothing is nothing",
+    "overrides.txt": (
+        "comment-only today, and an --overrides input rather than an -r one: torchao "
+        "is selected at install time against the torch actually present"
+    ),
+    "extras.txt": (
+        "not torch-independent: timm, openai-whisper, torch-stoi and torchcodec all "
+        "declare torch, so a with-deps resolution of this file pins torch, "
+        "torchvision, torchaudio, triton and the whole nvidia-* CUDA set from PyPI "
+        "and overrides the hardware-detected torch index"
+    ),
+    "diffusers-pin.txt": (
+        "a GitHub source ARCHIVE; resolving it means fetching and building the zip, "
+        "and the pin is already a full commit sha"
+    ),
+    "triton-kernels.txt": (
+        "a git+https requirement cannot carry a hash at all, and uv rejects one under "
+        "--require-hashes; the pin is already a full commit sha"
+    ),
+}
+
+
+def _python_locks_enabled() -> bool:
+    """False when the caller opted out with UNSLOTH_PYTHON_NO_LOCK=1.
+
+    The escape hatch exists for the case a lock cannot cover: a user on a platform or
+    a Python the locks were not resolved for, or a mirror that serves re-signed
+    artefacts. It reverts every step to exactly the pre-lock behaviour.
+    """
+    return os.environ.get("UNSLOTH_PYTHON_NO_LOCK", "0") != "1"
+
+
+# `# unsloth-lock-python-floor: 3.10` -- written by scripts/gen_python_locks.sh.
+_LOCK_FLOOR_RE = re.compile(r"^#\s*unsloth-lock-python-floor:\s*(\d+)\.(\d+)\s*$")
+
+
+def _lock_python_floor(text: str) -> "tuple[int, int] | None":
+    """The lowest Python a lock was resolved for, or None when it says nothing."""
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            break  # the header is the leading comment block; stop at the first pin
+        match = _LOCK_FLOOR_RE.match(line)
+        if match:
+            return (int(match.group(1)), int(match.group(2)))
+    return None
+
+
+def _lock_for(req: "Path | None") -> "Path | None":
+    """The hash-verified lock for a requirements file, or None to install it unlocked.
+
+    None, rather than an error, in every case a lock cannot be honoured, because the
+    unlocked path is what the installer did before locks existed and it still works:
+
+    * the escape hatch is set;
+    * the file is not one we lock (extras.txt and friends -- see
+      UNLOCKED_REQUIREMENTS for why each one);
+    * the lock is missing, which is a wheel built before this change (loud warning);
+    * this interpreter is below the lock's Python floor. The locks are universal
+      across platforms but resolved from a 3.10 floor, so their
+      `python_version < "3.10"` branches were resolved away. Handing a 3.9 host a
+      3.10 resolution would quietly install a subset; leave it exactly where it was.
+    """
+    if req is None or not _python_locks_enabled():
+        return None
+    if req.name not in LOCKED_REQUIREMENTS:
+        return None
+    lock = LOCK_ROOT / f"{req.stem}.lock.txt"
+    try:
+        text = lock.read_text(encoding = "utf-8")
+    except OSError:
+        _step(
+            "warning",
+            f"no hash-verified lock for {req.name} ({lock.name} is missing) -- "
+            f"installing it from the index unverified; the locks under "
+            f"{LOCK_ROOT.name}/ need regenerating",
+            _cyan,
+        )
+        return None
+    floor = _lock_python_floor(text)
+    if floor is not None and sys.version_info[:2] < floor:
+        _note(
+            f"{lock.name} was resolved for Python >= {floor[0]}.{floor[1]}; this is "
+            f"{sys.version_info[0]}.{sys.version_info[1]}, so {req.name} is installed unlocked"
+        )
+        return None
+    return lock
+
+
+def _lock_carve_out(lock: Path) -> "Path | None":
+    """The unlocked side file for a lock, when that step has carve-outs.
+
+    The lock generator (see the comment above LOCKED_REQUIREMENTS) strips entries
+    whose real bound cannot be written as a PEP 508 marker -- `pytorch_tokenizers<=1.4.1`,
+    where which version installs depends on musl-vs-glibc and on the macOS deployment
+    target its wheel was built against -- and writes them here. They are installed
+    straight after the lock, unlocked and with the shared constraints, so the resolver
+    keeps the fallback the cap exists for.
+    """
+    stem = lock.name[: -len(".lock.txt")]
+    side = lock.with_name(f"{stem}.unlocked.txt")
+    try:
+        # read, not is_file(): most locks have no side file, and an unreadable one has
+        # to behave the same as an absent one rather than abort the install.
+        text = side.read_text(encoding = "utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.split("#", 1)[0].strip():
+            return side
+    return None  # comments only: nothing to install
+
+
+def _pip_bootstrap_lock() -> "Path | None":
+    """The hash-verified lock for the pip bootstrap step, or None to install unpinned.
+
+    pip is the resolver every non-uv step below runs through, so it is the one
+    download whose bytes decide what every later download means -- and until this
+    lock it was fetched with nothing to check it against.
+
+    None when the escape hatch is set, when ALLOW_LATEST asked for "whatever pip is
+    newest" (which no lock can express), when the file is absent, or when it does not
+    pin exactly the version this module asks for. That last case is a stale lock left
+    behind by a _PIP_BOOTSTRAP_VERSION bump: installing the version it names instead
+    would silently ignore the bump, so warn and fall back to the spec.
+    """
+    if not _python_locks_enabled() or _allow_latest_pins():
+        return None
+    lock = LOCK_ROOT / "pip-bootstrap.lock.txt"
+    try:
+        text = lock.read_text(encoding = "utf-8")
+    except OSError:
+        return None
+    floor = _lock_python_floor(text)
+    if floor is not None and sys.version_info[:2] < floor:
+        return None
+    want = f"pip=={_PIP_BOOTSTRAP_VERSION}"
+    if not any(line.split("\\", 1)[0].strip() == want for line in text.splitlines()):
+        _step(
+            "warning",
+            f"{lock.name} does not pin {want} -- installing pip unverified; "
+            f"the locks under {LOCK_ROOT.name}/ need regenerating",
+            _cyan,
+        )
+        return None
+    return lock
 
 
 def _shared_base_requirements() -> Path | None:
@@ -4013,13 +4409,55 @@ def _relaxed_pip_policy_env(cmd: "list[str]") -> "dict[str, str]":
     unchanged" contract holds on a machine with no hostile pip config.
 
     `require-hashes = true` makes pip reject any requirement without a --hash, which is
-    every requirements file we ship; that is what took the pip FALLBACK down in #8530
-    once uv had failed. pip applies env vars AFTER config files, so PIP_REQUIRE_HASHES=0
-    overrides it while pip.conf's index-url, trusted-host, cert and proxy stay in force.
+    every UNLOCKED requirements file we ship; that is what took the pip FALLBACK down in
+    #8530 once uv had failed. pip applies env vars AFTER config files, so
+    PIP_REQUIRE_HASHES=0 overrides it while pip.conf's index-url, trusted-host, cert and
+    proxy stay in force.
+
+    A command that carries --require-hashes is installing one of the locks under
+    requirements/locks/, where every requirement DOES have a digest, so the relaxation
+    is both unnecessary and the opposite of what the step is for. The flag on the
+    command line outranks the env var either way (pip reads the command line last), but
+    a hash-verified install must not run with hash checking switched off in its
+    environment: the next person to add a flag here would inherit a silent hole.
     """
     if cmd[:1] == ["uv"] or not any(arg in ("install", "download") for arg in cmd):
         return {}
+    if "--require-hashes" in cmd:
+        return {}
     return {"PIP_REQUIRE_HASHES": "0"}
+
+
+# Env vars a hash-verified install must not carry, whoever set them.
+#
+# UV_OVERRIDE is exported process-wide further up this module on macOS arm64, because
+# resolving the MLX stack needs it: without it mlx-vlm's own `transformers>=5.14.0`
+# fights constraints.txt's pin and the resolver walks the whole MLX stack backwards.
+# But uv applies an override to EVERY install in the process, and an override file's
+# entries are ranges by nature -- overriding a range with an exact pin would just be a
+# pin. Under --require-hashes uv rejects any unpinned requirement, the ones an override
+# injects included, so the first hash-verified install in the process died on
+# `transformers>=5.5.0` before placing a single byte. Every macOS arm64 install did,
+# which is how it was found.
+#
+# scripts/build_macos_runtime.sh already states the invariant this restores, because
+# the payload builder hit the same wall and got it right: an override belongs where
+# resolution happens, not where a closure is placed. A lock has nothing left to
+# resolve, so it has nothing for an override to relax.
+_HASH_VERIFIED_HOSTILE_ENV_VARS = (
+    "UV_OVERRIDE",
+)
+
+
+def _hash_verified_env_removals(cmd: "list[str]") -> "tuple[str, ...]":
+    """Names to drop from the env of a --require-hashes install; () for anything else.
+
+    Keyed on the flag rather than on which lock is being installed, so a step added
+    later inherits the guarantee instead of having to know about it.
+    """
+    if "--require-hashes" not in cmd:
+        return ()
+    return tuple(name for name in _HASH_VERIFIED_HOSTILE_ENV_VARS if name in os.environ)
 
 
 def _install_env_for_cmd(cmd: "list[str]") -> "dict[str, str] | None":
@@ -4033,18 +4471,27 @@ def _install_env_for_cmd(cmd: "list[str]") -> "dict[str, str] | None":
     A non-pinned `pip` command also gets hash-required mode switched off, the one
     relaxation with no command-line equivalent; the wheel-less requirements go through
     the package-scoped --no-binary in _sdist_only_build_args() instead.
+
+    A --require-hashes command additionally loses the env vars in
+    _HASH_VERIFIED_HOSTILE_ENV_VARS, pinned index or not -- see there for why an
+    override cannot travel with a lock.
     """
+    removals = _hash_verified_env_removals(cmd)
     if not _is_pinned_index_cmd(cmd):
         relaxed = _relaxed_pip_policy_env(cmd)
-        if not relaxed:
+        if not relaxed and not removals:
             return None
         env = os.environ.copy()
         env.update(relaxed)
+        for name in removals:
+            env.pop(name, None)
         return env
     env = os.environ.copy()
     for name in _UV_INDEX_ENV_VARS:
         env.pop(name, None)
     for name in _PM_POLICY_ENV_VARS:
+        env.pop(name, None)
+    for name in removals:
         env.pop(name, None)
     env["UV_NO_CONFIG"] = "1"
     env["PIP_CONFIG_FILE"] = os.devnull
@@ -4099,66 +4546,101 @@ def pip_install(
     req: Path | None = None,
     constrain: bool = True,
 ) -> None:
-    """Build and run a pip install command (uses uv when available, falls back to pip)."""
+    """Build and run a pip install command (uses uv when available, falls back to pip).
+
+    When `req` has a hash-verified lock (see _lock_for), the lock is installed in its
+    place under --require-hashes, and any carve-outs that could not go into a universal
+    lock follow it as a second, unlocked install. Everything else is unchanged.
+    """
     # Any pip operation can change which torch is installed, so the memoized
     # classification must not outlive it.
     _invalidate_torch_runtime_probe()
-    constraint_args_pip: list[str] = []
-    constraint_args_uv: list[str] = []
-    if constrain and CONSTRAINTS.is_file():
-        constraint_args_pip = ["-c", str(CONSTRAINTS)]
-        constraint_args_uv = ["-c", _uv_safe_path(CONSTRAINTS)]
 
-    actual_req = req
+    # The steps this call makes, in order. One for an ordinary install; two when the
+    # lock has carve-outs that could not go into a universal resolution.
+    #
+    # constrain = False on a locked step, and not by omission: -c CONSTRAINTS would
+    # decide nothing (every version in a lock is already pinned) and --require-hashes
+    # rejects a range specifier outright -- constraints.txt carries `packaging<27`,
+    # `av<16` and `anyio<4.14.0`, so passing it turns every locked step into "all
+    # requirements must have their versions pinned with '=='". The compile in
+    # scripts/gen_python_locks.sh applies the constraints instead, where they belong.
+    lock = _lock_for(req)
+    if lock is None:
+        plans: list[tuple[str, Path | None, bool, bool]] = [(label, req, constrain, False)]
+    else:
+        plans = [(label, lock, False, True)]
+        carve_out = _lock_carve_out(lock)
+        if carve_out is not None:
+            # Same *args, so a --no-deps step stays --no-deps: these entries are capped
+            # precisely because their transitive resolution is the thing to avoid.
+            plans.append((f"{label} (unlockable carve-outs)", carve_out, constrain, False))
+
     temp_reqs: list[Path] = []
-    if req is not None and IS_WINDOWS and WINDOWS_SKIP_PACKAGES:
-        actual_req = _filter_requirements(req, WINDOWS_SKIP_PACKAGES)
-        temp_reqs.append(actual_req)
-    if actual_req is not None and NO_TORCH and NO_TORCH_SKIP_PACKAGES:
-        actual_req = _filter_requirements(actual_req, NO_TORCH_SKIP_PACKAGES)
-        temp_reqs.append(actual_req)
-    if actual_req is not None and PLATFORM_LACKS_TORCHCODEC_WHEEL:
-        # Linux aarch64 / Windows ARM64 / Intel Mac have no torchcodec
-        # wheel. `unsloth studio update --local` does not pass
-        # --no-torch, so the NO_TORCH filter above does not fire; do
-        # the targeted skip independently so the audio extras step
-        # does not take down the whole update.
-        actual_req = _filter_requirements(actual_req, {"torchcodec"})
-        temp_reqs.append(actual_req)
-    req_args_pip: list[str] = []
-    req_args_uv: list[str] = []
-    if actual_req is not None:
-        req_args_pip = ["-r", str(actual_req)]
-        req_args_uv = ["-r", _uv_safe_path(actual_req)]
-
     try:
-        if USE_UV:
-            uv_cmd = _build_uv_cmd(args) + constraint_args_uv + req_args_uv
-            if VERBOSE:
-                _safe_print(f"   {label}...")
-            result = subprocess.run(
-                uv_cmd,
-                stdout = subprocess.PIPE,
-                stderr = subprocess.STDOUT,
-                env = _install_env_for_cmd(uv_cmd),
-                **_windows_hidden_subprocess_kwargs(),
-            )
-            if result.returncode == 0:
-                # Echo success under UNSLOTH_VERBOSE, as install.sh's run_install_cmd
-                # does. Without it the dependency phase never reached the log that
-                # clean-machine-assert.sh's `nobuild` greps for uv's
-                # "Building <pkg>==<ver>", so a source build here -- the studio.txt
-                # install, where sdist-only dependencies show up -- reported
-                # "built: none" and stayed green. Redacted: uv echoes credentialed URLs.
-                if VERBOSE and result.stdout:
-                    _safe_print(_redact_install_output(result.stdout))
-                return
-            _safe_print(_red(f"   uv failed, falling back to pip..."))
-            if result.stdout:
-                _safe_print(_redact_install_output(result.stdout))
+        for step_label, step_req, step_constrain, require_hashes in plans:
+            constraint_args_pip: list[str] = []
+            constraint_args_uv: list[str] = []
+            if step_constrain and CONSTRAINTS.is_file():
+                constraint_args_pip = ["-c", str(CONSTRAINTS)]
+                constraint_args_uv = ["-c", _uv_safe_path(CONSTRAINTS)]
 
-        pip_cmd = _build_pip_cmd(args) + constraint_args_pip + req_args_pip
-        run(f"{label} (pip)" if USE_UV else label, pip_cmd)
+            actual_req = step_req
+            if step_req is not None and IS_WINDOWS and WINDOWS_SKIP_PACKAGES:
+                actual_req = _filter_requirements(step_req, WINDOWS_SKIP_PACKAGES)
+                temp_reqs.append(actual_req)
+            if actual_req is not None and NO_TORCH and NO_TORCH_SKIP_PACKAGES:
+                actual_req = _filter_requirements(actual_req, NO_TORCH_SKIP_PACKAGES)
+                temp_reqs.append(actual_req)
+            if actual_req is not None and PLATFORM_LACKS_TORCHCODEC_WHEEL:
+                # Linux aarch64 / Windows ARM64 / Intel Mac have no torchcodec
+                # wheel. `unsloth studio update --local` does not pass
+                # --no-torch, so the NO_TORCH filter above does not fire; do
+                # the targeted skip independently so the audio extras step
+                # does not take down the whole update.
+                actual_req = _filter_requirements(actual_req, {"torchcodec"})
+                temp_reqs.append(actual_req)
+            req_args_pip: list[str] = []
+            req_args_uv: list[str] = []
+            if actual_req is not None:
+                req_args_pip = ["-r", str(actual_req)]
+                req_args_uv = ["-r", _uv_safe_path(actual_req)]
+            # Ahead of the -r so the flag stays visible in a truncated log line, and
+            # never dropped on the pip fallback: pip verifies a hashed requirements
+            # file natively, so the fallback keeps the guarantee instead of quietly
+            # installing the same file unverified. A failing hashed install is not
+            # retried unlocked either -- that would hand anyone who can make the
+            # verified install fail (a mangling proxy, a yanked artefact) the
+            # unverified one instead.
+            hash_args = ["--require-hashes"] if require_hashes else []
+
+            if USE_UV:
+                uv_cmd = _build_uv_cmd(args) + hash_args + constraint_args_uv + req_args_uv
+                if VERBOSE:
+                    _safe_print(f"   {step_label}...")
+                result = subprocess.run(
+                    uv_cmd,
+                    stdout = subprocess.PIPE,
+                    stderr = subprocess.STDOUT,
+                    env = _install_env_for_cmd(uv_cmd),
+                    **_windows_hidden_subprocess_kwargs(),
+                )
+                if result.returncode == 0:
+                    # Echo success under UNSLOTH_VERBOSE, as install.sh's run_install_cmd
+                    # does. Without it the dependency phase never reached the log that
+                    # clean-machine-assert.sh's `nobuild` greps for uv's
+                    # "Building <pkg>==<ver>", so a source build here -- the studio.txt
+                    # install, where sdist-only dependencies show up -- reported
+                    # "built: none" and stayed green. Redacted: uv echoes credentialed URLs.
+                    if VERBOSE and result.stdout:
+                        _safe_print(_redact_install_output(result.stdout))
+                    continue
+                _safe_print(_red(f"   uv failed, falling back to pip..."))
+                if result.stdout:
+                    _safe_print(_redact_install_output(result.stdout))
+
+            pip_cmd = _build_pip_cmd(args) + hash_args + constraint_args_pip + req_args_pip
+            run(f"{step_label} (pip)" if USE_UV else step_label, pip_cmd)
     finally:
         for temp_req in temp_reqs:
             temp_req.unlink(missing_ok = True)
@@ -4280,6 +4762,28 @@ def install_python_stack() -> int:
     package_name = os.environ.get("STUDIO_PACKAGE_NAME", "unsloth")
     # --local overlays a local repo checkout after updating deps.
     local_repo = os.environ.get("STUDIO_LOCAL_REPO", "")
+    # Exact backend version to install, or "" for today's floating behavior. Read
+    # (and validated) before anything mutates the venv, so a malformed pin stops
+    # the run instead of half-installing behind a spec nobody meant to write.
+    try:
+        backend_version = _backend_version_pin()
+    except ValueError as error:
+        _safe_print(f"error: {error}", file = sys.stderr)
+        return 1
+    # The two spellings the core-package sites below need. Built once so the pinned
+    # and unpinned shapes cannot drift apart across the branches.
+    #   unsloth_spec        -- the requirement to install (honors STUDIO_PACKAGE_NAME)
+    #   unsloth_upgrade_args-- the `--upgrade-package` pair, or nothing when pinned.
+    # --upgrade-package exists to tell uv "ignore what is installed, take the
+    # newest"; an exact ==requirement already admits exactly one version, so the
+    # flag decides nothing and would leave a command reading as "upgrade" and
+    # "hold" at once. Dropped for unsloth exactly as install.sh drops it -- and
+    # NOT for unsloth-zoo, which stays a floor because no zoo version is stamped
+    # anywhere. The exact unsloth constrains zoo through its own metadata.
+    unsloth_spec = f"{package_name}=={backend_version}" if backend_version else package_name
+    unsloth_upgrade_args: tuple[str, ...] = (
+        () if backend_version else ("--upgrade-package", package_name)
+    )
     # +1 for the anyio repair check (step 8b), +1 for the diffusers pin (step 11b, every platform)
     base_total = 12 if IS_WINDOWS else 13
     if IS_MACOS:
@@ -4316,9 +4820,21 @@ def install_python_stack() -> int:
     #    include pip by default).
     USE_UV = _bootstrap_uv()
 
-    # 2. Ensure pip is available (uv venvs from install.sh omit pip).
+    # 2. Ensure pip is available (uv venvs from install.sh omit pip), at the pinned
+    #    version -- see _PIP_BOOTSTRAP_VERSION for why this is not "newest".
     _progress("pip bootstrap")
+    _pip_spec = _pip_bootstrap_spec()
+    # pip is what resolves and verifies every later download on the fallback path, so
+    # it is installed from its own hash-verified lock when there is one. The lock names
+    # exactly _PIP_BOOTSTRAP_VERSION (checked in _pip_bootstrap_lock), so this is the
+    # same pip either way -- with a digest instead of trust in the index.
+    _pip_lock = _pip_bootstrap_lock()
     if USE_UV:
+        _pip_args = (
+            ["--require-hashes", "-r", _uv_safe_path(_pip_lock)]
+            if _pip_lock is not None
+            else [_pip_spec]
+        )
         run(
             "Bootstrapping pip via uv",
             [
@@ -4327,12 +4843,12 @@ def install_python_stack() -> int:
                 "install",
                 "--python",
                 sys.executable,
-                "pip",
+                *_pip_args,
             ],
         )
     else:
-        # pip may not exist yet (uv-created venvs omit it). Try ensurepip,
-        # then upgrade. Direct upgrade only when pip is already present.
+        # pip may not exist yet (uv-created venvs omit it). Try ensurepip, then move
+        # to the pin. Direct install only when pip is already present.
         _has_pip = (
             subprocess.run(
                 [sys.executable, "-m", "pip", "--version"],
@@ -4344,28 +4860,35 @@ def install_python_stack() -> int:
         )
 
         if not _has_pip:
+            # ensurepip installs the pip CPython bundles, which the pinned CPython
+            # fixes -- already deterministic, so it is left as it is.
             run(
                 "Bootstrapping pip via ensurepip",
                 [sys.executable, "-m", "ensurepip", "--upgrade"],
             )
         else:
             run(
-                "Upgrading pip",
-                [sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
+                "Upgrading pip" if _allow_latest_pins() else f"Installing {_pip_spec}",
+                [sys.executable, "-m", "pip", "install", "--upgrade"]
+                + (
+                    ["--require-hashes", "-r", str(_pip_lock)]
+                    if _pip_lock is not None
+                    else [_pip_spec]
+                ),
             )
 
-    # macOS arm64: install MLX stack at latest (UV_OVERRIDE relaxes the
-    # mlx-vlm / mlx-lm transformers pin -- set at module load).
+    # macOS arm64: install the MLX stack inside the bounded window
+    # _mlx_stack_specs() defines (UV_OVERRIDE relaxes the mlx-vlm / mlx-lm
+    # transformers pin -- set at module load). --upgrade stays: with ceilings in
+    # place it means "newest inside the window", which is how an older venv is
+    # walked forward without letting a new minor in.
     if IS_MAC_ARM and not skip_base:
         _progress("MLX stack (Apple Silicon)")
         pip_install(
             "Installing MLX stack (mlx + mlx-lm + mlx-vlm)",
             "--no-cache-dir",
             "--upgrade",
-            "mlx",
-            "mlx-metal",
-            "mlx-lm",
-            "mlx-vlm",
+            *_mlx_stack_specs(),
         )
 
     # gfx906: the base install below resolves unsloth's unconditional bitsandbytes
@@ -4387,11 +4910,10 @@ def install_python_stack() -> int:
             f"Updating {package_name} + unsloth-zoo (no-torch mode)",
             "--no-cache-dir",
             "--no-deps",
-            "--upgrade-package",
-            package_name,
+            *unsloth_upgrade_args,
             "--upgrade-package",
             "unsloth-zoo",
-            package_name,
+            unsloth_spec,
             "unsloth-zoo",
         )
         # Resolve pydantic WITH deps so pip pins pydantic-core to the exact version
@@ -4430,6 +4952,9 @@ def install_python_stack() -> int:
     elif local_repo:
         # Local dev install: update the released core packages, then overlay the
         # checkout as an editable install (--no-deps so torch is not re-resolved).
+        # Deliberately ignores the backend pin, as install.sh's --local branch does:
+        # the editable overlay two calls down is the version the developer asked
+        # for, so an ==pin here would only decide which wheel gets thrown away.
         _progress("base packages")
         pip_install(
             "Updating core packages",
@@ -4465,7 +4990,7 @@ def install_python_stack() -> int:
         pip_install(
             f"Installing {package_name}",
             "--no-cache-dir",
-            package_name,
+            unsloth_spec,
         )
     else:
         # Update path: upgrade only unsloth + unsloth-zoo, preserving existing
@@ -4475,11 +5000,10 @@ def install_python_stack() -> int:
         pip_install(
             "Updating core packages",
             "--no-cache-dir",
-            "--upgrade-package",
-            "unsloth",
+            *unsloth_upgrade_args,
             "--upgrade-package",
             "unsloth-zoo",
-            "unsloth",
+            unsloth_spec,
             "unsloth-zoo",
         )
 

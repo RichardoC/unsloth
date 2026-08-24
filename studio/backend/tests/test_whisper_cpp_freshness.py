@@ -78,6 +78,10 @@ def _fake_binary(install_dir: Path) -> Path:
 def _reset(monkeypatch, tmp_path):
     # Isolate disk cache per-test; never touch the real cache.
     monkeypatch.setattr(fr, "_cache_dir", lambda: tmp_path / ".freshness")
+    # Exercise the unpinned (track-latest) policy these cases were written
+    # against; see the same note in test_llama_cpp_freshness.py. The pinned
+    # policy is covered by tests/studio/install/test_prebuilt_pin_freshness.py.
+    monkeypatch.setenv("UNSLOTH_PREBUILT_ALLOW_LATEST", "1")
     fr.reset_caches()
     yield
     fr.reset_caches()

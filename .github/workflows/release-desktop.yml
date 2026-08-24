@@ -503,6 +503,15 @@ jobs:
             args: '--target aarch64-apple-darwin'
             label: macOS (Apple Silicon)
             artifact: macos-aarch64
+            # The macOS leg stopped being comparable to the other two when the
+            # bundled runtime landed. On top of the Rust compile it downloads and
+            # hash-verifies a ~2.5 GiB payload, signs its ~700 Mach-O files one
+            # timestamped signature at a time (each one a round trip to Apple's
+            # timestamp service), rewrites a multi-gigabyte disk image twice, and
+            # notarizes the result. desktop-dev-build.yml budgets 90 minutes for
+            # the payload and the build ALONE, with no signing and no
+            # notarization, so 60 here would fail every release.
+            timeout_minutes: 180
           # - platform: macos-latest
           #   args: '--target x86_64-apple-darwin'
           #   label: macOS (Intel)
@@ -510,16 +519,21 @@ jobs:
             args: ''
             label: Linux (x64)
             artifact: linux-x64
+            timeout_minutes: 60
           - platform: windows-latest
             args: ''
             label: Windows (x64)
             artifact: windows-x64
+            timeout_minutes: 60
 
     name: Build ${{ matrix.label }}
     needs: prepare-version
     runs-on: ${{ matrix.platform }}
-    # 6.9-20.9 min observed across platforms and cache states.
-    timeout-minutes: 60
+    # Per leg, not one number for all three: 6.9-20.9 min was observed across
+    # platforms before the bundled runtime, and Linux and Windows still are that.
+    # Only macOS grew, and a shared cap would have to be the macOS one -- which
+    # would let a hung Windows signing step burn three hours instead of one.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
 
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -551,6 +565,33 @@ jobs:
           ref: ${{ needs.prepare-version.outputs.desktop_release_tag }}
           persist-credentials: false
 
+      # SOURCE_DATE_EPOCH is the tag commit's committer timestamp, so it is a
+      # property of the source rather than of the runner clock. It cannot live
+      # in the job-level `env:` block, which is evaluated before the checkout
+      # exists, so it is exported into the job environment here and every later
+      # step in this job sees it.
+      #
+      # This is groundwork, not a reproducibility claim: nothing in this
+      # workflow verifies that two builds of the same tag produce identical
+      # bytes, and whether tauri-bundler honours SOURCE_DATE_EPOCH for the
+      # timestamps it stamps into deb/NSIS/dmg payloads is unconfirmed. What it
+      # does today is remove the wall clock from any tool that already respects
+      # the convention, and record the value in build-inputs.json so a future
+      # rebuild can be attempted with the same input.
+      - name: Export SOURCE_DATE_EPOCH from the tag commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(git log -1 --format=%ct)"
+          case "$epoch" in
+            ''|*[!0-9]*)
+              echo "git log did not return a numeric committer timestamp: '$epoch'" >&2
+              exit 1
+              ;;
+          esac
+          echo "SOURCE_DATE_EPOCH=$epoch" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$epoch ($(date -u -d "@$epoch" 2>/dev/null || true))"
+
       # ── Linux dependencies ──
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -562,16 +603,29 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
-          node-version: 24
+          # Exact, not `24`. A major-only request resolves to whatever 24.x the
+          # setup-node manifest holds that day, so the Node that runs `vite
+          # build` and the Tauri CLI was a floating input of the release. There
+          # is no .nvmrc convention in this repo (every other workflow names the
+          # version inline), so the pin lives here and is recorded in
+          # build-inputs.json alongside the toolchain it built with.
+          node-version: '24.19.0'
 
       - name: Install pinned Tauri CLI
+        # `npm ci`, not `npm install`: studio/package.json exists only to hold
+        # this lockfile ("Lockfile holder for @tauri-apps/cli", see its
+        # description), and @tauri-apps/cli 2.10.1 is already pinned in its
+        # devDependencies and resolved in studio/package-lock.json. `npm install
+        # --save-dev @tauri-apps/cli@2.10.1` re-resolved the transitive tree on
+        # every run and could rewrite the lockfile in the working tree; `npm ci`
+        # installs exactly what the lockfile says and fails if the two disagree.
         # Lifecycle scripts (esbuild native-binary postinstall, etc.) are
         # required for `vite build`. The pre-install lockfile structural
         # audit (lockfile_supply_chain_audit.py) is the practical defence
         # against the npm postinstall-dropper class -- it fires BEFORE any
         # tarball runs, on the injection pattern itself rather than an
         # advisory-DB lookup.
-        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+        run: npm ci --prefix studio --no-fund --no-audit
 
       - name: Verify pinned Tauri CLI
         shell: bash
@@ -680,6 +734,244 @@ jobs:
           if (chmodIdx !== -1 && Math.max(...sha256Indexes) > chmodIdx) {
             throw new Error('Desktop Linux release must verify the AppImage toolchain before chmod +x');
           }
+
+          // ── The WebView2 bootstrapper the NSIS installer embeds ──
+          // Same shape as the AppImage toolchain check above: the mode has to
+          // stay the one the pin was designed for, the digest has to be pinned in
+          // every step that claims to, and the download has to be verified before
+          // the file reaches the path tauri-bundler treats as "already cached".
+          const expectedWebview2Digest = 'be695eb3732a94e181f008ab5cf6ee650f8644676e87f9e02b6ab0d02f2ea08e';
+          const webviewMode = config.bundle?.windows?.webviewInstallMode;
+          if (webviewMode?.type !== 'embedBootstrapper') {
+            throw new Error(
+              'bundle.windows.webviewInstallMode must stay {type: embedBootstrapper}; the release '
+              + 'pins the bootstrapper bytes and proves the installer embedded them. '
+              + 'downloadBootstrapper moves the unverified fetch to the user\'s machine and '
+              + 'fixedRuntime pins the WebView2 runtime version, cutting users off from Evergreen '
+              + 'security updates. Got: ' + JSON.stringify(webviewMode)
+            );
+          }
+          const windowsOverride = JSON.parse(readFileSync('studio/src-tauri/tauri.windows.conf.json', 'utf8'));
+          if (windowsOverride.bundle?.windows?.webviewInstallMode !== undefined) {
+            throw new Error(
+              'tauri.windows.conf.json must not override bundle.windows.webviewInstallMode; the '
+              + 'Windows leg merges it over tauri.conf.json, so an override here would silently '
+              + 'defeat the check above'
+            );
+          }
+          const stepBlock = (name) => {
+            const start = lines.findIndex((line) => new RegExp(`^\\s*- name: ${name}\\s*$`).test(line));
+            if (start === -1) {
+              throw new Error(`Desktop Windows release must keep the "${name}" step`);
+            }
+            const indent = lines[start].search(/\S/);
+            let end = lines.length;
+            for (let i = start + 1; i < lines.length; i += 1) {
+              if (lines[i].trim() === '') continue;
+              const lineIndent = lines[i].search(/\S/);
+              if (lineIndent < indent || (lineIndent === indent && /^\s*-\s/.test(lines[i]))) {
+                end = i;
+                break;
+              }
+            }
+            return lines.slice(start, end);
+          };
+          const digestIn = (block, name) => {
+            const pattern = new RegExp(`^\\s*${name}:\\s*["']([0-9a-f]{64})["']\\s*$`);
+            const line = block.find((candidate) => pattern.test(candidate));
+            return line?.match(pattern)?.[1];
+          };
+          const webviewPinLines = stepBlock('Pin Windows WebView2 bootstrapper');
+          const webviewVerifyLines = stepBlock('Verify the embedded WebView2 bootstrapper');
+          for (const [label, block] of [['pin', webviewPinLines], ['verify', webviewVerifyLines]]) {
+            if (digestIn(block, 'WEBVIEW2_BOOTSTRAPPER_SHA256') !== expectedWebview2Digest) {
+              throw new Error(
+                `Desktop Windows release must pin the WebView2 bootstrapper SHA-256 digest in the ${label} step, `
+                + 'and both steps must pin the same one'
+              );
+            }
+          }
+          const webviewUrl = webviewPinLines.find((line) => /^\s*WEBVIEW2_BOOTSTRAPPER_URL:/.test(line));
+          if (!webviewUrl || !/msedge\.sf\.dl\.delivery\.mp\.microsoft\.com\/filestreamingservice\/files\/[0-9a-f-]{36}\/MicrosoftEdgeWebview2Setup\.exe/.test(webviewUrl)) {
+            throw new Error(
+              'Desktop Windows release must pin the WebView2 bootstrapper to the immutable '
+              + 'per-version download URL, not the rotating go.microsoft.com/fwlink redirect'
+            );
+          }
+          const hashIdx = webviewPinLines.findIndex((line) => !isComment(line) && /Get-FileHash/.test(line));
+          const seedIdx = webviewPinLines.findIndex((line) => !isComment(line) && /Move-Item/.test(line));
+          if (hashIdx === -1 || seedIdx === -1 || hashIdx > seedIdx) {
+            throw new Error(
+              'Desktop Windows release must verify the WebView2 bootstrapper digest before moving it '
+              + 'into the tauri-bundler tools directory'
+            );
+          }
+          if (!webviewPinLines.some((line) => !isComment(line) && /exit 1/.test(line))) {
+            throw new Error('The WebView2 bootstrapper digest check must fail closed');
+          }
+          if (!webviewVerifyLines.some((line) => !isComment(line) && /WEBVIEW2BOOTSTRAPPERPATH/.test(line))) {
+            throw new Error(
+              'Desktop Windows release must read WEBVIEW2BOOTSTRAPPERPATH back out of the rendered '
+              + 'NSIS script, so the check covers what the installer embedded rather than what the '
+              + 'pin step intended'
+            );
+          }
+          const buildIdx = lines.findIndex((line) => /^\s*- name: Build Windows app\s*$/.test(line));
+          const pinIdx = lines.findIndex((line) => /^\s*- name: Pin Windows WebView2 bootstrapper\s*$/.test(line));
+          const verifyIdx = lines.findIndex((line) => /^\s*- name: Verify the embedded WebView2 bootstrapper\s*$/.test(line));
+          if (!(pinIdx < buildIdx && buildIdx < verifyIdx)) {
+            throw new Error(
+              'The WebView2 bootstrapper must be pinned before the Windows build and verified after it'
+            );
+          }
+
+          // ── The macOS bundled runtime, and the order that makes it signable ──
+          // Same shape as the two pins above: the invariant is checked against the
+          // real steps rather than trusted to a comment. Here the invariant is an
+          // ORDER, because getting it wrong does not fail loudly -- it produces a
+          // .dmg that Gatekeeper rejects on a user's machine, or an updater
+          // payload that macOS refuses to launch, days after the release.
+          const macosLegSteps = [
+            'Check the macOS bundle lock is not stale',
+            'Assemble the bundled runtime payload',
+            'Locate the built macOS bundle',
+            'Inject the bundled runtime into the macOS app',
+            'Sign the bundled runtime and the macOS app',
+            'Verify every Mach-O in the macOS bundle is signed',
+            'Rebuild the macOS updater artifact from the signed app',
+            'Rebuild the macOS disk image around the signed app',
+          ];
+          const stepIndex = (name) => {
+            const index = lines.findIndex((line) => new RegExp(`^\\s*- name: ${name}\\s*$`).test(line));
+            if (index === -1) {
+              throw new Error(`The macOS release leg must keep the "${name}" step`);
+            }
+            return index;
+          };
+          const order = [
+            'Check the macOS bundle lock is not stale',
+            'Assemble the bundled runtime payload',
+            'Build macOS app',
+            'Locate the built macOS bundle',
+            'Inject the bundled runtime into the macOS app',
+            'Sign the bundled runtime and the macOS app',
+            'Verify every Mach-O in the macOS bundle is signed',
+            'Rebuild the macOS updater artifact from the signed app',
+            'Rebuild the macOS disk image around the signed app',
+            'Notarize final macOS disk image',
+          ];
+          for (let i = 1; i < order.length; i += 1) {
+            if (stepIndex(order[i - 1]) >= stepIndex(order[i])) {
+              throw new Error(
+                `The macOS release leg must run "${order[i - 1]}" before "${order[i]}". `
+                + 'The payload cannot be injected into a signed bundle (that invalidates the '
+                + 'signature), the disk image cannot be rebuilt before the app it contains is '
+                + 'signed, and notarization cannot run before the image is rebuilt.'
+              );
+            }
+          }
+          for (const name of macosLegSteps) {
+            const block = stepBlock(name);
+            if (!block.some((line) => /^\s*if:\s*matrix\.platform == 'macos-latest'\s*$/.test(line))) {
+              throw new Error(`"${name}" must be gated on the macOS leg`);
+            }
+          }
+
+          // tauri-action must not be handed a signing identity. If it signs the
+          // app, the injection that follows invalidates that signature, and
+          // scripts/inject_macos_runtime.sh would refuse to run at all.
+          const macosBuildBlock = stepBlock('Build macOS app');
+          for (const secret of ['APPLE_SIGNING_IDENTITY', 'APPLE_ID', 'APPLE_PASSWORD', 'APPLE_TEAM_ID']) {
+            if (macosBuildBlock.some((line) => new RegExp(`^\\s*${secret}:`).test(line))) {
+              throw new Error(
+                `"Build macOS app" must not receive ${secret}: tauri signs the app before the `
+                + 'bundled runtime is injected, and injecting into a signed bundle invalidates '
+                + 'the signature. Signing happens after the injection instead.'
+              );
+            }
+          }
+
+          // The injection must not touch the disk image tauri built: that image is
+          // rebuilt around the SIGNED app further down, so adding the payload to
+          // it here would only produce an image whose app is unsigned.
+          const injectBlock = stepBlock('Inject the bundled runtime into the macOS app');
+          if (!injectBlock.some((line) => line.includes('scripts/inject_macos_runtime.sh'))) {
+            throw new Error('The injection step must use scripts/inject_macos_runtime.sh');
+          }
+          if (injectBlock.some((line) => !isComment(line) && /--dmg\b/.test(line))) {
+            throw new Error(
+              'The macOS release leg must not inject into tauri\'s disk image; the image is '
+              + 'rebuilt around the signed app instead'
+            );
+          }
+
+          // What the signature has to be. --options runtime and --timestamp are
+          // both notarization requirements, and --deep is not a substitute for
+          // signing the payload: it walks nested bundles, not files sitting in
+          // Contents/Resources, so it would report success over ~700 unsigned
+          // Mach-Os.
+          const signBlock = stepBlock('Sign the bundled runtime and the macOS app');
+          for (const flag of ['--options runtime', '--timestamp']) {
+            if (!signBlock.some((line) => !isComment(line) && line.includes(flag))) {
+              throw new Error(`The macOS signing step must pass ${flag}`);
+            }
+          }
+          if (signBlock.some((line) => !isComment(line) && /codesign[^\n]*--deep/.test(line))) {
+            throw new Error(
+              'codesign --deep must not sign the bundled runtime: it does not reach Mach-O '
+              + 'files stored as resources, so it would leave the payload unsigned'
+            );
+          }
+          if (!signBlock.some((line) => !isComment(line)
+              && /--entitlements\s+studio\/src-tauri\/Entitlements\.plist/.test(line))) {
+            throw new Error(
+              'The app must be re-signed with studio/src-tauri/Entitlements.plist: codesign '
+              + '--force replaces a signature wholesale, so omitting it strips the app\'s '
+              + 'entitlements'
+            );
+          }
+          if (!signBlock.some((line) => /MIN_SIGNED_TOTAL:/.test(line))) {
+            throw new Error(
+              'The macOS signing step must declare a floor for how many Mach-O files it '
+              + 'signs, so a silently empty payload cannot reach notarization'
+            );
+          }
+
+          // The entitlements split, which is the reason there are two plists at
+          // all: the app does not get library-validation relief (nothing foreign
+          // is loaded into its process), and the payload's executables do (a
+          // user's own torch.compile output and pip-installed extensions are not
+          // signed by us, and hardened runtime is mandatory inside a notarized
+          // bundle).
+          // The <key> element, not the string: both plists explain in a comment
+          // why the key is or is not there, and a substring match would read the
+          // explanation as the setting.
+          const libraryValidationKey =
+            /<key>\s*com\.apple\.security\.cs\.disable-library-validation\s*<\/key>/;
+          const appEntitlements = readFileSync('studio/src-tauri/Entitlements.plist', 'utf8');
+          if (libraryValidationKey.test(appEntitlements)) {
+            throw new Error(
+              'studio/src-tauri/Entitlements.plist must not carry '
+              + 'com.apple.security.cs.disable-library-validation: it applies to the app\'s own '
+              + 'process, which loads nothing but Apple frameworks and its own code. The bundled '
+              + 'interpreter needs it and is signed with its own entitlements instead.'
+            );
+          }
+          if (!signBlock.some((line) => libraryValidationKey.test(line))) {
+            throw new Error(
+              'The payload\'s executables must be signed with '
+              + 'com.apple.security.cs.disable-library-validation, or a user\'s own extension '
+              + 'modules will not load under the hardened runtime a notarized bundle requires'
+            );
+          }
+
+          const verifyBlock = stepBlock('Verify every Mach-O in the macOS bundle is signed');
+          if (!verifyBlock.some((line) => !isComment(line) && /--verify --deep --strict/.test(line))) {
+            throw new Error(
+              'The macOS verification step must run codesign --verify --deep --strict over the app'
+            );
+          }
+
           const releaseBody = process.env.DESKTOP_RELEASE_NOTES;
           if (!releaseBody) {
             throw new Error('DESKTOP_RELEASE_NOTES must not be empty');
@@ -697,18 +989,30 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: studio/frontend
+        # `npm ci`, not `npm install`: the release must install exactly the tree
+        # in studio/frontend/package-lock.json, and `npm install` is free to
+        # re-resolve a range and rewrite that lockfile in the working tree.
         # Lifecycle scripts (esbuild native-binary postinstall, etc.) are
         # required for `vite build`. The pre-install lockfile structural
         # audit (lockfile_supply_chain_audit.py) is the practical defence
         # against the npm postinstall-dropper class -- it fires BEFORE any
         # tarball runs, on the injection pattern itself rather than an
         # advisory-DB lookup.
-        run: npm install --no-fund --no-audit
+        run: npm ci --no-fund --no-audit
 
       # ── Rust ──
-      - name: Install Rust stable
+      # `toolchain:` is passed explicitly and must stay byte-identical to
+      # `channel` in studio/src-tauri/rust-toolchain.toml. The action's
+      # `toolchain` input defaults to `stable`, so without this the requested
+      # cross-compilation targets would be installed against stable while
+      # rust-toolchain.toml forces every cargo invocation onto 1.94.1 -- the
+      # aarch64/x86_64 Apple std would be missing from the toolchain that
+      # actually builds, and the macOS leg would fail on a missing target.
+      # Change both files together.
+      - name: Install Rust 1.94.1
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-03-27
         with:
+          toolchain: '1.94.1'
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Patch desktop app version
@@ -778,6 +1082,83 @@ jobs:
 
           git diff -- Cargo.toml Cargo.lock
 
+      # ── Lockfile immutability, part 1 of 2 ──
+      # A build that rewrites a lockfile built something other than what was
+      # reviewed, and today that would pass silently. The obvious check --
+      # `git diff --exit-code` over the three lockfiles after the build -- is
+      # only correct for two of them: the step above deliberately rewrites the
+      # `unsloth-studio` entry in Cargo.lock, so its baseline is the post-patch
+      # state, not HEAD.
+      #
+      # So the check is split. The two npm lockfiles are never touched by this
+      # workflow, and `npm ci` (unlike `npm install`) does not rewrite one, so
+      # HEAD stays their baseline and that is asserted here -- after both
+      # installs have already run, which is the point at which a rewriting
+      # install would have shown up. Cargo.lock is checked against HEAD too, but
+      # for confinement: the only difference may be the one version line the
+      # patch step wrote. Digests of all three are then snapshotted for part 2.
+      - name: Snapshot lockfile digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          # Both npm installs have run by now, so a lockfile-rewriting install
+          # fails here rather than shipping a tree nobody reviewed.
+          git diff --exit-code -- studio/package-lock.json studio/frontend/package-lock.json
+          "$PYTHON" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          LOCKFILES = (
+              'studio/src-tauri/Cargo.lock',
+              'studio/package-lock.json',
+              'studio/frontend/package-lock.json',
+          )
+
+          # Windows runners check out with core.autocrlf, so the bytes on disk
+          # differ from the LF-canonical source for any file .gitattributes does
+          # not pin. Normalise CRLF to LF before hashing: the digest is then a
+          # property of the source, identical on all three matrix legs, and on a
+          # Linux/macOS checkout it equals a plain sha256sum of the file.
+          def digest(path: pathlib.Path) -> str:
+              return hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+
+          diff = subprocess.run(
+              ['git', 'diff', '-U0', '--', 'studio/src-tauri/Cargo.lock'],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout
+          changed = [
+              line for line in diff.splitlines()
+              if re.fullmatch(r'[-+](?!(?:\+\+|--)).*', line)
+          ]
+          # Zero changed lines is the patch step finding the release version
+          # already in place; two is the version line it rewrote. Anything else
+          # means something other than the patch touched the lockfile.
+          if len(changed) not in (0, 2) or not all(
+              re.fullmatch(r'[-+]version = "[^"]+"', line) for line in changed
+          ):
+              sys.exit(
+                  'Cargo.lock differs from the tag by more than the release version '
+                  f'patch, so the build would use a dependency set nobody reviewed:\n{diff}'
+              )
+
+          snapshot = {path: digest(pathlib.Path(path)) for path in LOCKFILES}
+          out = pathlib.Path(os.environ['RUNNER_TEMP'], 'lockfile-digests.json')
+          out.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(out.read_text(encoding='utf-8'))
+          PY
+
       - name: Rust cache
         uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
@@ -825,6 +1206,209 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           security find-identity -v -p codesigning build.keychain
           rm -f certificate.p12
+
+      # ── macOS: the self-contained runtime that ships inside the app ──
+      # Unsloth.app/Contents/Resources/runtime holds a complete macOS arm64
+      # runtime -- CPython, every Python distribution, llama.cpp, whisper.cpp,
+      # Node and the OXC node_modules -- so copying the app off the .dmg is the
+      # whole installation and first launch builds nothing.
+      #
+      # THE ORDER IS NOT NEGOTIABLE. Injecting a payload into a signed bundle
+      # invalidates its signature, so scripts/inject_macos_runtime.sh refuses an
+      # app that is already signed. That single constraint decides this whole leg:
+      #
+      #   assemble payload -> tauri build (UNSIGNED) -> inject -> sign every
+      #   Mach-O in the payload -> sign the app -> rebuild the updater tarball
+      #   and the .dmg around the signed app -> notarize and staple the .dmg
+      #
+      # "Build macOS app" below therefore no longer receives APPLE_SIGNING_IDENTITY
+      # (see the comment there), and everything Apple-signed is signed by the
+      # steps after the injection instead of by tauri-bundler.
+      #
+      # These three steps run BEFORE the build on purpose: they are the ones most
+      # likely to fail (a moved wheel, a bumped pin, a stale lock, an unreachable
+      # release), and failing them costs seconds instead of a ~20 minute compile.
+      - name: Install the pinned uv
+        if: matrix.platform == 'macos-latest'
+        # The version install.sh downloads for users, read out of install.sh
+        # rather than written here twice: the runtime payload is installed by uv,
+        # so a payload built with a different uv is a payload for an install
+        # nobody performs. Both lock generators and the assembly script refuse to
+        # run against any other version, so drift fails loudly here rather than
+        # producing a subtly different bundle. Same step as in
+        # desktop-dev-build.yml, so a dev build is evidence about this one.
+        id: uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^UV_PINNED_VERSION="\([^"]*\)".*/\1/p' install.sh | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read UV_PINNED_VERSION out of install.sh" >&2
+            exit 1
+          fi
+          python3 -m venv "$RUNNER_TEMP/uvpin"
+          "$RUNNER_TEMP/uvpin/bin/python" -m pip install --quiet --disable-pip-version-check \
+            "uv==$version"
+          "$RUNNER_TEMP/uvpin/bin/uv" --version
+          echo "bin=$RUNNER_TEMP/uvpin/bin/uv" >> "$GITHUB_OUTPUT"
+
+      - name: Check the macOS bundle lock is not stale
+        if: matrix.platform == 'macos-latest'
+        # Cheap, and it runs before every expensive step. A bundle lock that no
+        # longer matches a fresh regeneration means a requirements file, the torch
+        # window, the MLX ceilings or the pins moved without the lock following,
+        # and the payload assembled below would ship versions nobody reviewed --
+        # inside a signed, notarized release.
+        shell: bash
+        env:
+          UV: ${{ steps.uv.outputs.bin }}
+        run: bash scripts/gen_macos_bundle_lock.sh --check
+
+      - name: Assemble the bundled runtime payload
+        if: matrix.platform == 'macos-latest'
+        # Everything the app needs at runtime, verified at build time: CPython,
+        # all Python distributions under --require-hashes, llama.cpp,
+        # whisper.cpp, Node and the OXC node_modules.
+        shell: bash
+        env:
+          UV: ${{ steps.uv.outputs.bin }}
+          # What the dispatcher typed, and what prepare-version resolved it to.
+          # These are two different claims and the assertions below tell them
+          # apart: a value that was typed names the backend that was published,
+          # and the payload must BE it; a blank one resolved to
+          # MIN_DESKTOP_BACKEND_VERSION, which is a floor and not a claim about
+          # what ships.
+          INPUT_PYPI_VERSION: ${{ inputs.pypi_version }}
+          RESOLVED_PYPI_VERSION: ${{ needs.prepare-version.outputs.pypi_version }}
+        run: |
+          set -euo pipefail
+          bash scripts/build_macos_runtime.sh --out "$RUNNER_TEMP/runtime"
+          # HEAD is the release tag: the checkout above pins `ref:` to it precisely
+          # so this is a property of the tag rather than of the dispatch ref.
+          # GITHUB_SHA is the dispatch ref's commit and would pass this check
+          # against the wrong source, which is why it is not used here.
+          TAG_COMMIT="$(git rev-parse HEAD)"
+          export TAG_COMMIT
+          python3 - "$RUNNER_TEMP/runtime/BUNDLE_MANIFEST.json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          manifest = json.load(open(sys.argv[1]))
+          # --skip-diffusers-pin and --with-sd-cpp both record themselves in the
+          # manifest. A release must ship the complete payload, so an incomplete
+          # one fails here rather than reaching a signature.
+          if manifest["incomplete"]:
+              sys.exit(f'the assembled payload is incomplete: {manifest["incomplete"]}')
+
+          # ── the payload's backend is this tag's code, and the release says so ──
+          #
+          # The macOS payload no longer installs `unsloth` from PyPI at first run:
+          # scripts/build_macos_runtime.sh builds a wheel from the checkout and
+          # replaces the lock-installed copy with it. That moved the backend from
+          # something a user's machine resolved to something this build decided, and
+          # nothing in this workflow checked what it decided.
+          #
+          # The gap that leaves is not theoretical. `pypi_version` is compiled into
+          # the binary as UNSLOTH_DESKTOP_BACKEND_VERSION and is what the app
+          # believes its backend to be, but it only ever stamped that env var -- it
+          # never influenced the payload. So a release dispatched with a
+          # `pypi_version` the tag's unsloth/_version.py does not match would ship a
+          # bundle holding one version while telling the app it holds another, and
+          # the bundled path cannot install its way out of that (there is no venv to
+          # upgrade: the payload IS the backend). It would reach a user as a signed,
+          # notarized app that reports it needs a backend it cannot obtain.
+          local = manifest["local_provenance"]
+          entry = next(
+              (item for item in local["distributions"] if item["name"] == "unsloth"),
+              None,
+          )
+          if entry is None:
+              sys.exit(
+                  "the payload records no locally built unsloth. The macOS bundle must "
+                  "ship this tag's backend, not the published wheel -- a payload built "
+                  "from an index is a payload nobody's release was tested in."
+              )
+          if entry["provenance"] != "local-checkout" or entry["index_verified"]:
+              sys.exit(f"unsloth was not built from the checkout: {entry}")
+
+          tag_commit = os.environ["TAG_COMMIT"]
+          if entry["repo_commit"] != tag_commit:
+              sys.exit(
+                  f"the payload unsloth was built from {entry['repo_commit']!r}, but this "
+                  f"release is building {tag_commit!r}. The bundle would ship code that is "
+                  f"not the tag being released."
+              )
+          wheel_commit = manifest["components"]["unsloth_local_wheel"]["repo_commit"]
+          if wheel_commit != tag_commit:
+              sys.exit(
+                  f"the manifest's two records of the local wheel disagree: components says "
+                  f"{wheel_commit!r}, local_provenance says {tag_commit!r}"
+              )
+
+          # A dirty worktree means the wheel holds edits that exist on no commit, so
+          # the recorded commit describes something other than what shipped and the
+          # release is unreproducible by construction. Fine for a dev build, never
+          # for a signed one.
+          if entry["worktree_dirty"]:
+              sys.exit(
+                  "the payload was built from a dirty worktree, so its recorded commit "
+                  "does not describe what it contains. A release must ship committed code."
+              )
+
+          payload_version = entry["version"]
+          typed = os.environ.get("INPUT_PYPI_VERSION", "").strip()
+          resolved = os.environ["RESOLVED_PYPI_VERSION"].strip()
+          if typed:
+              # The dispatcher named the exact backend version they published. The
+              # payload has to be that version, or the app's stamp is a lie about
+              # its own contents.
+              if payload_version != typed:
+                  sys.exit(
+                      f"pypi_version was dispatched as {typed!r}, but the payload ships "
+                      f"unsloth {payload_version!r} (from unsloth/_version.py at "
+                      f"{tag_commit[:12]}). The app would be stamped with a backend "
+                      f"version the bundle does not contain. Release the tag whose "
+                      f"_version.py is {typed}, or dispatch {payload_version} instead."
+                  )
+          else:
+              # Blank resolved to MIN_DESKTOP_BACKEND_VERSION, which is a floor: a
+              # payload at or above it is fine, one below it is a backend the app
+              # itself would reject as too old.
+              def release_tuple(text):
+                  match = re.match(r"(\d+)\.(\d+)\.(\d+)", text)
+                  return tuple(int(part) for part in match.groups()) if match else None
+
+              payload_key, floor_key = release_tuple(payload_version), release_tuple(resolved)
+              if payload_key is None or floor_key is None:
+                  sys.exit(
+                      f"cannot compare payload unsloth {payload_version!r} against the "
+                      f"desktop minimum {resolved!r}"
+                  )
+              if payload_key < floor_key:
+                  sys.exit(
+                      f"the payload ships unsloth {payload_version}, below the desktop "
+                      f"minimum {resolved} compiled into the app. The app would refuse "
+                      f"its own bundled backend."
+                  )
+              # Not an error, but the divergence is worth saying out loud: the stamp
+              # is the floor rather than the shipped version, because pypi_version
+              # was left blank.
+              if payload_version != resolved:
+                  print(
+                      f"note: pypi_version was blank, so the app is stamped with the "
+                      f"minimum {resolved} while the bundle ships {payload_version}"
+                  )
+
+          print(
+              f'payload ok: python {manifest["python"]["version"]}, '
+              f'{manifest["distribution_count"]} distributions, '
+              f'{manifest["total_bytes"] / (1024 ** 3):.2f} GiB, '
+              f'unsloth {payload_version} built from {tag_commit[:12]} '
+              f'(index copy {entry["replaced_index_version"]} replaced)'
+          )
+          PY
 
       # ── Windows: install Azure Trusted Signing CLI ──
       # This binary runs in the steps holding the Azure Trusted Signing and
@@ -1041,7 +1625,28 @@ jobs:
               output.write(f'artifactPaths={json.dumps(paths)}\n')
           PY
 
-      # ── macOS: build + sign + notarize ──
+      # ── macOS: build unsigned, then inject, then sign, then repackage ──
+      # This step deliberately holds NO Apple credentials. It used to be
+      # "build + sign + notarize" in one action, and that stopped being possible
+      # when the bundled runtime landed: tauri-bundler signs the .app, then builds
+      # the .dmg and the updater tarball from it, and the payload has to go in
+      # BEFORE any of that or the signature it produced is invalid the moment the
+      # runtime is copied in. scripts/inject_macos_runtime.sh refuses a signed
+      # app for exactly that reason.
+      #
+      # So tauri produces an unsigned .app, an unsigned .dmg and an updater
+      # tarball built from an app with no payload in it, and the steps below
+      # replace all three: the payload is injected, every Mach-O in it is signed
+      # with the release identity, the app is signed over the top, and the .dmg
+      # and the updater tarball are rebuilt around the signed app. The .dmg keeps
+      # the path tauri reported, so "Notarize final macOS disk image" and "Stage
+      # release assets" still read steps.build_macos.outputs.artifactPaths and
+      # need no knowledge of any of this.
+      #
+      # APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID are gone from here too: they
+      # only ever did anything in combination with a signing identity (tauri
+      # notarizes only what it signed), and leaving them would suggest this step
+      # still notarizes something. It does not; the .dmg step below does.
       - name: Build macOS app
         id: build_macos
         if: matrix.platform == 'macos-latest'
@@ -1056,22 +1661,814 @@ jobs:
           # prompts for a password when the variable is absent, which would hang
           # the job, so the line stays.
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: studio
           tauriScript: npx --prefix . tauri
           args: -v ${{ matrix.args }}
 
+      - name: Locate the built macOS bundle
+        id: macos_bundle
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.build_macos.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          app="$(find studio/src-tauri/target/aarch64-apple-darwin/release/bundle/macos \
+                   -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$app" ]; then
+            echo "::error::no .app was produced by the macOS build" >&2
+            exit 1
+          fi
+          test -f "$app/Contents/Info.plist"
+          echo "app_path=$app" >> "$GITHUB_OUTPUT"
+          # The three files tauri reported, resolved from the same output the
+          # notarization and staging steps read, so the steps below rewrite
+          # exactly what the release will publish rather than a sibling copy.
+          python3 <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+
+          try:
+              paths = json.loads(os.environ.get('ARTIFACT_PATHS', ''))
+          except json.JSONDecodeError as error:
+              sys.exit(f'Invalid tauri-action artifactPaths output: {error}')
+          if not isinstance(paths, list):
+              sys.exit('tauri-action artifactPaths must be a JSON list')
+          paths = [path for path in paths if isinstance(path, str)]
+
+          def exactly_one(label: str, predicate) -> str:
+              matches = sorted({path for path in paths if predicate(path)})
+              if len(matches) != 1:
+                  sys.exit(f'Expected exactly one {label} from tauri-action, found {matches}')
+              return matches[0]
+
+          # Resolved first and printed second, so a list that is wrong about one
+          # of the three sets none of them: a half-populated output would leave a
+          # later step rewriting one file and publishing tauri's copy of another.
+          resolved = {
+              'dmg_path': exactly_one('.dmg', lambda p: p.lower().endswith('.dmg')),
+              'updater_path': exactly_one(
+                  'updater tarball', lambda p: p.endswith('.app.tar.gz')
+              ),
+              'updater_sig_path': exactly_one(
+                  'updater signature', lambda p: p.endswith('.app.tar.gz.sig')
+              ),
+          }
+          for name, value in resolved.items():
+              print(f'{name}={value}')
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Inject the bundled runtime into the macOS app
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+        run: |
+          set -euo pipefail
+          # --app only, and no --dmg on purpose. The script's --dmg mode adds the
+          # payload to the image tauri built, which would leave that image holding
+          # an UNSIGNED app; the image is rebuilt further down around the signed
+          # one instead. The script still refuses a signed app, so if anything
+          # ever starts signing before this point, this fails rather than shipping
+          # a broken signature.
+          bash scripts/inject_macos_runtime.sh \
+            --payload "$RUNNER_TEMP/runtime" \
+            --app "$APP"
+
+          # The payload now exists twice, and this leg is disk bound rather than
+          # CPU bound from here on: it still has to hold the app (~2.5 GiB), a
+          # writable disk image grown to fit it, a compressed image, an updater
+          # tarball and a full extraction of that tarball to check it. Nothing
+          # after this point reads the staging copy -- the manifest is read back
+          # out of the app bundle, precisely so that what is recorded is what
+          # shipped -- so it goes now, while the space is still free to give.
+          rm -rf "$RUNNER_TEMP/runtime"
+          df -h .
+
+      # ── macOS: sign the payload, inside out, then the app ──
+      # Tauri's bundler seals resources as data. It does not sign nested Mach-O
+      # files, and Contents/Resources/runtime holds ~700 of them (617 .so/.dylib
+      # in site-packages, 54 in CPython, 45 in llama.cpp, plus whisper.cpp, Node
+      # and the OXC .node addons). Notarization rejects an unsigned Mach-O, so
+      # every one of them is signed here with the release identity, hardened
+      # runtime and a secure timestamp.
+      #
+      # WHY NOT codesign --deep
+      #
+      # Because it would not work, before any of the reasons Apple gives for
+      # calling it "for emergency repairs only". --deep walks nested *bundles* and
+      # the standard code locations inside them; a .so sitting in
+      # Contents/Resources is a resource as far as it is concerned, so it would
+      # sign the app, report success, and leave all ~700 payload Mach-Os
+      # unsigned -- exactly the notarization failure this step exists to prevent.
+      # On top of that it would apply one entitlement set to everything it did
+      # find, which is the opposite of what is wanted here (see the two plists
+      # below).
+      #
+      # WHAT "INSIDE OUT" MEANS HERE
+      #
+      # Signing a container seals what is inside it, so contents must be signed
+      # first or the seal records unsigned content. The payload has exactly one
+      # containment relation -- the .app contains all of it -- because the check
+      # below refuses any nested .framework/.app/.xpc/.bundle inside the payload,
+      # which is the only thing that could create another one. So the required
+      # order is "all ~700 payload Mach-Os, then the app bundle", and that is what
+      # this step does. The correctness of that rests on the nested-bundle refusal,
+      # not on the sort: each list is additionally ordered deepest first, which is
+      # cheap insurance and makes the log read in the direction the seal is built.
+      - name: Sign the bundled runtime and the macOS app
+        id: sign_macos
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          # Below the ~720 measured today, far above what any single missing
+          # component could leave behind, and per component so that a payload
+          # that lost llama.cpp cannot hide inside a healthy total.
+          MIN_SIGNED_TOTAL: '600'
+          MIN_SIGNED_SITE_PACKAGES: '400'
+          MIN_SIGNED_PYTHON: '30'
+          MIN_SIGNED_LLAMA_CPP: '20'
+          MIN_SIGNED_WHISPER_CPP: '1'
+          MIN_SIGNED_NODE: '1'
+          MIN_SIGNED_OXC_NODE_MODULES: '1'
+        run: |
+          set -euo pipefail
+          # No `set -x` anywhere in this step: the identity is a masked secret and
+          # a traced `codesign --sign "$IDENTITY"` line puts it in the log 700 times.
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "::error::APPLE_SIGNING_IDENTITY is empty; refusing to publish an unsigned bundle." >&2
+            exit 1
+          fi
+
+          # "Import Apple certificate" ran with `set-keychain-settings -t 3600`,
+          # and on this leg it now runs more than an hour before the first
+          # signature (payload assembly plus the Rust compile). An idle keychain
+          # relocks, and codesign against a locked keychain fails with "User
+          # interaction is not allowed". Unlock it here, in the step that needs it.
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+
+          # ── The two entitlement sets ──
+          # studio/src-tauri/Entitlements.plist is the APP's, and it is passed
+          # explicitly below because `codesign --force` on a bundle replaces its
+          # signature wholesale: omitting it would silently strip the app's
+          # network-client and microphone entitlements.
+          #
+          # The payload's executables need a different, deliberately smaller set,
+          # and they need their OWN because entitlements are a property of a
+          # signed executable, not something a parent process passes down. The
+          # bundled python3 is a child process; whatever the app is entitled to
+          # says nothing about what python3 may load.
+          runtime_entitlements="$RUNNER_TEMP/runtime-entitlements.plist"
+          cat > "$runtime_entitlements" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <!--
+                Entitlements for the executables INSIDE Contents/Resources/runtime
+                (python3, node, llama-server, whisper-server and the other helper
+                binaries), not for the app. Two keys, both load-bearing:
+
+                disable-library-validation: hardened runtime otherwise restricts
+                a process to libraries signed by the same Team ID or by Apple.
+                Everything shipped in the payload is signed by us and would pass,
+                but the extension modules a user's own work produces are not:
+                torch.compile writes a .so and dlopen()s it, `pip install` of
+                anything with a native extension lands an unsigned .so in the
+                user's data root, and node loads .node addons the same way. All of
+                that works today because these binaries live unsigned under
+                ~/.unsloth with no hardened runtime at all; shipping them inside a
+                notarized bundle means hardened runtime is mandatory, so the
+                exception has to be stated for the processes that need it.
+
+                allow-unsigned-executable-memory: the JIT paths in the same stack
+                (numba's LLVM JIT, torch inductor) map generated code as
+                executable.
+
+                Deliberately NOT here: allow-dyld-environment-variables. The
+                backend sets DYLD_LIBRARY_PATH for llama-server as a fallback for
+                a prebuilt with wrong install names (see
+                core/inference/llama_cpp.py); hardened runtime strips DYLD_* from
+                a process that is not entitled for it, so that fallback is inert
+                for the bundled copy. That is acceptable because the payload's
+                llama-server resolves through @loader_path, which is what
+                desktop-dev-build.yml proves when it runs the binary out of the
+                mounted .dmg with no DYLD_LIBRARY_PATH set at all. Entitling every
+                payload executable to honour injected loader variables would buy
+                nothing for a case that does not occur.
+              -->
+              <key>com.apple.security.cs.disable-library-validation</key>
+              <true/>
+              <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+              <true/>
+          </dict>
+          </plist>
+          PLIST
+          # plutil, not a comment claiming it is well formed: a malformed
+          # entitlements file makes codesign fail 700 times in a row instead of
+          # once here. Note the XML comment above must contain no double hyphen,
+          # which is what this catches if one is ever added.
+          plutil -lint "$runtime_entitlements"
+          plutil -p "$runtime_entitlements"
+
+          # ── Find the Mach-O files by reading their headers ──
+          # Not by extension: this payload carries .so (CPython extension
+          # modules), .dylib (llama.cpp, ggml, libpython), .node (the OXC parser
+          # binding) and bare extensionless executables (python3.13, node,
+          # llama-server, whisper-server, torch_shm_manager), and a list of
+          # suffixes would have to be right about all of them forever.
+          #
+          # So every regular file under the .app is opened, its first four bytes
+          # are compared against the Mach-O and universal-binary magics, and any
+          # candidate has its `filetype` header field read to decide what it is:
+          # MH_EXECUTE gets the payload entitlements, MH_DYLIB/MH_BUNDLE get none
+          # (a library's entitlements are ignored; the process that loads it is
+          # what carries them), MH_OBJECT is skipped because codesign cannot sign
+          # an object file and notarization does not ask it to, and anything else
+          # fails the release rather than being quietly skipped.
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import struct
+          import sys
+
+          MACHO_MAGICS = {
+              b"\xcf\xfa\xed\xfe": ("<", 64),   # MH_MAGIC_64, little endian
+              b"\xce\xfa\xed\xfe": ("<", 32),   # MH_MAGIC, little endian
+              b"\xfe\xed\xfa\xcf": (">", 64),   # big endian
+              b"\xfe\xed\xfa\xce": (">", 32),
+          }
+          FAT_MAGICS = {b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf",
+                        b"\xbe\xba\xfe\xca", b"\xbf\xba\xfe\xca"}
+          MH_OBJECT, MH_EXECUTE, MH_DYLIB, MH_BUNDLE = 0x1, 0x2, 0x6, 0x8
+          NAMES = {MH_OBJECT: "object", MH_EXECUTE: "executable",
+                   MH_DYLIB: "dylib", MH_BUNDLE: "bundle"}
+
+          def slice_filetype(blob, offset):
+              magic = blob[offset:offset + 4]
+              if magic not in MACHO_MAGICS:
+                  return None
+              endian, _ = MACHO_MAGICS[magic]
+              (filetype,) = struct.unpack_from(endian + "I", blob, offset + 12)
+              return filetype
+
+          def filetypes(path):
+              """Mach-O filetypes in this file, or None if it is not a Mach-O at all."""
+              with open(path, "rb") as handle:
+                  blob = handle.read(65536)
+              if len(blob) < 16:
+                  return None
+              head = blob[:4]
+              if head in MACHO_MAGICS:
+                  found = slice_filetype(blob, 0)
+                  return None if found is None else {found}
+              if head not in FAT_MAGICS:
+                  return None
+              # A universal binary. CA FE BA BE is also the Java class magic, so
+              # the count has to be plausible AND every slice header has to be a
+              # real Mach-O; a class file's version fields fail both.
+              (count,) = struct.unpack_from(">I", blob, 4)
+              if not 1 <= count <= 16:
+                  return None
+              found = set()
+              for index in range(count):
+                  entry = 8 + index * 20
+                  if entry + 20 > len(blob):
+                      return None
+                  (offset,) = struct.unpack_from(">I", blob, entry + 8)
+                  with open(path, "rb") as handle:
+                      handle.seek(offset)
+                      slice_blob = handle.read(4096)
+                  kind = slice_filetype(slice_blob, 0)
+                  if kind is None:
+                      return None
+                  found.add(kind)
+              return found
+
+          app = pathlib.Path(os.environ["APP"]).resolve()
+          runtime = app / "Contents" / "Resources" / "runtime"
+          if not runtime.is_dir():
+              sys.exit(f"{runtime} does not exist; the injection step did not run")
+
+          # A nested bundle would introduce a second containment relation, and
+          # signing the Mach-O inside one instead of the bundle around it is
+          # wrong. None exist today; refuse rather than sign the wrong thing.
+          nested = sorted(
+              str(path.relative_to(app))
+              for path in runtime.rglob("*")
+              if path.is_dir() and path.suffix in (".framework", ".app", ".xpc", ".bundle")
+          )
+          if nested:
+              sys.exit(
+                  "the payload contains nested code bundles, which need to be signed as "
+                  f"bundles rather than as files: {nested}"
+              )
+
+          executables, libraries, objects, unexpected = [], [], [], []
+          scanned = 0
+          for path in sorted(app.rglob("*")):
+              if path.is_symlink() or not path.is_file():
+                  continue
+              scanned += 1
+              try:
+                  kinds = filetypes(path)
+              except OSError as error:
+                  sys.exit(f"could not read {path}: {error}")
+              if not kinds:
+                  continue
+              if kinds == {MH_OBJECT}:
+                  objects.append(str(path))
+                  continue
+              stray = kinds - {MH_EXECUTE, MH_DYLIB, MH_BUNDLE}
+              if stray:
+                  unexpected.append(f"{path}: filetype(s) {sorted(hex(k) for k in stray)}")
+                  continue
+              if MH_EXECUTE in kinds:
+                  executables.append(str(path))
+              else:
+                  libraries.append(str(path))
+
+          if unexpected:
+              sys.exit(
+                  "unrecognised Mach-O filetypes; decide what they are rather than "
+                  "leaving them unsigned:\n  " + "\n  ".join(unexpected)
+              )
+
+          # Everything outside the payload is covered by signing the bundle, and
+          # the only Mach-O a tauri app bundle keeps there is its main executable
+          # in Contents/MacOS. A sidecar or a Frameworks directory appearing later
+          # would need signing of its own, so it fails here instead of shipping
+          # unsigned.
+          macos_dir = app / "Contents" / "MacOS"
+          covered_by_bundle = (
+              {str(path) for path in macos_dir.iterdir() if path.is_file() and not path.is_symlink()}
+              if macos_dir.is_dir() else set()
+          )
+          prefix = str(runtime) + os.sep
+          stray = sorted(
+              path for path in executables + libraries
+              if not path.startswith(prefix) and path not in covered_by_bundle
+          )
+          if stray:
+              sys.exit(
+                  "Mach-O files outside both the payload and Contents/MacOS; signing the "
+                  f"app bundle does not cover these: {stray}"
+              )
+
+          payload_executables = sorted(p for p in executables if p.startswith(prefix))
+          payload_libraries = sorted(p for p in libraries if p.startswith(prefix))
+
+          # Deepest first. See the step comment: with no nested bundles this is
+          # belt and braces, and it stays correct if one ever appears.
+          def depth_key(path):
+              return (-path.count(os.sep), path)
+
+          out = pathlib.Path(os.environ["RUNNER_TEMP"])
+          def dump(name, paths):
+              (out / name).write_bytes(
+                  b"".join(p.encode() + b"\0" for p in sorted(paths, key = depth_key))
+              )
+
+          dump("macho-executables", payload_executables)
+          dump("macho-libraries", payload_libraries)
+          # Object files are not signed, and the verification step needs to know
+          # which ones they were: it re-detects Mach-Os with file(1) and compares
+          # the two views, so "unsigned on purpose" has to be recorded rather than
+          # inferred from a description string.
+          dump("macho-objects", [p for p in objects if p.startswith(prefix)])
+
+          counts = {}
+          for path in payload_executables + payload_libraries:
+              component = pathlib.Path(path).relative_to(runtime).parts[0]
+              counts[component] = counts.get(component, 0) + 1
+          summary = {
+              "scanned_files": scanned,
+              "payload_total": len(payload_executables) + len(payload_libraries),
+              "payload_executables": len(payload_executables),
+              "payload_libraries": len(payload_libraries),
+              "objects_skipped": len(objects),
+              "by_component": counts,
+          }
+          (out / "macho-summary.json").write_text(json.dumps(summary, indent = 2, sort_keys = True))
+          print(json.dumps(summary, indent = 2, sort_keys = True))
+          PY
+
+          # ── The count guard ──
+          # A payload that assembled but landed empty, or lost a component to a
+          # moved path, would otherwise sail through: codesign would sign nothing,
+          # report nothing, and notarization would pass because there is nothing
+          # left to reject.
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          summary = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "macho-summary.json").read_text())
+          floors = {
+              "site-packages": int(os.environ["MIN_SIGNED_SITE_PACKAGES"]),
+              "python": int(os.environ["MIN_SIGNED_PYTHON"]),
+              "llama.cpp": int(os.environ["MIN_SIGNED_LLAMA_CPP"]),
+              "whisper.cpp": int(os.environ["MIN_SIGNED_WHISPER_CPP"]),
+              "node": int(os.environ["MIN_SIGNED_NODE"]),
+              "oxc-node-modules": int(os.environ["MIN_SIGNED_OXC_NODE_MODULES"]),
+          }
+          failures = []
+          total_floor = int(os.environ["MIN_SIGNED_TOTAL"])
+          if summary["payload_total"] < total_floor:
+              failures.append(
+                  f'only {summary["payload_total"]} Mach-O files in the payload, '
+                  f'expected at least {total_floor}'
+              )
+          for component, floor in sorted(floors.items()):
+              found = summary["by_component"].get(component, 0)
+              if found < floor:
+                  failures.append(
+                      f'{component}: {found} Mach-O files, expected at least {floor}'
+                  )
+          if failures:
+              sys.exit(
+                  "the bundled runtime is implausibly thin, so it is not the payload "
+                  "this release is supposed to ship:\n  " + "\n  ".join(failures)
+              )
+          print(f'{summary["payload_total"]} Mach-O files to sign: '
+                f'{summary["payload_executables"]} executables, '
+                f'{summary["payload_libraries"]} libraries '
+                f'({summary["objects_skipped"]} object files skipped)')
+          PY
+
+          # ── Sign ──
+          # One file per codesign call, sequentially. Batching would be faster,
+          # but --timestamp is a round trip to Apple's timestamp service for every
+          # code object; per file means a throttled or dropped timestamp is
+          # retried on its own rather than re-signing 700 files, and the failure
+          # names the file. `read -d ''` keeps arbitrary paths intact and works on
+          # the bash 3.2 that macOS ships.
+          sign_list() {
+            list="$1"
+            shift
+            signed=0
+            while IFS= read -r -d '' path; do
+              attempt=1
+              while :; do
+                # </dev/null so nothing can consume the path list this loop is
+                # reading from: a tool that read stdin here would silently skip
+                # every remaining file and the step would report success.
+                if codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
+                     --options runtime --timestamp "$@" "$path" </dev/null; then
+                  break
+                fi
+                if [ "$attempt" -ge 3 ]; then
+                  echo "::error::codesign failed three times for $path" >&2
+                  return 1
+                fi
+                delay=$(( 10 * attempt ))
+                echo "::warning::codesign failed for $path (attempt $attempt/3); retrying in ${delay}s"
+                sleep "$delay"
+                attempt=$(( attempt + 1 ))
+              done
+              signed=$(( signed + 1 ))
+              # Progress goes to stderr so it reaches the log: stdout is the
+              # function's return channel and the caller reads its last line.
+              if [ $(( signed % 100 )) -eq 0 ]; then
+                echo "  signed $signed ..." >&2
+              fi
+            done < "$list"
+            echo "$signed"
+          }
+
+          echo "==> signing payload libraries (no entitlements: a library's are ignored)"
+          libraries="$(sign_list "$RUNNER_TEMP/macho-libraries" | tail -n 1)"
+          echo "==> signing payload executables (with the runtime entitlements)"
+          executables="$(sign_list "$RUNNER_TEMP/macho-executables" \
+            --entitlements "$runtime_entitlements" | tail -n 1)"
+
+          # Counted on the way out as well as on the way in, and BEFORE the app is
+          # signed: the app's signature is the seal over the payload, so it must
+          # not be created over a payload the loops above did not actually cover.
+          total=$(( libraries + executables ))
+          if [ "$total" -lt "$MIN_SIGNED_TOTAL" ]; then
+            echo "::error::signed only $total Mach-O files in the payload" >&2
+            exit 1
+          fi
+
+          echo "==> signing the app bundle (last, so it seals a fully signed payload)"
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime --timestamp \
+            --entitlements studio/src-tauri/Entitlements.plist \
+            "$APP"
+
+          echo "signed $total Mach-O files in the payload ($libraries libraries, $executables executables), then the app"
+          echo "signed_macho_count=$total" >> "$GITHUB_OUTPUT"
+          echo "SIGNED_MACHO_COUNT=$total" >> "$GITHUB_ENV"
+
+      - name: Verify every Mach-O in the macOS bundle is signed
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+          SIGNED: ${{ steps.sign_macos.outputs.signed_macho_count }}
+        run: |
+          set -euo pipefail
+          # An independent oracle first. file(1) is the system's own identification,
+          # so if the header parser in the signing step missed a Mach-O -- the
+          # exact thing notarization would then reject -- the two views disagree
+          # and this fails. `find -type f` excludes symlinks, so nothing is counted
+          # twice through a link.
+          find "$APP" -type f -print > "$RUNNER_TEMP/all-files.txt"
+          file -f "$RUNNER_TEMP/all-files.txt" > "$RUNNER_TEMP/all-types.txt"
+          python3 <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          paths = temp.joinpath("all-files.txt").read_text().splitlines()
+          runtime = str(pathlib.Path(os.environ["APP"]).resolve() / "Contents/Resources/runtime")
+
+          # file(1) output is parsed as "<path>: <description>" rather than paired
+          # positionally with --brief, because a universal binary can be described
+          # over more than one line and positional pairing would then silently
+          # shift every following file's description by one.
+          known = set(paths)
+          bad = sorted(path for path in paths if ": " in path)
+          if bad:
+              sys.exit(f"paths containing ': ' cannot be attributed to a file(1) line: {bad}")
+
+          described = {}
+          current = None
+          for line in temp.joinpath("all-types.txt").read_text().splitlines():
+              head, separator, tail = line.partition(": ")
+              if separator and head in known:
+                  current = head
+                  described[current] = tail
+              elif current is not None:
+                  described[current] += " " + line.strip()
+          undescribed = sorted(set(paths) - set(described))
+          if undescribed:
+              sys.exit(f"file(1) said nothing about {len(undescribed)} files, e.g. {undescribed[:5]}")
+
+          def read_list(name):
+              blob = temp.joinpath(name).read_bytes()
+              return {entry for entry in blob.decode().split("\0") if entry}
+
+          signed = read_list("macho-executables") | read_list("macho-libraries")
+          # Object files are Mach-O but cannot be signed, and the signing step
+          # recorded which ones it decided that about.
+          objects = read_list("macho-objects")
+
+          found = {
+              path for path, description in described.items()
+              if "Mach-O" in description
+              and str(pathlib.Path(path).resolve()).startswith(runtime + os.sep)
+          }
+          found = {str(pathlib.Path(path).resolve()) for path in found}
+          missing = sorted(found - signed - objects)
+          extra = sorted((signed | objects) - found)
+          if missing or extra:
+              sys.exit(
+                  "the signing step's Mach-O list and file(1) disagree, so something in "
+                  f"the payload may be unsigned:\n  only file(1) saw: {missing}\n"
+                  f"  only the signer saw: {extra}"
+              )
+          pathlib.Path(temp, "macho-verify.txt").write_bytes(
+              b"".join(entry.encode() + b"\0" for entry in sorted(signed))
+          )
+          print(f"file(1) and the signer agree on {len(signed)} signed Mach-O files "
+                f"and {len(objects)} unsignable object files")
+          PY
+
+          # Then every one of them, individually: really signed (not ad hoc, so it
+          # carries a Team Identifier) and really hardened (the runtime flag is
+          # what notarization requires and what makes library validation apply).
+          checked=0
+          while IFS= read -r -d '' path; do
+            # </dev/null, same reason as the signing loop: this loop's stdin is
+            # the list of files it still has to check.
+            info="$(codesign --display --verbose=4 "$path" </dev/null 2>&1)" || {
+              echo "::error::not signed: $path" >&2
+              exit 1
+            }
+            case "$info" in
+              *"flags="*"runtime"*) ;;
+              *) echo "::error::signed without hardened runtime: $path" >&2; exit 1 ;;
+            esac
+            case "$info" in
+              *"Signature=adhoc"*) echo "::error::ad hoc signature: $path" >&2; exit 1 ;;
+            esac
+            case "$info" in
+              *"TeamIdentifier=not set"*)
+                echo "::error::no Team Identifier, so this was not signed with the release identity: $path" >&2
+                exit 1 ;;
+              *"TeamIdentifier="*) ;;
+              *) echo "::error::no Team Identifier line for $path" >&2; exit 1 ;;
+            esac
+            checked=$(( checked + 1 ))
+          done < "$RUNNER_TEMP/macho-verify.txt"
+          echo "verified $checked payload Mach-O signatures"
+          if [ "$checked" -ne "$SIGNED" ]; then
+            echo "::error::verified $checked signatures but the signing step reported $SIGNED" >&2
+            exit 1
+          fi
+
+          # The whole bundle, including the seal over the payload.
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          # The entitlements decision, asserted rather than described. The app is
+          # signed WITHOUT disable-library-validation (nothing foreign is loaded
+          # into its process; see studio/src-tauri/Entitlements.plist), and the
+          # bundled interpreter is signed WITH it, because a user's own
+          # torch.compile output or pip-installed extension is not signed by us.
+          # plutil rather than PlistBuddy: the same value, from a tool this leg
+          # already uses, and reachable through PATH so this step can be executed
+          # against stubs in tests/security.
+          executable="$(plutil -extract CFBundleExecutable raw -o - "$APP/Contents/Info.plist")"
+          # The <key> element, not a bare substring: an entitlements plist can
+          # carry a comment naming the key it deliberately omits, and reading that
+          # as the setting is exactly the mistake this check exists to catch.
+          relief='<key>com.apple.security.cs.disable-library-validation</key>'
+          app_entitlements="$(codesign --display --entitlements - --xml \
+            "$APP/Contents/MacOS/$executable" 2>/dev/null || true)"
+          case "$app_entitlements" in
+            *"$relief"*)
+              echo "::error::the app is signed with com.apple.security.cs.disable-library-validation; it does not need it" >&2
+              exit 1 ;;
+          esac
+          case "$app_entitlements" in
+            *"<key>com.apple.security.network.client</key>"*) ;;
+            *) echo "::error::the app lost its entitlements; --force without --entitlements strips them" >&2; exit 1 ;;
+          esac
+          python_entitlements="$(codesign --display --entitlements - --xml \
+            "$APP/Contents/Resources/runtime/python/bin/python3" 2>/dev/null || true)"
+          case "$python_entitlements" in
+            *"$relief"*) ;;
+            *)
+              echo "::error::the bundled interpreter is signed without com.apple.security.cs.disable-library-validation, so a user's own extension modules will not load" >&2
+              exit 1 ;;
+          esac
+          echo "entitlements: app without library-validation relief, bundled interpreter with it"
+
+      # ── macOS: rebuild what tauri built from the pre-injection app ──
+      # tauri produced the updater tarball and the disk image before the payload
+      # existed and before anything was signed, so both are stale. They are
+      # rebuilt here, in place, at the paths tauri reported -- so the release
+      # asset names, "Stage release assets" and "Notarize final macOS disk image"
+      # all stay exactly as they were.
+      #
+      # The tarball is not cosmetic: it is the auto-update payload. Publishing
+      # tauri's copy would push shipped installs an app with no runtime in it and
+      # no Apple signature, which macOS refuses to launch.
+      - name: Rebuild the macOS updater artifact from the signed app
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+          UPDATER: ${{ steps.macos_bundle.outputs.updater_path }}
+          UPDATER_SIG: ${{ steps.macos_bundle.outputs.updater_sig_path }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Empty, not unset: the CLI prompts for a password when the variable is
+          # absent and would hang the job. Same reasoning as the build step.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: |
+          set -euo pipefail
+          # COPYFILE_DISABLE keeps Apple's tar from writing AppleDouble `._`
+          # members for extended attributes. Those would extract as files the
+          # bundle's signature does not seal, and the update would fail to launch.
+          # Symlinks are stored as symlinks (bsdtar does not follow them), which
+          # the payload needs: python/bin/python3 and llama.cpp's libggml chain
+          # are links, and dereferencing them breaks the seal as well.
+          rm -f "$UPDATER" "$UPDATER_SIG"
+          COPYFILE_DISABLE=1 tar -czf "$UPDATER" \
+            -C "$(dirname "$APP")" "$(basename "$APP")"
+
+          # Prove the round trip preserved the signature, on the artifact itself
+          # rather than on the directory it was made from.
+          check="$RUNNER_TEMP/updater-check"
+          rm -rf "$check"
+          mkdir -p "$check"
+          tar -xzf "$UPDATER" -C "$check"
+          extracted="$(find "$check" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$extracted"
+          test -x "$extracted/Contents/Resources/runtime/python/bin/python3"
+          codesign --verify --deep --strict --verbose=2 "$extracted"
+          rm -rf "$check"
+
+          # The updater signature is over the new bytes. This is the minisign key
+          # shipped apps check before they install anything, so a stale signature
+          # is a failed update, not a warning.
+          npx --prefix studio tauri signer sign "$UPDATER"
+          test -s "$UPDATER_SIG"
+          python3 - "$UPDATER_SIG" <<'PY'
+          import base64
+          import binascii
+          import pathlib
+          import sys
+
+          # The same shape "Generate versioned updater metadata" will demand in
+          # publish-release, checked here where the failure names this step.
+          value = pathlib.Path(sys.argv[1]).read_text(encoding = "utf-8").strip()
+          try:
+              decoded = base64.b64decode(value, validate = True)
+          except (binascii.Error, ValueError) as error:
+              sys.exit(f"the regenerated updater signature is not base64: {error}")
+          if not decoded.startswith(b"untrusted comment:") or b"\ntrusted comment:" not in decoded:
+              sys.exit("the regenerated updater signature is not a minisign signature")
+          print("updater signature regenerated and well formed")
+          PY
+          ls -l "$UPDATER" "$UPDATER_SIG"
+
+      - name: Rebuild the macOS disk image around the signed app
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APP: ${{ steps.macos_bundle.outputs.app_path }}
+          DMG: ${{ steps.macos_bundle.outputs.dmg_path }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Converted, grown, written into and converted back, rather than
+          # recreated: tauri's image carries a background, a window size, icon
+          # positions and the /Applications symlink, all encoded in a .DS_Store
+          # that `hdiutil create -srcfolder` would not reproduce. Same approach as
+          # scripts/inject_macos_runtime.sh takes for the dev build, except that
+          # what goes in is the signed app rather than a payload directory.
+          work="$RUNNER_TEMP/dmg-rebuild"
+          rm -rf "$work"
+          mkdir -p "$work/mnt"
+          rw="$work/rw.dmg"
+          trap 'hdiutil detach "$work/mnt" -quiet >/dev/null 2>&1 || true' EXIT
+
+          hdiutil convert "$DMG" -format UDRW -o "$rw" -quiet
+          app_mb="$(du -sm "$APP" | cut -f1)"
+          image_mb="$(du -sm "$rw" | cut -f1)"
+          target_mb=$(( app_mb + image_mb + 512 ))
+          echo "growing the image to ${target_mb}m (app ${app_mb}m + image ${image_mb}m + slack)"
+          hdiutil resize -size "${target_mb}m" "$rw" >/dev/null
+
+          hdiutil attach "$rw" -nobrowse -mountpoint "$work/mnt" -quiet
+          mounted="$(find "$work/mnt" -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$mounted" ]; then
+            echo "::error::no .app inside the disk image tauri produced" >&2
+            exit 1
+          fi
+          if [ "$(basename "$mounted")" != "$(basename "$APP")" ]; then
+            echo "::error::the image holds $(basename "$mounted") but the signed app is $(basename "$APP"); the .DS_Store layout is keyed by name" >&2
+            exit 1
+          fi
+          # ditto, not cp -R: it preserves the symlinks, permissions and extended
+          # attributes the signature depends on.
+          rm -rf "$mounted"
+          ditto "$APP" "$mounted"
+          codesign --verify --deep --strict --verbose=2 "$mounted"
+          test -x "$mounted/Contents/Resources/runtime/python/bin/python3"
+          hdiutil detach "$work/mnt" -quiet
+
+          # ULFO (lzfse) rather than UDZO (zlib): measurably smaller for a payload
+          # that is mostly already-compressed wheels and dylibs, and readable on
+          # every macOS this bundle targets. Matches the dev build's image.
+          hdiutil convert "$rw" -format ULFO -o "$work/out.dmg" -quiet
+          mv "$work/out.dmg" "$DMG"
+
+          # The bundler used to sign the image; nothing does now unless this does,
+          # and notarization requires a signature with a secure timestamp. The
+          # notarization step's first gate is `codesign --verify` on this file, so
+          # a silent failure here stops the release there.
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$DMG"
+          codesign --verify --verbose=2 "$DMG"
+          echo "rebuilt $(du -sh "$DMG" | cut -f1) $DMG"
+
       # ── macOS: notarize + staple the disk image itself ──
-      # tauri-bundler notarizes and staples the .app, but only codesigns the
-      # .dmg it wraps around it (tauri-apps/tauri#7533). The disk image users
-      # actually download therefore ships signed but without a notarization
-      # ticket, so Gatekeeper has to phone home to clear it and blocks it
-      # outright offline. Close that gap here and fail the release if any part
-      # of it does not hold.
+      # This step exists because tauri-bundler notarized and stapled the .app but
+      # only codesigned the .dmg it wrapped around it (tauri-apps/tauri#7533): the
+      # disk image users actually download shipped signed but without a
+      # notarization ticket, so Gatekeeper had to phone home to clear it and
+      # blocked it outright offline.
+      #
+      # Since the bundled runtime landed, tauri signs and notarizes nothing on
+      # this leg (see "Build macOS app"), and this is the ONLY notarization the
+      # release performs. That is deliberate rather than an omission. The ticket
+      # Apple issues for a disk image covers the code nested inside it, so the app
+      # a user drags out of the image is covered by the ticket stapled here. The
+      # updater tarball is not, so an update installed through the updater lands a
+      # signed, hardened, but unstapled app -- which macOS accepts, because the
+      # updater writes the bundle itself and never sets a quarantine attribute, so
+      # no Gatekeeper assessment happens. What protects that path is the minisign
+      # signature the updater checks before it installs anything, and "Rebuild the
+      # macOS updater artifact from the signed app" regenerates it over the signed
+      # bytes.
+      #
+      # Everything below is unchanged, and its first gate still holds: the image
+      # arriving here must already be signed, which is now the rebuild step's job
+      # rather than the bundler's.
       - name: Notarize final macOS disk image
         if: matrix.platform == 'macos-latest'
         shell: bash
@@ -1110,9 +2507,9 @@ jobs:
           PY
           )"
 
-          # First gate, before the multi-minute upload: the bundler signs the
-          # DMG whenever a signing identity is configured, so an unsigned image
-          # here means the signing step silently did nothing.
+          # First gate, before the multi-minute upload: the image is signed by
+          # "Rebuild the macOS disk image around the signed app", so an unsigned
+          # image here means that step silently did nothing.
           codesign --verify --verbose=2 "$dmg_path"
 
           # notarytool has no environment or stdin form for --password, so the
@@ -1206,6 +2603,93 @@ jobs:
           Write-Host "install.ps1 -> $($sig.Status) $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { Write-Host "::error::install.ps1 is $($sig.Status) after signing"; exit 1 }
 
+      # ── Windows: pin the WebView2 bootstrapper the installer embeds ──
+      # `bundle > windows > webviewInstallMode: embedBootstrapper` makes
+      # tauri-bundler embed Microsoft's Evergreen WebView2 bootstrapper in the
+      # NSIS installer. The bundler fetched it from
+      # https://go.microsoft.com/fwlink/p/?LinkId=2124703 -- a link whose target
+      # Microsoft rotates -- and, unlike every other file it downloads (NSIS 3.11
+      # and nsis_tauri_utils.dll are both hash-verified), it verified nothing. So
+      # the last unpinned build input ended up inside a signed installer that is
+      # also the auto-updater payload, trusted purely on TLS, and differing
+      # between two builds of the same commit.
+      #
+      # tauri-bundler 2.8.1 (the bundler in the pinned tauri-cli 2.10.1) resolves
+      # it in bundle/windows/util.rs as:
+      #
+      #   let file_path = base_path.join("MicrosoftEdgeWebview2Setup.exe");
+      #   if !file_path.exists() { fs::write(&file_path, download(URL)?)?; }
+      #
+      # so seeding that path with a verified copy makes the bundler use ours and
+      # download nothing. `base_path` is the bundler's tools directory:
+      # `dirs::cache_dir()/tauri`, i.e. %LOCALAPPDATA%\tauri, because
+      # `bundle > useLocalToolsDir` is false. Nothing in the config can hand the
+      # bundler a local bootstrapper -- the five webviewInstallMode variants are
+      # skip / downloadBootstrapper / embedBootstrapper / offlineInstaller /
+      # fixedRuntime{path} -- so the cache seed is the supported seam, and
+      # "Verify the embedded WebView2 bootstrapper" below proves it was taken.
+      #
+      # The URL is the immutable per-version target the fwlink redirects to, so
+      # the pin only moves when we move it. The SHA-256 is the integrity gate and
+      # fails closed, same shape as the AppImage toolchain and trusted-signing-cli
+      # pins above.
+      #
+      # This pins the ~1.8MB *bootstrapper*, not the WebView2 runtime. The file is
+      # Microsoft Edge Update Setup 1.3.257.13, whose only job is to fetch the
+      # current Evergreen runtime at install time, so users still receive WebView2
+      # security updates. (`fixedRuntime` would pin the runtime itself and take
+      # that away; deliberately not used.)
+      #
+      # To bump, re-record the digest from the artifact itself:
+      #   curl -sSIL 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' | grep -i '^location'
+      #   curl -fsSL '<resolved url>' | sha256sum
+      # then update WEBVIEW2_BOOTSTRAPPER_URL / WEBVIEW2_BOOTSTRAPPER_SHA256 in
+      # both Windows steps here (they must agree), the copies in the "Verify
+      # desktop updater and Linux package config" guard, and
+      # tests/security/test_release_desktop_webview2.py.
+      - name: Pin Windows WebView2 bootstrapper
+        if: matrix.platform == 'windows-latest'
+        # Explicit, like every other Windows step here; -MaximumRetryCount is
+        # PowerShell 6+ only and must not come from a runner default.
+        shell: pwsh
+        env:
+          WEBVIEW2_BOOTSTRAPPER_URL: "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/09d01e8e-f1ac-43a6-b5a0-282e0778a4b6/MicrosoftEdgeWebview2Setup.exe"
+          WEBVIEW2_BOOTSTRAPPER_SHA256: "be695eb3732a94e181f008ab5cf6ee650f8644676e87f9e02b6ab0d02f2ea08e"
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:LOCALAPPDATA) {
+            Write-Output "::error::LOCALAPPDATA is unset, so the tauri-bundler tools directory cannot be located. Refusing to build an installer that would embed an unverified WebView2 bootstrapper."
+            exit 1
+          }
+          $toolsDir = Join-Path $env:LOCALAPPDATA "tauri"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          $seeded = Join-Path $toolsDir "MicrosoftEdgeWebview2Setup.exe"
+
+          # Download to a staging path, verify there, and only then move it into
+          # the bundler's cache. A partial or substituted download must never
+          # exist at $seeded even briefly, because that is the exact path the
+          # bundler treats as "already have it, no need to fetch".
+          $stage = Join-Path $env:RUNNER_TEMP "webview2"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $dest = Join-Path $stage "MicrosoftEdgeWebview2Setup.exe"
+          Invoke-WebRequest -Uri $env:WEBVIEW2_BOOTSTRAPPER_URL -OutFile $dest -MaximumRetryCount 3 -RetryIntervalSec 5
+
+          $actual = (Get-FileHash -Path $dest -Algorithm SHA256).Hash.ToLower()
+          $expected = $env:WEBVIEW2_BOOTSTRAPPER_SHA256.ToLower()
+          if ($actual -ne $expected) {
+            Remove-Item -Force $dest
+            Write-Output "::error::WebView2 bootstrapper digest mismatch, refusing to embed an unverified Microsoft binary in the installer. Expected $expected, got $actual. Re-pin WEBVIEW2_BOOTSTRAPPER_URL and WEBVIEW2_BOOTSTRAPPER_SHA256 deliberately if Microsoft rotated the Evergreen bootstrapper."
+            exit 1
+          }
+
+          # -Force overwrites: a warm runner image (or a restored cache) could
+          # already hold an unverified copy at this path, and that copy would win
+          # the bundler's existence check.
+          Move-Item -Force -Path $dest -Destination $seeded
+          Write-Output "verified WebView2 bootstrapper sha256=$actual"
+          Write-Output "seeded tauri-bundler tools directory: $seeded"
+          "WEBVIEW2_BOOTSTRAPPER_PATH=$seeded" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build Windows app
         id: build_windows
         if: matrix.platform == 'windows-latest'
@@ -1229,6 +2713,81 @@ jobs:
           projectPath: studio
           tauriScript: npx --prefix . tauri
           args: -v ${{ matrix.args }}
+
+      # ── Windows: prove the installer embedded the pinned bootstrapper ──
+      # Seeding the bundler's cache is only as good as the assumption that the
+      # bundler read it, and that assumption is a tauri-bundler implementation
+      # detail that a CLI bump could change silently. So check the result rather
+      # than the intent: tauri-bundler renders the NSIS script it hands to
+      # makensis into target/<profile>/nsis/<arch>/installer.nsi, and the
+      # embedBootstrapper branch of that script embeds the file named by
+      #
+      #   !define WEBVIEW2BOOTSTRAPPERPATH "<absolute path>"
+      #
+      # with `File "/oname=$TEMP\MicrosoftEdgeWebview2Setup.exe" ...`. Reading
+      # that path back out and hashing it is direct evidence of which bytes went
+      # into the installer, independent of where the bundler chose to cache them.
+      # Runs before the 20-minute Defender scan so a miss fails fast.
+      - name: Verify the embedded WebView2 bootstrapper
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          WEBVIEW2_BOOTSTRAPPER_SHA256: "be695eb3732a94e181f008ab5cf6ee650f8644676e87f9e02b6ab0d02f2ea08e"
+        run: |
+          $ErrorActionPreference = "Stop"
+          # target/<profile>/nsis/<arch>/ without --target, target/<triple>/<profile>/...
+          # with one. Globbed rather than -Recurse: the target directory holds
+          # hundreds of thousands of build artifacts.
+          $scripts = @(Get-ChildItem -File -ErrorAction SilentlyContinue -Path @(
+            "studio/src-tauri/target/*/nsis/*/installer.nsi",
+            "studio/src-tauri/target/*/*/nsis/*/installer.nsi"
+          ))
+          if ($scripts.Count -ne 1) {
+            Write-Output "::error::Expected exactly one rendered NSIS script under studio/src-tauri/target, found $($scripts.Count). Cannot prove which WebView2 bootstrapper the installer embedded."
+            exit 1
+          }
+          $nsi = $scripts[0].FullName
+          $text = Get-Content -Raw -Path $nsi
+
+          $modeMatch = [regex]::Match($text, '(?m)^!define\s+INSTALLWEBVIEW2MODE\s+"([^"]*)"')
+          if (-not $modeMatch.Success -or $modeMatch.Groups[1].Value -ne "embedBootstrapper") {
+            Write-Output "::error::Rendered NSIS script does not install WebView2 via embedBootstrapper (got '$($modeMatch.Groups[1].Value)'), so this check cannot vouch for the embedded bootstrapper. Re-review the pin if webviewInstallMode changed."
+            exit 1
+          }
+
+          $pathMatch = [regex]::Match($text, '(?m)^!define\s+WEBVIEW2BOOTSTRAPPERPATH\s+"([^"]*)"')
+          if (-not $pathMatch.Success) {
+            Write-Output "::error::Rendered NSIS script declares no WEBVIEW2BOOTSTRAPPERPATH; refusing to publish an installer whose WebView2 bootstrapper cannot be identified."
+            exit 1
+          }
+          # tauri-bundler escapes NSIS metacharacters when rendering the template
+          # ('"' -> '$\"', '$' -> '$$'); undo the two a Windows path can contain.
+          $embedded = $pathMatch.Groups[1].Value.Replace('$\"', '"').Replace('$$', '$')
+          if (-not (Test-Path -LiteralPath $embedded)) {
+            Write-Output "::error::Rendered NSIS script embedded '$embedded', which no longer exists, so its digest cannot be checked."
+            exit 1
+          }
+
+          # The seeded path is where the pinned copy was placed. A different path
+          # means the bundler cached elsewhere and fetched its own copy.
+          if (-not $env:WEBVIEW2_BOOTSTRAPPER_PATH) {
+            Write-Output "::error::WEBVIEW2_BOOTSTRAPPER_PATH is unset; 'Pin Windows WebView2 bootstrapper' did not run."
+            exit 1
+          }
+          $seeded = (Resolve-Path -LiteralPath $env:WEBVIEW2_BOOTSTRAPPER_PATH).Path
+          $embeddedResolved = (Resolve-Path -LiteralPath $embedded).Path
+          if ($embeddedResolved -ne $seeded) {
+            Write-Output "::error::The installer embedded '$embeddedResolved' but the pinned bootstrapper was seeded at '$seeded'. tauri-bundler fetched its own unverified copy; re-check bundle/windows/util.rs for the tauri-cli version in studio/package-lock.json."
+            exit 1
+          }
+
+          $actual = (Get-FileHash -Path $embeddedResolved -Algorithm SHA256).Hash.ToLower()
+          $expected = $env:WEBVIEW2_BOOTSTRAPPER_SHA256.ToLower()
+          if ($actual -ne $expected) {
+            Write-Output "::error::The WebView2 bootstrapper embedded in the installer is not the pinned one. Expected $expected, got $actual."
+            exit 1
+          }
+          Write-Output "installer embedded the pinned WebView2 bootstrapper sha256=$actual from $embeddedResolved"
 
       # ── Windows: scan the signed bundles with Defender before publishing ──
       # 0.1.512-beta shipped a "Trojan:Win32/Wacatac.B!ml" false positive nothing
@@ -1545,6 +3104,227 @@ jobs:
           $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           Write-Host ($md -join "`n")
 
+      # ── Lockfile immutability, part 2 of 2 ──
+      # The bundles are built by now, so any lockfile rewrite the build itself
+      # performed (a cargo invocation without --locked, a stray `npm install`
+      # inside a build script) has already happened. Fail the release loudly
+      # rather than shipping binaries whose dependency set no longer matches the
+      # reviewed one. Baselines: HEAD for the two npm lockfiles, and the
+      # post-patch snapshot from part 1 for Cargo.lock.
+      - name: Verify the build rewrote no lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          git diff --exit-code -- studio/package-lock.json studio/frontend/package-lock.json
+          "$PYTHON" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          def digest(path: pathlib.Path) -> str:
+              return hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+
+          snapshot_path = pathlib.Path(os.environ['RUNNER_TEMP'], 'lockfile-digests.json')
+          if not snapshot_path.is_file():
+              sys.exit('No lockfile digest snapshot; "Snapshot lockfile digests" did not run')
+          snapshot = json.loads(snapshot_path.read_text(encoding='utf-8'))
+
+          drifted = {
+              path: (recorded, digest(pathlib.Path(path)))
+              for path, recorded in sorted(snapshot.items())
+              if digest(pathlib.Path(path)) != recorded
+          }
+          if drifted:
+              for path, (recorded, actual) in drifted.items():
+                  print(f'{path}: {recorded} -> {actual}', file=sys.stderr)
+              sys.exit(
+                  'The build rewrote a lockfile, so these bundles were not built '
+                  'from the reviewed dependency set.'
+              )
+          print('lockfiles unchanged since the release version patch')
+          PY
+
+      # ── Build provenance: what this leg actually built with ──
+      # Every version below exists only in the runner log today, and logs
+      # expire. publish-release merges the three legs' records into one
+      # build-inputs.json release asset, which outlives them.
+      - name: Record build inputs
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARTIFACT_KEY: ${{ matrix.artifact }}
+          # The manifest is read out of the SIGNED app bundle, not out of the
+          # staging directory it was assembled in, so what lands in the record is
+          # what shipped. Empty on the legs that ship no payload.
+          BUNDLED_RUNTIME_APP: ${{ steps.macos_bundle.outputs.app_path }}
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          # Collected in the shell rather than from Python's subprocess: `npx`
+          # and `npm` are .cmd shims on Windows and are only reliably resolvable
+          # through a shell. rustc/cargo are read from studio/src-tauri so
+          # rust-toolchain.toml governs which toolchain answers.
+          RUSTC_VERSION="$(cd studio/src-tauri && rustc -V)"
+          CARGO_VERSION="$(cd studio/src-tauri && cargo -V)"
+          NODE_VERSION="$(node -v)"
+          NPM_VERSION="$(npm -v)"
+          TAURI_CLI_VERSION="$(npx --prefix studio tauri --version)"
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          export RUSTC_VERSION CARGO_VERSION NODE_VERSION NPM_VERSION TAURI_CLI_VERSION COMMIT_SHA
+          "$PYTHON" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import platform
+          import re
+          import sys
+
+          workflow = pathlib.Path('.github/workflows/release-desktop.yml').read_text(encoding='utf-8')
+
+          # Read the pins out of the workflow itself rather than restating them:
+          # a copy here would silently go stale the next time one is bumped.
+          pinned_actions = sorted({
+              match.group(1)
+              for match in re.finditer(r'^\s*-?\s*uses:\s*(\S+@[0-9a-f]{40})', workflow, re.M)
+          })
+          pinned_downloads = {
+              match.group(1): match.group(2)
+              for match in re.finditer(
+                  r'^\s*([A-Z][A-Z0-9_]*(?:_URL|_SHA256)):\s*"([^"]+)"', workflow, re.M
+              )
+          }
+
+          toolchain = pathlib.Path('studio/src-tauri/rust-toolchain.toml').read_text(encoding='utf-8')
+          channel = re.search(r'^\s*channel\s*=\s*"([^"]+)"', toolchain, re.M)
+          if not channel:
+              sys.exit('studio/src-tauri/rust-toolchain.toml declares no channel')
+          channel = channel.group(1)
+          if not re.fullmatch(r'\d+\.\d+(?:\.\d+)?', channel):
+              sys.exit(
+                  'Desktop releases must build on an exact rustc, not a moving channel: '
+                  f'rust-toolchain.toml channel = "{channel}"'
+              )
+          rustc_version = os.environ['RUSTC_VERSION']
+          # Proves the pin took effect on this runner. Without it a
+          # rust-toolchain.toml that failed to apply would only show up as a
+          # version string nobody read.
+          if not rustc_version.startswith(f'rustc {channel} '):
+              sys.exit(
+                  f'rustc is {rustc_version!r}, not the pinned {channel} from '
+                  'studio/src-tauri/rust-toolchain.toml'
+              )
+
+          def digest(path: str) -> str:
+              return hashlib.sha256(
+                  pathlib.Path(path).read_bytes().replace(b'\r\n', b'\n')
+              ).hexdigest()
+
+          record = {
+              'artifact': os.environ['ARTIFACT_KEY'],
+              'runner_label': os.environ['PLATFORM'],
+              'runner': {
+                  'os': os.environ.get('RUNNER_OS', ''),
+                  'arch': os.environ.get('RUNNER_ARCH', ''),
+                  'image_os': os.environ.get('ImageOS', ''),
+                  'image_version': os.environ.get('ImageVersion', ''),
+                  'platform': platform.platform(),
+                  'machine': platform.machine(),
+              },
+              'commit': os.environ['COMMIT_SHA'],
+              'source_date_epoch': os.environ.get('SOURCE_DATE_EPOCH', ''),
+              'toolchain': {
+                  'rust_toolchain_toml_channel': channel,
+                  'rustc': rustc_version,
+                  'cargo': os.environ['CARGO_VERSION'],
+                  'node': os.environ['NODE_VERSION'],
+                  'npm': os.environ['NPM_VERSION'],
+                  'tauri_cli': os.environ['TAURI_CLI_VERSION'],
+              },
+              'lockfiles': {
+                  path: digest(path)
+                  for path in (
+                      'studio/src-tauri/Cargo.lock',
+                      'studio/package-lock.json',
+                      'studio/frontend/package-lock.json',
+                  )
+              },
+              'pinned_actions': pinned_actions,
+              'pinned_downloads': pinned_downloads,
+          }
+
+          # ── The bundled runtime, for the legs that ship one ──
+          # A shipped .dmg now contains a whole Python stack, and "which versions
+          # were in it" has to be answerable from the release rather than from a
+          # runner log that expires. BUNDLE_MANIFEST.json is exactly that answer:
+          # every distribution and its version, the digest of every prebuilt
+          # archive, and a `locks` map that already carries the SHA-256 of
+          # darwin-arm64-bundle.lock.txt. So it is embedded whole, digested as
+          # shipped, and nothing about the payload is restated here -- the same
+          # reason pinned_downloads is scraped out of the workflow above instead of
+          # being copied into it.
+          app = os.environ.get('BUNDLED_RUNTIME_APP', '')
+          if os.environ['PLATFORM'].startswith('macos') and not app:
+              sys.exit(
+                  'the macOS leg recorded no app bundle, so the bundled runtime cannot be '
+                  'described; "Locate the built macOS bundle" must run before this step'
+              )
+          if app:
+              manifest_path = pathlib.Path(app, 'Contents/Resources/runtime/BUNDLE_MANIFEST.json')
+              if not manifest_path.is_file():
+                  sys.exit(f'{manifest_path} is missing; the signed app ships no bundled runtime')
+              manifest_bytes = manifest_path.read_bytes()
+              manifest = json.loads(manifest_bytes)
+              if manifest.get('incomplete'):
+                  sys.exit(f'the shipped payload is incomplete: {manifest["incomplete"]}')
+              bundle_lock = 'darwin-arm64-bundle.lock.txt'
+              if bundle_lock not in manifest.get('locks', {}):
+                  sys.exit(
+                      f'BUNDLE_MANIFEST.json records no {bundle_lock}, so the release cannot '
+                      'say which lock resolved the payload'
+                  )
+              record['bundled_runtime'] = {
+                  'root': 'Contents/Resources/runtime',
+                  'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+                  'manifest': manifest,
+                  # Recorded because a payload nobody signed is the failure this
+                  # release path exists to prevent, so the count belongs with the
+                  # digests rather than only in the signing step's log.
+                  'signed_macho_count': int(os.environ.get('SIGNED_MACHO_COUNT', '0')),
+              }
+              if record['bundled_runtime']['signed_macho_count'] <= 0:
+                  sys.exit('no Mach-O count was recorded, so nothing proves the payload was signed')
+
+          out_dir = pathlib.Path(os.environ['RUNNER_TEMP'], 'build-inputs')
+          out_dir.mkdir(parents=True, exist_ok=True)
+          out = out_dir / f'build-inputs-{record["artifact"]}.json'
+          out.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(out.read_text(encoding='utf-8'))
+          PY
+
+      - name: Upload build input record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          # Deliberately not `desktop-release-*`: publish-release and
+          # virustotal-scan both merge that pattern into the bundle directory,
+          # and a stray JSON there would fail the asset-set contract.
+          name: desktop-build-inputs-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/build-inputs/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
       - name: Stage release assets
         shell: bash
         env:
@@ -1628,12 +3408,22 @@ jobs:
     # is one runner slot held for the length of the run.
     needs: [prepare-version]
     runs-on: ubuntu-latest
-    # Waits out the build (legs cap at 60) then downloads and uploads; the
-    # publish steps themselves are 17-40s.
-    timeout-minutes: 90
+    # Waits out the build (the macOS leg caps at 180 now that it assembles,
+    # signs and notarizes the bundled runtime; the other two still cap at 60)
+    # then downloads and uploads. The publish steps themselves are 17-40s, but
+    # the macOS .dmg went from tens of megabytes to ~600 MB, so the download and
+    # the `gh release upload` are no longer instant either.
+    timeout-minutes: 210
     permissions:
-      contents: write  # create the versioned Release and replace updater-channel metadata
-      actions: read    # the waiter reads this run's job list
+      contents: write      # create the versioned Release and replace updater-channel metadata
+      actions: read        # the waiter reads this run's job list
+      # Build provenance, and only here: the workflow-level default stays
+      # `contents: read` and the build matrix keeps no permissions block at all,
+      # so the job that already holds write scope is the one that signs for what
+      # it publishes. `id-token: write` mints the short-lived OIDC token Sigstore
+      # binds the attestation to; `attestations: write` stores the result.
+      id-token: write
+      attestations: write
     env:
       GH_REPO: ${{ github.repository }}
       APP_VERSION: ${{ needs.prepare-version.outputs.app_version }}
@@ -1659,7 +3449,12 @@ jobs:
           # The three matrix legs, by their `name:` (Build <matrix.label>).
           LEGS=('Build macOS (Apple Silicon)' 'Build Linux (x64)' 'Build Windows (x64)')
           POLL=30
-          DEADLINE=$(( $(date +%s) + 75 * 60 ))
+          # Longer than the longest leg's own cap (macOS, 180 minutes since the
+          # bundled runtime), so a leg that is merely slow is waited out and only
+          # a leg that has genuinely stopped reporting trips this. Shorter than
+          # this job's 210, so the timeout is this explicit message rather than
+          # the runner killing the job.
+          DEADLINE=$(( $(date +%s) + 195 * 60 ))
           # Matrix job records appear with the run, so a leg still missing well
           # after the start is a real problem, not a slow API.
           STARTUP_DEADLINE=$(( $(date +%s) + 15 * 60 ))
@@ -1733,6 +3528,127 @@ jobs:
           path: ${{ runner.temp }}/desktop-release-assets
           merge-multiple: true
 
+      - name: Download build input records
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: desktop-build-inputs-*
+          path: ${{ runner.temp }}/build-inputs
+          merge-multiple: true
+
+      # What the bundles were built from, as a release asset rather than a log
+      # line: the toolchain versions, lockfile digests and pinned tool digests
+      # currently exist only in runner logs, which expire while the binaries stay
+      # downloadable forever. Deliberately not in the release notes -- those are
+      # the maintainer's changelog and the updater popup renders them.
+      #
+      # The merge is also a check. All three legs report the commit they built
+      # and the lockfiles they built with; a leg that disagrees built something
+      # else, and that fails the release here rather than shipping a mixed set.
+      - name: Assemble build-inputs.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          # The matrix legs by `artifact`, same hardcoded list as "Wait for the
+          # build matrix" keeps by `label`. A record short of one leg would
+          # describe a release only partly, and silently.
+          EXPECTED_LEGS = {'macos-aarch64', 'linux-x64', 'windows-x64'}
+
+          record_dir = pathlib.Path(os.environ['RUNNER_TEMP'], 'build-inputs')
+          records = sorted(record_dir.glob('build-inputs-*.json'))
+          if not records:
+              sys.exit('No per-leg build input records were downloaded')
+
+          platforms = {}
+          for path in records:
+              record = json.loads(path.read_text(encoding='utf-8'))
+              key = record.pop('artifact')
+              if key in platforms:
+                  sys.exit(f'Duplicate build input record for {key}')
+              platforms[key] = record
+
+          if set(platforms) != EXPECTED_LEGS:
+              sys.exit(
+                  'Build input records do not cover the build matrix: '
+                  f'missing={sorted(EXPECTED_LEGS - set(platforms))}, '
+                  f'unexpected={sorted(set(platforms) - EXPECTED_LEGS)}'
+              )
+
+          # The macOS .dmg ships a complete Python runtime inside the app bundle.
+          # A release whose record cannot say which one is a release whose runtime
+          # is unauditable once the runner logs expire, so refuse to publish it.
+          macos = platforms['macos-aarch64']
+          bundled = macos.get('bundled_runtime') or {}
+          if not bundled.get('manifest_sha256') or not bundled.get('manifest'):
+              sys.exit(
+                  'the macOS build input record carries no bundled runtime manifest, so the '
+                  'release could not say what is inside the app bundle it publishes'
+              )
+          if bundled.get('signed_macho_count', 0) <= 0:
+              sys.exit('the macOS build input record reports no signed Mach-O files')
+
+          commits = {key: record['commit'] for key, record in platforms.items()}
+          if len(set(commits.values())) != 1:
+              sys.exit(f'Build legs did not all build the same commit: {commits}')
+          lockfiles = {key: record['lockfiles'] for key, record in platforms.items()}
+          if len({json.dumps(value, sort_keys=True) for value in lockfiles.values()}) != 1:
+              sys.exit(f'Build legs did not all build from the same lockfiles: {lockfiles}')
+
+          # Every leg reads these out of its own checkout of this workflow, so
+          # disagreement means the legs were not running the same file.
+          HOISTED = ('commit', 'source_date_epoch', 'lockfiles', 'pinned_actions', 'pinned_downloads')
+          for field in HOISTED:
+              values = {json.dumps(record[field], sort_keys=True) for record in platforms.values()}
+              if len(values) != 1:
+                  sys.exit(f'Build legs did not all agree on {field}: {sorted(values)}')
+
+          shared = next(iter(platforms.values()))
+          build_inputs = {
+              'schema': 'unsloth-desktop-build-inputs/1',
+              'studio_version': os.environ['STUDIO_VERSION'],
+              'app_version': os.environ['APP_VERSION'],
+              'pypi_version': os.environ['PYPI_VERSION'],
+              'release_tag': os.environ['DESKTOP_RELEASE_TAG'],
+              'commit': shared['commit'],
+              'source_date_epoch': shared['source_date_epoch'],
+              'lockfiles': shared['lockfiles'],
+              'pinned_actions': shared['pinned_actions'],
+              'pinned_downloads': shared['pinned_downloads'],
+              'lockfile_digest_note': (
+                  'SHA-256 over each file with CRLF normalised to LF, so the digest is the '
+                  'same on all three runner platforms; on an LF checkout it equals sha256sum. '
+                  'Cargo.lock is hashed after the release version patch, which rewrites the '
+                  'unsloth-studio [[package]] version to app_version and nothing else.'
+              ),
+              'workflow': {
+                  'repository': os.environ['GITHUB_REPOSITORY'],
+                  'ref': os.environ.get('GITHUB_WORKFLOW_REF', ''),
+                  'run_id': os.environ['GITHUB_RUN_ID'],
+                  'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT', ''),
+              },
+              'platforms': {
+                  key: {
+                      name: value
+                      for name, value in record.items()
+                      # Hoisted above; per-leg copies are identical by the checks
+                      # right up there and would only invite them to drift.
+                      if name not in HOISTED
+                  }
+                  for key, record in sorted(platforms.items())
+              },
+          }
+
+          asset_dir = pathlib.Path(os.environ['RUNNER_TEMP'], 'desktop-release-assets')
+          out = asset_dir / 'build-inputs.json'
+          out.write_text(json.dumps(build_inputs, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(out.read_text(encoding='utf-8'))
+          PY
+
       - name: Validate release asset set
         shell: bash
         run: |
@@ -1754,6 +3670,10 @@ jobs:
               f'{base_name}-Ubuntu.deb',
               f'{base_name}-Windows.exe',
               f'{base_name}-Windows.exe.sig',
+              # Not prefixed Unsloth-Desktop-: that prefix is the republish
+              # guard's namespace for bundles, and this is a per-release record,
+              # not a bundle. It is validated, attested and uploaded with them.
+              'build-inputs.json',
           }
           actual_names = {path.name for path in files}
           if actual_names != expected_names:
@@ -1765,6 +3685,28 @@ jobs:
               )
           print('\n'.join(sorted(actual_names)))
           PY
+
+      # ── Build provenance attestation ──
+      # Signs a SLSA provenance statement for every staged asset, binding each
+      # file's digest to this repository, this workflow file, this commit and
+      # this run, via a short-lived Sigstore certificate. Anyone can then check a
+      # downloaded bundle against it:
+      #
+      #   gh attestation verify Unsloth-Desktop-...-MacOS.dmg --repo unslothai/unsloth
+      #
+      # which is the part code signing does not give: an Apple/Azure signature
+      # says Unsloth signed this binary, this says which source and which
+      # workflow run produced it. Runs after the asset set is validated, so
+      # exactly the reviewed set is attested, and before the upload, so nothing
+      # is published without one.
+      #
+      # Gated on a real publish: an attestation is a write to the repository's
+      # attestation store, and a validation-only run must leave no trace.
+      - name: Attest build provenance for the release assets
+        if: ${{ !inputs.draft }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/desktop-release-assets/*
 
       # Validation runs before the scan so an already-used version is rejected
       # before any bundle is disclosed to VirusTotal. Creation remains deferred
@@ -2129,7 +4071,14 @@ jobs:
     # A missing secret, a VirusTotal outage or quota exhaustion must not fail
     # the release whose assets are already uploaded.
     continue-on-error: true
-    timeout-minutes: 30
+    # Raised with the bundled runtime. scripts/virustotal_scan.py already uploads
+    # through the signed-URL flow because "every desktop bundle is 41-46 MB",
+    # which is over the 32 MB cap on POST /files; the macOS .dmg is now ~600 MB,
+    # so that one upload alone is an order of magnitude slower than the whole scan
+    # used to be. Nothing else changes: the job still cannot block a release, and a
+    # .dmg that exceeds VirusTotal's 650 MB signed-URL ceiling degrades to an
+    # annotated "unavailable" row rather than a failure.
+    timeout-minutes: 60
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0

@@ -51,6 +51,7 @@ on:
       - 'studio/install_*_prebuilt.py'
       - 'studio/prebuilt_core.py'
       - 'studio/node_prebuilt_pins.json'
+      - 'studio/prebuilt_release_pins.json'
       # The overlay exists so a constraints or requirements change is exercised here
       # (see the header). update-smoke cannot stand in: it starts from a preinstalled
       # Python and full developer tooling.
@@ -81,6 +82,7 @@ on:
       - 'studio/install_*_prebuilt.py'
       - 'studio/prebuilt_core.py'
       - 'studio/node_prebuilt_pins.json'
+      - 'studio/prebuilt_release_pins.json'
       - 'studio/backend/requirements/**'
       - 'pyproject.toml'
       - 'unsloth_cli/commands/studio.py'

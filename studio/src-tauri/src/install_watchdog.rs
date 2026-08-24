@@ -156,16 +156,40 @@ pub fn note_progress(watch: &WatchState, text: &str) -> bool {
 /// `poll` yields the exit status and whether the stop was asked for, or None while running.
 pub fn wait_with_watchdog(
     watch: &std::sync::Mutex<ProgressWatch>,
+    poll: impl FnMut() -> Result<Option<(std::process::ExitStatus, bool)>, String>,
+    report: impl FnMut(&str),
+    stop: impl FnMut(),
+) -> Result<(std::process::ExitStatus, bool), String> {
+    wait_with_watchdog_using(watch, poll, report, stop, Instant::now)
+}
+
+/// The loop, with the clock passed in.
+///
+/// Every other test here drives `ProgressWatch` with instants it makes up, which is
+/// what keeps them deterministic. This loop used to be the exception: it read
+/// `Instant::now()` itself, so the only way to test the backstop was to hand it a watch
+/// started `Instant::now() - 13 h`. That panics -- `Instant`'s `Sub` does not saturate --
+/// on any host whose monotonic clock has not been running for thirteen hours, which a
+/// freshly booted Windows CI runner has not:
+///
+///     panicked at library/std/src/time.rs: overflow when subtracting duration from instant
+///
+/// Taking the clock as an argument lets the test name the instants instead, the way the
+/// rest of the module does. Production behaviour is unchanged: the public wrapper above
+/// passes `Instant::now`.
+fn wait_with_watchdog_using(
+    watch: &std::sync::Mutex<ProgressWatch>,
     mut poll: impl FnMut() -> Result<Option<(std::process::ExitStatus, bool)>, String>,
     mut report: impl FnMut(&str),
     mut stop: impl FnMut(),
+    mut clock: impl FnMut() -> Instant,
 ) -> Result<(std::process::ExitStatus, bool), String> {
     loop {
         if let Some(exit) = poll()? {
             return Ok(exit);
         }
 
-        let now = Instant::now();
+        let now = clock();
         let (due, expired) = {
             let mut watch = watch.lock().map_err(|e| e.to_string())?;
             (watch.due_report(now), watch.expired(now))
@@ -288,13 +312,20 @@ mod tests {
 
     #[test]
     fn the_wait_loop_reports_a_silence_then_stops_the_child_at_the_backstop() {
-        let watch = Mutex::new(ProgressWatch::with_backstop(Instant::now() - 13 * HOUR, 12 * HOUR));
+        // A named instant and a clock that reports 12 h later, rather than a watch
+        // started 13 h in the past: `Instant::now() - 13 * HOUR` panics outright on a
+        // host whose monotonic clock is younger than that. One tick is enough -- at
+        // t0 + 12 h the silence report and the backstop both come due in the same
+        // iteration, which is exactly what the old start-in-the-past setup produced.
+        let t0 = Instant::now();
+        let watch = Mutex::new(ProgressWatch::with_backstop(t0, 12 * HOUR));
         let (mut reports, mut stops) = (Vec::new(), 0);
-        let error = wait_with_watchdog(
+        let error = wait_with_watchdog_using(
             &watch,
             || Ok(None),
             |line| reports.push(line.to_string()),
             || stops += 1,
+            || t0 + 12 * HOUR,
         )
         .expect_err("the backstop must end the wait");
         assert!(error.contains("12 h"), "{error}");

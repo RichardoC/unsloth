@@ -34,7 +34,7 @@ Download the native Unsloth Desktop app for your operating system:
     <td><a href='https://github.com/unslothai/unsloth/releases/download/v0.1.800-beta/Unsloth-Desktop-0_1_800_beta-Windows.exe'>Download</a></td>
   </tr>
   <tr>
-    <td><b>macOS</b></td>
+    <td><b>macOS (Apple Silicon)</b></td>
     <td><a href='https://github.com/unslothai/unsloth/releases/download/v0.1.800-beta/Unsloth-Desktop-0_1_800_beta-MacOS.dmg'>Download</a></td>
   </tr>
   <tr>
@@ -45,13 +45,9 @@ Download the native Unsloth Desktop app for your operating system:
     <td><b>Linux (AppImage)</b></td>
     <td><a href='https://github.com/unslothai/unsloth/releases/download/v0.1.800-beta/Unsloth-Desktop-0_1_800_beta-Linux.AppImage'>Download</a></td>
   </tr>
-  <tr>
-    <td><b>Linux (Arm64)</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/download/v0.1.800-beta/Unsloth-Desktop-0_1_800_beta-ARM64.app.tar.gz'>Download</a></td>
-  </tr>
 </table>
 
-Download from [Unsloth](https://unsloth.ai/download) or [GitHub Releases](https://github.com/unslothai/unsloth/releases).
+Download from [Unsloth](https://unsloth.ai/download) or [GitHub Releases](https://github.com/unslothai/unsloth/releases). macOS users on Apple Silicon can also `brew install --cask unsloth-studio` — see [Homebrew](#macos-homebrew) below.
 
 Or if you prefer to install manually:
 
@@ -133,7 +129,7 @@ The Tauri based desktop app is the easiest way to use Unsloth and needs no setup
     <td><a href='https://github.com/unslothai/unsloth/releases/download/v0.1.800-beta/Unsloth-Desktop-0_1_800_beta-Windows.exe'>Download</a></td>
   </tr>
   <tr>
-    <td><b>macOS</b></td>
+    <td><b>macOS (Apple Silicon)</b></td>
     <td><a href='https://github.com/unslothai/unsloth/releases/download/v0.1.800-beta/Unsloth-Desktop-0_1_800_beta-MacOS.dmg'>Download</a></td>
   </tr>
   <tr>
@@ -144,11 +140,17 @@ The Tauri based desktop app is the easiest way to use Unsloth and needs no setup
     <td><b>Linux (AppImage)</b></td>
     <td><a href='https://github.com/unslothai/unsloth/releases/download/v0.1.800-beta/Unsloth-Desktop-0_1_800_beta-Linux.AppImage'>Download</a></td>
   </tr>
-  <tr>
-    <td><b>Linux (Arm64)</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/download/v0.1.800-beta/Unsloth-Desktop-0_1_800_beta-ARM64.app.tar.gz'>Download</a></td>
-  </tr>
 </table>
+
+#### macOS (Homebrew)
+
+```bash
+brew install --cask unsloth-studio
+```
+
+> The `unsloth-studio` cask is prepared in-tree at [`studio/packaging/homebrew/unsloth-studio.rb`](studio/packaging/homebrew/unsloth-studio.rb) and is pending submission to [homebrew-cask](https://github.com/Homebrew/homebrew-cask). `brew install --cask unsloth-studio` will work once the cask is merged upstream; until then, use the `.dmg` download or the install script above.
+
+Apple Silicon (arm64) only — Intel Macs should use the `curl ... install.sh` script above instead.
 
 ### Unsloth Studio (web UI)
 Unsloth Studio (Beta) works on **Windows, Linux, WSL** and **macOS**.
@@ -413,8 +415,9 @@ The recommended way to fully remove Unsloth Studio is the matching uninstall scr
 
 * ​ **MacOS, WSL, Linux:** `curl -fsSL https://raw.githubusercontent.com/unslothai/unsloth/main/scripts/uninstall.sh | sh`
 * ​ **Windows (PowerShell):** `irm https://raw.githubusercontent.com/unslothai/unsloth/main/scripts/uninstall.ps1 | iex`
+* ​ **macOS (Homebrew):** `brew uninstall --cask unsloth-studio` (add `--zap` to also remove app data: `brew uninstall --zap --cask unsloth-studio`)
 
-If you only want to drop the install dir and keep the launcher/shortcut for a later reinstall, you can instead run `rm -rf ~/.unsloth/studio` (Mac/Linux/WSL) or `Remove-Item -Recurse -Force "$HOME\.unsloth\studio"` (Windows). The model cache at `~/.cache/huggingface` is not touched by any of these.
+If you only want to drop the install dir and keep the launcher/shortcut for a later reinstall, you can instead run `rm -rf ~/.unsloth/studio` (Mac/Linux/WSL) or `Remove-Item -Recurse -Force "$HOME\.unsloth\studio"` (Windows). The model cache at `~/.cache/huggingface` is not touched by any of these, including the Homebrew cask's `--zap`, which deliberately preserves it.
 
 For more info, [see our docs](https://unsloth.ai/docs/new/studio/install#uninstall).
 

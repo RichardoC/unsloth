@@ -41,6 +41,7 @@ from utils.prebuilt.whisper_layout import canonical_install_root
 from utils.whisper_cpp_freshness import (
     _INSTALL_MARKER_NAME,
     check_prebuilt_freshness,
+    install_target_tag,
     is_behind,
     latest_published_release,
     latest_release_assets,
@@ -209,9 +210,30 @@ def _active_install_is_local_link(binary: Optional[str]) -> bool:
     return _flow.active_install_is_local_link(binary, dir_name = "whisper.cpp")
 
 
+def _active_install_is_immutable_runtime(binary: Optional[str]) -> bool:
+    """True when the active whisper-server is the copy that ships inside the macOS
+    app bundle, so no update may write to it.
+
+    Same shape and same reasoning as llama_cpp_update's namesake: asked of the root
+    an apply would install into (``_whisper_install_root``), because the bundled
+    copy carries a normal marker and UNSLOTH_WHISPER_CPP_PATH points at it, so
+    every existing check calls it managed -- truthfully, and without noticing that
+    the directory is code-signed and read-only.
+    """
+    return _flow.immutable_runtime_root(_whisper_install_root(binary))
+
+
 def _local_link_status() -> dict:
     """Status payload for a local-link install: unmanaged, no update offered."""
     return _flow.local_link_status(_job, _job_lock)
+
+
+def _immutable_runtime_status(binary: Optional[str]) -> dict:
+    """Status payload for the bundled whisper.cpp: no update ever offered."""
+    marker = read_install_marker(binary) or {}
+    return _flow.immutable_runtime_status(
+        _job, _job_lock, installed_tag = marker.get("release_tag") or marker.get("tag")
+    )
 
 
 def get_update_status(*, force_refresh: bool = False) -> dict:
@@ -224,6 +246,10 @@ def get_update_status(*, force_refresh: bool = False) -> dict:
     # replace it. Bail before any network/freshness work.
     if _active_install_is_local_link(binary):
         return _local_link_status()
+    # Same for the copy inside the app bundle: read-only, signed, and changed only
+    # by updating the app. Also before any network work.
+    if _active_install_is_immutable_runtime(binary):
+        return _immutable_runtime_status(binary)
     marker = read_install_marker(binary)
 
     # No marker = source build / custom path. Offer the official prebuilt if one
@@ -235,8 +261,12 @@ def get_update_status(*, force_refresh: bool = False) -> dict:
 
     repo = (marker or {}).get("published_repo") or DEFAULT_PUBLISHED_REPO
 
-    if force_refresh and repo:
-        # Prime the cache so the freshness read below sees the newest tag.
+    if force_refresh and repo and not install_target_tag(repo):
+        # Prime the cache so the freshness read below sees the newest tag. Under
+        # the release pin there is nothing to prime -- the target is the pinned
+        # tag and the freshness read makes no GitHub call at all -- so an
+        # explicit "check now" must not spend a network round trip on an answer
+        # it will not use.
         try:
             latest_published_release(repo, force_refresh = True)
         except Exception as exc:  # pragma: no cover - network defensive
@@ -444,6 +474,12 @@ def repair_pairing_plan() -> dict:
     if _active_install_is_local_link(binary):
         plan["skip_reason"] = "local_link"
         return plan
+    # Unreachable today (the llama switch that would call this is refused first for
+    # the same root), and still checked: this is the other door into an installer
+    # run against the install directory, and it must not be the one left open.
+    if _active_install_is_immutable_runtime(binary):
+        plan["skip_reason"] = _flow.IMMUTABLE_RUNTIME_REASON
+        return plan
     marker = read_install_marker(binary)
     if marker is None:
         plan["skip_reason"] = "source_build" if binary else "not_installed"
@@ -533,6 +569,16 @@ def chained_phase_plan(
             "skip_reason": "local_link",
             "phase": None,
         }
+    # The bundled copy is signed and read-only. Skipped like a local link rather
+    # than refused, because whisper is the piggyback phase and must never be the
+    # reason a llama update cannot run.
+    if _active_install_is_immutable_runtime(binary):
+        return {
+            "status": _immutable_runtime_status(binary),
+            "update_available": False,
+            "skip_reason": _flow.IMMUTABLE_RUNTIME_REASON,
+            "phase": None,
+        }
     marker = read_install_marker(binary)
     if marker is None:
         # No marker: whisper is absent or a source/custom build. The standalone
@@ -575,9 +621,15 @@ def chained_phase_plan(
         plan["skip_reason"] = "no_install_dir"
         return plan
     plan["update_available"] = True
+    phase_repo = marker.get("published_repo") or DEFAULT_PUBLISHED_REPO
+    # Same clamp as the llama phase: a user-initiated update installs the pinned
+    # release and never past it, so a stale status cannot take whisper off the
+    # baseline (see llama_cpp_update._plan_llama_phase for the full reasoning).
+    # None when no pin is in force -- the offered tag is then used, as before.
+    pinned_target = install_target_tag(phase_repo)
     plan["phase"] = {
         "install_dir": install_dir,
-        "repo": marker.get("published_repo") or DEFAULT_PUBLISHED_REPO,
+        "repo": phase_repo,
         "asset": marker.get("asset"),
         "backend": marker.get("backend"),
         "script": script,
@@ -589,7 +641,9 @@ def chained_phase_plan(
         # (walk-back to an os-compatible release), so pinning whisper to the
         # newest tag could be an impossible pairing (min_os / requires_llama_tag)
         # on every retry.
-        "pin_release_tag": None if sys.platform == "darwin" else status.get("latest_tag"),
+        "pin_release_tag": (
+            None if sys.platform == "darwin" else (pinned_target or status.get("latest_tag"))
+        ),
     }
     return plan
 

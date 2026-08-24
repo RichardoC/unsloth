@@ -1,2 +1,12 @@
 # Triton kernels (installed with --no-deps, from source)
-triton_kernels @ git+https://github.com/triton-lang/triton.git@release/3.6.x#subdirectory=python/triton_kernels
+#
+# Pinned to a commit, not to the release/3.6.x branch it came from: a branch moves,
+# so the same installer built a different triton_kernels on different days and
+# nothing reviewed the change. The sha below is what release/3.6.x pointed at on
+# 2026-08-19. To bump it, resolve the branch again and paste the new sha:
+#
+#   git ls-remote https://github.com/triton-lang/triton refs/heads/release/3.6.x
+#
+# Keep it a full 40-character sha (an abbreviated one is not a stable git ref) and
+# keep it on release/3.6.x -- this must stay ABI-matched to the pinned torch/triton.
+triton_kernels @ git+https://github.com/triton-lang/triton.git@7c56a5e40f7fd928dfd5c72902d5def0097db73a#subdirectory=python/triton_kernels

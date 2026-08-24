@@ -1,0 +1,527 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Builds an UNSIGNED Apple Silicon .dmg on every push and attaches it to the run,
+# so a change can be tried on real hardware without going near release-desktop.yml.
+#
+# This is deliberately NOT a release. It differs from release-desktop.yml in ways
+# that matter, and the difference is the point:
+#
+#   - No Apple credentials, so no codesigning, no notarization, no stapling.
+#     release-desktop.yml fails closed without those secrets and cannot run in a
+#     fork; this can. Gatekeeper will refuse the result until the quarantine
+#     attribute is removed -- see the job summary it prints.
+#   - The updater bundle is signed with a throwaway minisign key generated per
+#     run. tauri.conf.json sets createUpdaterArtifacts, so the build wants a
+#     signing key; an ephemeral one keeps the real key out of dev builds and out
+#     of this workflow's threat model entirely. A dev build must never be
+#     something a released app would accept as an update.
+#   - Nothing is uploaded to a GitHub release, no tag is created, and no
+#     latest.json is published, so this cannot move the updater pointer that
+#     shipped apps follow.
+#
+# Toolchain versions are kept identical to release-desktop.yml on purpose: a dev
+# build that compiled with a different rustc or Node would not be evidence about
+# the release build.
+#
+# THE BUNDLED RUNTIME
+#
+# This workflow is also the proving ground for the self-contained payload:
+# scripts/build_macos_runtime.sh assembles a complete macOS arm64 runtime (CPython,
+# every Python distribution, llama.cpp, whisper.cpp, stable-diffusion.cpp, Node, the
+# OXC node_modules) and scripts/inject_macos_runtime.sh puts it inside
+# Contents/Resources/runtime, so copying the app off the .dmg is the whole
+# installation and first launch builds nothing. The verification step below does not merely check that the files landed:
+# it mounts the .dmg and runs THE BUNDLED INTERPRETER against the BUNDLED
+# site-packages, because "the payload is present" and "the payload works" are
+# different claims and only the second one matters to a user.
+#
+# The payload is assembled before `tauri build` deliberately. It is the step most
+# likely to fail (a moved wheel, a bumped pin, an unreachable release), and failing
+# it before the ~20-minute Rust compile is worth more than the little parallelism
+# lost.
+#
+# AND THE BACKEND IN IT IS THIS COMMIT'S
+#
+# The payload's `unsloth` is built from the checkout, not installed from PyPI (see
+# scripts/build_macos_runtime.sh step 3). That is what makes this workflow evidence at
+# all: while the payload carried the published wheel, every dev build was testing a new
+# Rust shell against last release's Python backend, and a backend-side regression could
+# not be caught here even in principle. It shipped exactly that way once -- the bundled
+# CLI had no _serves_backend_in_process, so the app started the backend and got
+# "Unsloth Studio not set up. Run install.sh first." The proof step below therefore does
+# not just import the CLI; it asks the CLI, inside the mounted .dmg, whether it knows it
+# is the bundled runtime.
+
+name: Desktop dev build (unsigned)
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      backend_version:
+        description: >-
+          Stamp UNSLOTH_DESKTOP_BACKEND_VERSION so the build pins the Python
+          backend to this exact version, the way a real release does (e.g.
+          2026.8.18). Leave empty to build like a dev checkout, which tracks
+          latest. Use this to exercise the pinned first-run path.
+        required: false
+        type: string
+
+concurrency:
+  # A dev build is only interesting for the newest commit on a ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dmg:
+    name: Unsigned .dmg (Apple Silicon)
+    runs-on: macos-15
+    # Raised from 60 with the bundled runtime: assembling the payload downloads and
+    # verifies ~2 GB of wheels and archives, and the .dmg round-trip that injects it
+    # rewrites a multi-gigabyte image twice. The download is the variable part -- a
+    # cross-build measured 35s with a warm HTTP path and several minutes cold -- so the
+    # headroom is for the cold case rather than the observed one.
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Same exact version release-desktop.yml pins.
+          node-version: '24.19.0'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-03-27
+        with:
+          # Must match studio/src-tauri/rust-toolchain.toml, or the target below
+          # installs against a toolchain the build will not use.
+          toolchain: '1.94.1'
+          targets: aarch64-apple-darwin
+
+      - name: Install the pinned Tauri CLI
+        # npm ci, not npm install: studio/package.json exists only to hold this
+        # pin, and ci cannot rewrite the lockfile.
+        run: npm ci --prefix studio --no-fund --no-audit
+
+      - name: Install frontend dependencies
+        # tauri.conf.json's beforeBuildCommand runs `npm run build` in
+        # studio/frontend, so its node_modules must exist before the build.
+        run: npm ci --prefix studio/frontend --no-fund --no-audit
+
+      - name: Install the pinned uv
+        # The version install.sh downloads for users, read out of install.sh rather
+        # than written here twice: the runtime payload is installed by uv, so a
+        # payload built with a different uv is a payload for an install nobody
+        # performs. Both lock generators and the assembly script refuse to run
+        # against any other version, so a drift here fails loudly rather than
+        # producing a subtly different bundle.
+        id: uv
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^UV_PINNED_VERSION="\([^"]*\)".*/\1/p' install.sh | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read UV_PINNED_VERSION out of install.sh" >&2
+            exit 1
+          fi
+          python3 -m venv "$RUNNER_TEMP/uvpin"
+          "$RUNNER_TEMP/uvpin/bin/python" -m pip install --quiet --disable-pip-version-check \
+            "uv==$version"
+          "$RUNNER_TEMP/uvpin/bin/uv" --version
+          echo "bin=$RUNNER_TEMP/uvpin/bin/uv" >> "$GITHUB_OUTPUT"
+
+      - name: Check the macOS bundle lock is not stale
+        # Cheap, and it runs before the expensive steps. A bundle lock that no
+        # longer matches a fresh regeneration means a requirements file, the torch
+        # window, the MLX ceilings or the pins moved without the lock following, and
+        # the payload assembled below would ship versions nobody reviewed.
+        env:
+          UV: ${{ steps.uv.outputs.bin }}
+        run: bash scripts/gen_macos_bundle_lock.sh --check
+
+      - name: Assemble the bundled runtime payload
+        # Everything the app needs at runtime, verified at build time: CPython, all
+        # Python distributions under --require-hashes, llama.cpp, whisper.cpp,
+        # stable-diffusion.cpp, Node and the OXC node_modules. No skip flags: those
+        # mark the payload incomplete and the proof step below refuses it. Runs BEFORE
+        # tauri build so a payload failure costs seconds rather than a full Rust compile.
+        env:
+          UV: ${{ steps.uv.outputs.bin }}
+        run: |
+          set -euo pipefail
+          bash scripts/build_macos_runtime.sh --out "$RUNNER_TEMP/runtime"
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+            "$RUNNER_TEMP/runtime/BUNDLE_MANIFEST.json"
+
+      - name: Generate a throwaway updater signing key
+        run: |
+          set -euo pipefail
+          # Never the real key. A dev build signed with the release key would be
+          # accepted as an update by shipped apps.
+          npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/dev-updater.key" -p ""
+
+      - name: Build the .dmg
+        env:
+          # The PATH form, not the key contents. Writing key material into
+          # $GITHUB_ENV would have the runner echo it in plaintext in the env
+          # block of every later step -- harmless for a per-run throwaway, but a
+          # pattern nobody should copy with a real key.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/dev-updater.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          # Empty unless dispatched with a value, in which case the build pins
+          # the backend exactly as a release does.
+          UNSLOTH_DESKTOP_BACKEND_VERSION: ${{ inputs.backend_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${UNSLOTH_DESKTOP_BACKEND_VERSION:-}" ]; then
+            echo "backend pinned to $UNSLOTH_DESKTOP_BACKEND_VERSION"
+          else
+            echo "backend unpinned (dev behaviour: first run tracks latest)"
+            unset UNSLOTH_DESKTOP_BACKEND_VERSION
+          fi
+          # app AND dmg, not dmg alone: `--bundles dmg` asks tauri for the disk image
+          # only, and it does not leave the .app behind in bundle/macos -- the next
+          # step needs it, because the payload is injected into both so a developer
+          # poking at target/ sees the same bundle a user mounts.
+          npx --prefix studio tauri build --target aarch64-apple-darwin --bundles app,dmg
+
+      - name: Locate the .dmg and rename it for this commit
+        id: dmg
+        run: |
+          set -euo pipefail
+          src="$(find studio/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg \
+                   -name '*.dmg' -maxdepth 1 -print -quit)"
+          if [ -z "$src" ]; then
+            echo "::error::no .dmg was produced" >&2
+            exit 1
+          fi
+          out="$RUNNER_TEMP/Unsloth-Desktop-dev-${GITHUB_SHA:0:8}-unsigned-MacOS.dmg"
+          mv "$src" "$out"
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$out")" >> "$GITHUB_OUTPUT"
+          # app_path is the .app tauri left in the target dir; the payload goes into
+          # both it and the .dmg, so a developer poking at target/ sees the same
+          # bundle a user would mount.
+          app="$(find studio/src-tauri/target/aarch64-apple-darwin/release/bundle/macos \
+                   -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$app" ]; then
+            echo "::error::no .app was produced alongside the .dmg" >&2
+            exit 1
+          fi
+          echo "app_path=$app" >> "$GITHUB_OUTPUT"
+
+      - name: Inject the bundled runtime into the .app and the .dmg
+        # Not a tauri `resources` entry: tauri's resource copier does not preserve
+        # the payload's symlinks (python/bin/python3 -> python3.13, and llama.cpp's
+        # whole libggml-*.dylib version chain), and declaring it in
+        # tauri.macos.conf.json would make every macOS build, release included,
+        # require a payload -- which is a separate stage. See the script's header.
+        run: |
+          set -euo pipefail
+          bash scripts/inject_macos_runtime.sh \
+            --payload "$RUNNER_TEMP/runtime" \
+            --app "${{ steps.dmg.outputs.app_path }}" \
+            --dmg "${{ steps.dmg.outputs.path }}"
+
+      - name: Record the .dmg digest and size
+        id: shipped
+        # After injection, not before: the .dmg the artifact upload publishes is the
+        # one that has the runtime in it, so that is the one whose digest is quoted.
+        run: |
+          set -euo pipefail
+          path="${{ steps.dmg.outputs.path }}"
+          shasum -a 256 "$path"
+          echo "sha256=$(shasum -a 256 "$path" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "dmg_mib=$(( $(stat -f%z "$path") / 1048576 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm it is a real arm64 bundle, and unsigned
+        run: |
+          set -euxo pipefail
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/devdmg "${{ steps.dmg.outputs.path }}"
+          app="$(find /tmp/devdmg -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app"
+          exe="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          file "$exe" | grep -q 'arm64'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist"
+          # Expected to fail: this build is not notarized. Asserting that keeps
+          # the workflow honest about what it produces -- if this ever starts
+          # passing, something is signing dev builds.
+          if spctl --assess --type execute "$app" 2>/dev/null; then
+            echo "::error::a dev build passed Gatekeeper; it should not be signed" >&2
+            hdiutil detach /tmp/devdmg
+            exit 1
+          fi
+          echo "unsigned as expected"
+          hdiutil detach /tmp/devdmg
+
+      - name: Prove the bundled runtime works from inside the mounted .dmg
+        # The point of the whole payload is that copying the app off the .dmg is the
+        # entire installation, so this asserts against the .dmg's own copy -- not the
+        # staging directory, not the target/ tree -- and it RUNS things rather than
+        # checking that files exist. It uses the app's own flags and its own
+        # site-packages mechanism, so a passing import here is an import the app can
+        # make -- see the note at the interpreter invocation for why PYTHONPATH is not
+        # that mechanism.
+        #
+        # No writes to the mounted image (it is attached read-only) and
+        # PYTHONDONTWRITEBYTECODE=1, because that is how the app runs it: the payload
+        # lives in a read-only bundle, so anything that needs to write a .pyc beside
+        # its source must fail here and not on a user's Mac.
+        run: |
+          set -euxo pipefail
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/rtdmg "${{ steps.dmg.outputs.path }}"
+          trap 'hdiutil detach /tmp/rtdmg || true' EXIT
+          app="$(find /tmp/rtdmg -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app"
+          runtime="$app/Contents/Resources/runtime"
+
+          # The layout contract studio/src-tauri resolves.
+          test -d "$runtime/python"
+          test -d "$runtime/site-packages"
+          test -d "$runtime/llama.cpp"
+          test -d "$runtime/whisper.cpp"
+          test -d "$runtime/stable-diffusion.cpp"
+          test -d "$runtime/node"
+          test -d "$runtime/oxc-node-modules"
+          test -f "$runtime/BUNDLE_MANIFEST.json"
+
+          # The manifest parses, is the schema this workflow expects, and does not
+          # advertise itself as incomplete.
+          python3 - "$runtime/BUNDLE_MANIFEST.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          manifest = json.load(open(sys.argv[1]))
+          assert manifest["schema_version"] == 1, manifest["schema_version"]
+          for key in ("generator", "generator_version", "target", "python",
+                      "components", "locks", "distributions", "sizes_bytes"):
+              assert key in manifest, f"BUNDLE_MANIFEST.json is missing {key!r}"
+          assert manifest["python"]["venv"] is False
+          assert manifest["distribution_count"] > 100, manifest["distribution_count"]
+          for component in ("python", "llama_cpp", "whisper_cpp", "sd_cpp", "node"):
+              assert manifest["components"][component]["asset_sha256"], component
+          # sd.cpp is the one component whose install-time path verifies against a digest
+          # GitHub serves beside the asset. The bundle must not: its digest comes from the
+          # pins file in this repo, and this is where a regression to the old path shows up.
+          assert manifest["components"]["sd_cpp"]["pins_file"] == "studio/macos_runtime_pins.json", (
+              manifest["components"]["sd_cpp"]
+          )
+          assert not manifest["incomplete"], manifest["incomplete"]
+          # The payload's `unsloth` must be THIS commit's, built from the checkout, and
+          # the manifest must say so rather than let `locks` imply the whole payload came
+          # hash-verified off an index. A payload whose backend is the published wheel is
+          # a payload nobody's changes were tested in.
+          local = manifest["local_provenance"]
+          assert local["index_verified"] is False, local
+          entry = next(item for item in local["distributions"] if item["name"] == "unsloth")
+          assert entry["provenance"] == "local-checkout", entry
+          assert entry["index_verified"] is False, entry
+          assert entry["wheel_tag"] == "py3-none-any", entry
+          assert entry["wheel_sha256"], entry
+          expected_commit = os.environ["GITHUB_SHA"]
+          assert entry["repo_commit"] == expected_commit, (
+              f'the payload records unsloth built from {entry["repo_commit"]!r}, but this '
+              f'build is {expected_commit!r}'
+          )
+          assert manifest["components"]["unsloth_local_wheel"]["repo_commit"] == expected_commit
+          assert manifest["distributions"]["unsloth"] == entry["version"], (
+              manifest["distributions"]["unsloth"], entry["version"]
+          )
+          print(f"manifest ok: {manifest['distribution_count']} distributions, "
+                f"python {manifest['python']['version']}, "
+                f"unsloth {entry['version']} built from {entry['repo_commit'][:12]} "
+                f"(index copy {entry['replaced_index_version']} replaced)")
+          PY
+
+          # llama.cpp is there AND executable, in the layout the installer uses.
+          server="$runtime/llama.cpp/build/bin/llama-server"
+          test -x "$server"
+          file "$server" | grep -q 'arm64'
+          "$server" --version 2>&1 | head -5
+          test -x "$runtime/whisper.cpp/build/bin/whisper-server"
+          test -x "$runtime/node/bin/node"
+
+          # stable-diffusion.cpp, the same way: both binaries present, executable and
+          # arm64, and the CLI actually identifies itself. Without this the app would
+          # still generate images -- by downloading 45 MiB the first time somebody
+          # pressed Generate, which is the thing the payload exists to abolish.
+          sd_cli="$runtime/stable-diffusion.cpp/build/bin/sd-cli"
+          sd_server="$runtime/stable-diffusion.cpp/build/bin/sd-server"
+          test -x "$sd_cli"
+          test -x "$sd_server"
+          file "$sd_cli" | grep -q 'arm64'
+          file "$sd_server" | grep -q 'arm64'
+          # `|| true`: older sd-cli builds print their usage and exit non-zero, which
+          # under pipefail would fail the step for the wrong reason. The output is what
+          # is being judged -- the same predicate sd_cpp_engine.help_text_identifies_sd_cpp
+          # uses to decide an executable really is stable-diffusion.cpp.
+          sd_help="$("$sd_cli" --help 2>&1 || true)"
+          printf '%s\n' "$sd_help" | head -5
+          printf '%s\n' "$sd_help" | grep -qi 'stable-diffusion\|--cfg-scale'
+          # Pruned on purpose; a reappearance means the prune list stopped applying.
+          test ! -d "$runtime/node/include"
+
+          # THE claim: the bundled interpreter, against the bundled site-packages,
+          # imports the stack. This is the assertion that a first run needs no
+          # network and no install.
+          py="$runtime/python/bin/python3"
+          test -x "$py"
+          # The flags and the path mechanism the app itself uses, not a bespoke pair.
+          # `-I` implies `-E`, so PYTHONPATH is DISCARDED -- site-packages sits outside
+          # the interpreter's prefix, so under -I the only route to it is a bootstrap
+          # that reads a variable -E knows nothing about. Probing with `-I -P` plus
+          # PYTHONPATH therefore failed with ModuleNotFoundError while the app itself
+          # was fine, which is a probe bug masquerading as a payload bug. -B replaces
+          # PYTHONDONTWRITEBYTECODE for the same reason. See BUNDLED_CLI_ENTRYPOINT in
+          # studio/src-tauri/src/bundled_runtime.rs.
+          export UNSLOTH_BUNDLED_SITE_PACKAGES="$runtime/site-packages"
+          # Exported because the app exports them for the Python subprocesses the
+          # backend spawns; both are inert for these -I invocations.
+          export PYTHONHOME="$runtime/python"
+          export PYTHONDONTWRITEBYTECODE=1
+          boot='import os, sys; sys.path.append(os.environ["UNSLOTH_BUNDLED_SITE_PACKAGES"])'
+          "$py" -X utf8 -I -B -c "$boot; print(sys.version)"
+          "$py" -X utf8 -I -B -c "$boot; import fastapi, transformers; print(\"ok\")"
+          "$py" -X utf8 -I -B -c "$boot; import torch; print(\"torch\", torch.__version__, \"mps\", torch.backends.mps.is_available())"
+          # The entrypoint the app actually calls, imported the way the app imports it.
+          # If this resolves, `unsloth studio` has a CLI to run from the bundle.
+          "$py" -X utf8 -I -B -c "$boot; sys.argv[0] = \"unsloth\"; from unsloth_cli import app; print(\"cli ok\")"
+          "$py" -X utf8 -I -B -c "$boot; import mlx.core as mx; print(\"mlx\", mx.default_device())"
+          "$py" -X utf8 -I -B -c "$boot; import diffusers, datasets, uvicorn, pymupdf, bitsandbytes, unsloth_zoo; print(\"stack ok\")"
+          # -m cannot work here: -I discards the variable that puts site-packages on
+          # the path, so the module is unimportable. The app runs -c with a bootstrap
+          # for exactly this reason; the CLI import above is the equivalent proof.
+
+          # THE SEAM, from inside the mounted .dmg. Everything above passed on the build
+          # that shipped broken: the payload imported fine, and then the CLI decided it
+          # was an ordinary install with no studio venv and printed "Unsloth Studio not
+          # set up. Run install.sh first." So ask the two questions that decide it --
+          # does the CLI recognise this interpreter as the bundled runtime, and does the
+          # launch path therefore serve the backend in-process -- with the same
+          # environment the app hands the backend process.
+          test -f "$runtime/site-packages/unsloth_cli/_bundled_runtime.py"
+          test -f "$runtime/site-packages/studio/backend/utils/bundled_runtime.py"
+          "$py" -X utf8 -I -B -c "$boot
+          from pathlib import Path
+          from unsloth_cli import _bundled_runtime
+          from unsloth_cli.commands import studio as studio_cmd
+          root = _bundled_runtime.bundled_runtime_root()
+          assert root == Path(os.environ['UNSLOTH_BUNDLED_SITE_PACKAGES']).resolve().parent, root
+          assert _bundled_runtime.bundled_site_packages().is_dir()
+          assert studio_cmd._serves_backend_in_process() is True, (
+              'the bundled CLI does not know it carries the backend; unsloth studio '
+              'would exit with \"Unsloth Studio not set up. Run install.sh first.\"'
+          )
+          assert studio_cmd._in_managed_studio_venv() is False, (
+              'a bundled runtime is not the managed venv, and must not be mistaken for one'
+          )
+          print('seam ok:', root)"
+          # And the backend's own mirror of the same predicate: it runs from interpreters
+          # with no unsloth_cli on sys.path, so it carries its own copy and the two must
+          # agree about the same payload.
+          "$py" -X utf8 -I -B -c "$boot
+          from studio.backend.utils import bundled_runtime as backend_seam
+          from unsloth_cli import _bundled_runtime
+          assert backend_seam.bundled_runtime_root() == _bundled_runtime.bundled_runtime_root()
+          print('backend seam ok')"
+
+          # Node runs the OXC validator against the prefetched, darwin-arm64
+          # node_modules. A Linux binding would fail exactly here.
+          #
+          # NODE_PATH is required, not decorative: the payload's directory is called
+          # oxc-node-modules, not node_modules, so oxc-parser cannot resolve its flat
+          # siblings -- including the native @oxc-parser/binding-darwin-arm64 its
+          # generated bindings.js loads through its own createRequire -- by the normal
+          # upward walk. This is the same variable local_callable_validators.py sets
+          # for the real validator, so the probe exercises the shipped mechanism
+          # rather than a bespoke one.
+          NODE_PATH="$runtime/oxc-node-modules" \
+          "$runtime/node/bin/node" -e \
+            'const {parseSync} = require(process.argv[1] + "/oxc-parser");
+             const r = parseSync("t.ts", "const x: number = 1;");
+             if (r.errors.length) { throw new Error(JSON.stringify(r.errors)); }
+             console.log("oxc ok");' "$runtime/oxc-node-modules"
+
+      - name: Upload the .dmg
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.dmg.outputs.name }}
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Explain how to run it
+        # The size rows are not decoration. A self-contained runtime costs hundreds of
+        # megabytes on every single build, and a number that only appears in a log line
+        # stops being looked at. Printing it here keeps the cost a decision rather than
+        # a drift, and the per-component breakdown says where a jump came from.
+        env:
+          DMG_MIB: ${{ steps.shipped.outputs.dmg_mib }}
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/runtime/BUNDLE_MANIFEST.json"
+          {
+            echo "### Unsigned dev build"
+            echo
+            echo "\`${{ steps.dmg.outputs.name }}\` — download it from the artifacts on this run."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| commit | \`${GITHUB_SHA:0:8}\` |"
+            echo "| sha256 | \`${{ steps.shipped.outputs.sha256 }}\` |"
+            echo "| dmg size | **${DMG_MIB} MiB** (compressed, runtime included) |"
+            echo "| backend | ${{ inputs.backend_version && format('pinned to {0}', inputs.backend_version) || 'unpinned (tracks latest on first run)' }} |"
+            echo
+            echo "#### Bundled runtime"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$manifest" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+
+          manifest = json.load(open(sys.argv[1]))
+          print(f"Python {manifest['python']['version']}, "
+                f"{manifest['distribution_count']} distributions, no venv. "
+                f"First launch installs nothing.")
+          print()
+          # Which `unsloth` is in there. Not a detail: while this said "from PyPI" the
+          # dev build was proving nothing about the backend in the commit under test.
+          local = next(
+              item for item in manifest["local_provenance"]["distributions"]
+              if item["name"] == "unsloth"
+          )
+          print(f"Backend in the payload: `unsloth {local['version']}` built from this "
+                f"checkout (`{(local['repo_commit'] or 'unknown')[:12]}`), replacing the "
+                f"index copy `{local['replaced_index_version']}`. Every other "
+                f"distribution came from the locks under `--require-hashes`.")
+          print()
+          print("| component | installed |")
+          print("| --- | --- |")
+          for name, size in sorted(manifest["sizes_bytes"].items(), key = lambda kv: -kv[1]):
+              print(f"| `{name}` | {size / (1024 * 1024):.0f} MiB |")
+          print(f"| **total** | **{manifest['total_bytes'] / (1024 ** 3):.2f} GiB** |")
+          print()
+          freed = manifest["pruned"]["bytes_freed"] / (1024 * 1024)
+          print(f"Pruned {len(manifest['pruned']['removed'])} paths "
+                f"({freed:.0f} MiB): {', '.join(manifest['pruned']['removed'])}")
+          PY
+          {
+            echo
+            echo "This build is **not signed or notarized**, so Gatekeeper will refuse it."
+            echo "After copying the app to /Applications:"
+            echo
+            echo '```sh'
+            echo 'xattr -dr com.apple.quarantine "/Applications/Unsloth.app"'
+            echo '```'
+            echo
+            echo "Its updater is signed with a throwaway key, so it cannot install"
+            echo "real updates and shipped apps will not accept it as one."
+          } >> "$GITHUB_STEP_SUMMARY"

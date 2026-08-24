@@ -7,6 +7,7 @@ import test from "node:test";
 // use-tauri-backend.ts pulls in React and the Tauri APIs, so the message choice
 // lives in its own module and is driven directly here.
 import {
+  BUNDLED_RUNTIME_UNUSABLE,
   WORKING_DIRECTORY_UNAVAILABLE,
   PATH_SETTING_UNRESOLVABLE,
   preflightStaleMessage,
@@ -44,6 +45,20 @@ test("a genuinely stale install still says to update", () => {
 
 test("the reason string matches the one the Rust side sends", () => {
   assert.equal(WORKING_DIRECTORY_UNAVAILABLE, "working_directory_unavailable");
+  assert.equal(BUNDLED_RUNTIME_UNUSABLE, "bundled_runtime_unusable");
+});
+
+test("a damaged bundled runtime says to reinstall the app, not to update", () => {
+  // The runtime ships inside the .app, so `unsloth studio update` is not merely
+  // unhelpful here -- there is no managed install under the profile for it to
+  // touch. This reason arrives as ManagedProbe::Unavailable, which preflight maps
+  // to managed_stale with can_auto_repair false, so it lands in this function and
+  // used to fall through to "Managed Unsloth install is too old".
+  const message = preflightStaleMessage("managed_stale", BUNDLED_RUNTIME_UNUSABLE);
+  assert.match(message, /built-in runtime is damaged/);
+  assert.match(message, /Download Unsloth again/);
+  assert.doesNotMatch(message, UPDATE_ADVICE);
+  assert.doesNotMatch(message, MANAGED_TOO_OLD);
 });
 
 test("the roaming-profile cause is offered on Windows and withheld elsewhere", () => {

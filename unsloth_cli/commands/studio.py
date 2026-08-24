@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import List, Literal, Optional, Sequence, Tuple
 import typer
 
-from unsloth_cli import _studio_deps, _studio_runtime_gate
+from unsloth_cli import _bundled_runtime, _studio_deps, _studio_runtime_gate
 from unsloth_cli._inference import SpeculativeType
 from unsloth_cli.commands import _password_prompt
 
@@ -370,6 +370,42 @@ def _studio_venv_python() -> Optional[Path]:
     return p if p.is_file() else None
 
 
+def _in_managed_studio_venv() -> bool:
+    """Whether this interpreter IS the managed studio venv's."""
+    return sys.prefix.startswith(str(STUDIO_HOME / "unsloth_studio"))
+
+
+def _serves_backend_in_process() -> bool:
+    """Whether the interpreter already running this code carries the backend, so
+    the launch paths must serve in-process instead of looking for a second one.
+
+    Two ways that is true, and they are the same claim:
+
+      * the managed studio venv -- ``<STUDIO_HOME>/unsloth_studio`` -- which is
+        what ``install.sh`` builds and re-execs into. Unchanged.
+      * the runtime baked into ``Unsloth.app``, where ``sys.prefix`` is
+        ``…/Resources/runtime/python`` and the distributions live beside it in
+        ``runtime/site-packages`` (see ``unsloth_cli/_bundled_runtime``). There is
+        no ``<STUDIO_HOME>/unsloth_studio/bin/python`` on such a machine and never
+        will be -- copying the app off the .dmg is the whole installation -- so the
+        venv probe would report "Unsloth Studio not set up. Run install.sh first."
+        and exit 1 after preflight had already said Ready.
+
+    Nothing else changes for either: the caller still validates the frontend and
+    the in-process backend import before the pre-exposure gate can strip the
+    seeded password, still clears a contradicting HSA override before any launch,
+    and still serves through ``_load_run_module``.
+
+    A bundled runtime is detected from three corroborating facts, not from the
+    environment variable alone, so a stray ``UNSLOTH_BUNDLED_SITE_PACKAGES`` in a
+    user's shell cannot talk an ordinary install out of finding its venv; the
+    predicate and its reasoning are in ``unsloth_cli/_bundled_runtime``.
+    """
+    if _bundled_runtime.bundled_runtime_root() is not None:
+        return True
+    return _in_managed_studio_venv()
+
+
 def _managed_cli_site_packages_layout(python: Path) -> bool:
     """On-disk hint that the venv holding *python* still carries the CLI.
 
@@ -596,10 +632,20 @@ def _clear_hsa_override_before_launch(silent: bool = False) -> Optional[str]:
     to ``studio_run``, so both would otherwise reach llama-server and the backend
     with the contradicting override still set. Idempotent, so chained entry points
     are free to call it twice.
+
+    Still called, and still called FIRST, when the launch is the runtime baked into
+    Unsloth.app -- the bundled path takes the in-process branch, which is one of
+    the three this chokepoint exists to cover. It just has nothing to find there:
+    the check reads a venv's ``lib/python*/site-packages`` for AMD's ``rocm``
+    meta-package, the bundle keeps its distributions in ``runtime/site-packages``
+    instead, and that payload is macOS/arm64 with no ROCm stack in it at all. So
+    the guard is inapplicable rather than skipped, and this note is here so a
+    future Linux payload knows it has to teach _installed_rocm_single_arch the
+    bundle layout rather than assume it is already covered.
     """
     _venv = STUDIO_HOME / "unsloth_studio"
     _arch = _clear_hsa_override_contradicting_install(
-        Path(sys.prefix) if sys.prefix.startswith(str(_venv)) else _venv
+        Path(sys.prefix) if _in_managed_studio_venv() else _venv
     )
     if _arch is not None and not silent:
         typer.echo(
@@ -1905,8 +1951,13 @@ def studio_default(
     # launcher BEFORE the gate: a headless gate strips the seeded
     # .bootstrap_password, so aborting afterward (venv/run.py missing) would leave
     # must_change_password=1 with no password to log in.
-    studio_venv_dir = STUDIO_HOME / "unsloth_studio"
-    in_studio_venv = sys.prefix.startswith(str(studio_venv_dir))
+    #
+    # "Already in it" now also covers the runtime baked into Unsloth.app, which
+    # carries the backend in the same interpreter and has no studio venv to find
+    # (_serves_backend_in_process). Everything downstream of this flag -- the
+    # frontend/backend validation before the strip, _child_self_suppresses, the
+    # in-process serve -- is exactly what the in-venv case already does.
+    in_studio_venv = _serves_backend_in_process()
     # Before any of the three launch paths below, and before the environment is handed
     # to a child: an override contradicting single-arch wheels makes every kernel launch
     # fail, and the installer's own unset cannot reach a launch it does not perform (#7331).
@@ -2588,8 +2639,12 @@ def run(
     # the child launcher BEFORE the gate: a headless gate strips the seeded
     # .bootstrap_password, so aborting afterward (venv/entry point missing) would
     # leave must_change_password=1 with no password to log in.
-    studio_venv_dir = STUDIO_HOME / "unsloth_studio"
-    in_studio_venv = sys.prefix.startswith(str(studio_venv_dir))
+    #
+    # Same seam as studio_default: the runtime inside Unsloth.app is already the
+    # right interpreter, and there is no `unsloth` console script in the bundle to
+    # re-exec through anyway (the app reaches the CLI as `python3 -c
+    # <bootstrap>`), so it takes the in-process branch below.
+    in_studio_venv = _serves_backend_in_process()
     studio_bin = None
     resolved_frontend = frontend
     if not in_studio_venv:

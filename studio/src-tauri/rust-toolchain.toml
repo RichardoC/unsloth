@@ -1,0 +1,17 @@
+# Pins the compiler for desktop builds. Without this the release workflow's
+# dtolnay/rust-toolchain action defaults its `toolchain` input to `stable`, so
+# every build compiled with whatever rustc was current that day -- the single
+# largest floating input in the desktop build, and an unreviewed one.
+#
+# `rust-version = "1.89"` in Cargo.toml is only a floor (the oldest rustc that
+# still compiles this crate); this is the exact compiler releases are built
+# with. release-desktop.yml passes the same version to the toolchain action so
+# the cross-compilation targets get installed against it -- change both
+# together or the target install lands on a different toolchain.
+#
+# Targets are deliberately absent: the workflow supplies them per matrix leg,
+# and listing aarch64-apple-darwin here would make every Linux contributor
+# download an Apple std it will never use.
+[toolchain]
+channel = "1.94.1"
+profile = "minimal"

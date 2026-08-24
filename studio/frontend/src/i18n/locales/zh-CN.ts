@@ -805,6 +805,7 @@ export const zhCN = {
           notInstalled: "未找到受管理的 llama.cpp 安装，因此没有可切换的后端。",
           localLink: "llama.cpp 是你自己链接的本地目录，Unsloth 不会替换它。",
           sourceBuild: "此 llama.cpp 由源码编译，无法在这里切换后端。",
+          immutableRuntime: "llama.cpp 随 Unsloth 应用一起提供，因此是只读的。请更新应用来更改它。",
           unresolved: "无法检查可用的后端。请检查网络连接后重试。",
         },
         // 不显示：用于设置搜索的额外词条。

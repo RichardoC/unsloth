@@ -136,6 +136,11 @@ else
     _ARCH=arm64
     _VENV_PY="$FAKE_PY"
     PACKAGE_NAME=unsloth
+    # The backend specs install.sh derives before this function runs; these are the
+    # unpinned values (no UNSLOTH_BACKEND_VERSION), which is what the command
+    # asserted below expects. tests/sh/test_backend_version_pin.sh covers the pin.
+    _UNSLOTH_SPEC=unsloth
+    _UNSLOTH_UPGRADE_PKG=unsloth
     C_WARN=warn
     SKIP_TORCH=false
     _OVERRIDES_FILE="$WORK4/missing-repository-override.txt"

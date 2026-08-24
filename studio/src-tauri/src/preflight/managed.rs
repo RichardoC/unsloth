@@ -15,6 +15,12 @@ const MANAGED_CAPABILITY_CACHE_SCHEMA: u16 = 3;
 
 /// The install is fine; the directory its children must run from is not reachable.
 pub(super) const WORKING_DIRECTORY_UNAVAILABLE: &str = "working_directory_unavailable";
+/// The runtime inside this app bundle cannot run. Not repairable by definition: the
+/// bundle is signed and read-only, and the way it changes is an app update. Mirror
+/// this in the frontend message map (`hooks/backend-preflight-message.ts`) when that
+/// file is next touched; until then it falls through to the generic stale message,
+/// which is wrong about the fix but not about the state.
+pub(super) const BUNDLED_RUNTIME_UNUSABLE: &str = "bundled_runtime_unusable";
 /// The profile is reachable but a user-written path setting is not resolvable,
 /// so reinstalling hits the same wall. Mirrored in the frontend message map.
 pub(super) const PATH_SETTING_UNRESOLVABLE: &str = "path_setting_unresolvable";
@@ -676,7 +682,114 @@ pub(super) async fn probe_managed_bin(bin: PathBuf) -> ManagedProbe {
     }
 }
 
+/// What preflight asks of a runtime that ships inside the app.
+///
+/// Three of the four things `probe_managed_bin` does no longer apply, and saying so
+/// explicitly beats doing them anyway:
+///
+///   * **staleness** (`desktop-capabilities`, `managed_backend_version_stale_reason`)
+///     asks whether the installed Python stack matches the desktop shell that wants
+///     to drive it. For a bundled runtime the shell and the stack are the same build
+///     in the same `.app`, so their agreement is a build-time invariant rather than
+///     a runtime measurement. The invariant is not dropped, only moved: the protocol
+///     and version fields of the backend that actually starts are still checked over
+///     `/api/health` by `preflight::backend`, so a payload built against a different
+///     shell is still caught -- one probe later, against the process that matters.
+///   * **the capability cache** exists to avoid re-running that probe. With no probe
+///     there is nothing to cache, and nothing that could change underneath a cached
+///     answer, since no update rewrites the bundle.
+///   * **repair** cannot apply: see `preflight::release_auto_repair`.
+///
+/// Two checks remain, and both still mean something. The structural check
+/// ([`crate::bundled_runtime::BundledRuntime::health`]) catches a payload that never
+/// arrived or arrived truncated. The `-h` probe stays because it is the only thing
+/// that proves this interpreter EXECUTES here: quarantine, a wrong-architecture
+/// payload and a botched relocation all leave a structurally perfect tree, and the
+/// alternative to catching them here is an unexplained backend crash. It is also
+/// the same subprocess the launch already paid for.
+async fn probe_bundled_runtime(runtime: &crate::bundled_runtime::BundledRuntime) -> ManagedProbe {
+    let bin = runtime.interpreter();
+    let health = runtime.health();
+    if let Err(reason) = &health {
+        warn!("Managed preflight: the bundled runtime is not usable: {reason}");
+    }
+    // Unchanged from the managed path, and still true here: an unreachable profile
+    // or an unresolvable path setting fails every child, and neither is a broken
+    // runtime. The data root lives under the profile whether the code does or not.
+    let context = crate::process::managed_cli_context_error();
+    if let Some(error) = &context {
+        info!("Managed preflight: no usable managed context for the bundled runtime: {error}");
+    }
+    // Only asked when there is something to ask it of: a structurally broken payload
+    // has no interpreter to run, and an unreachable profile has nowhere to run it.
+    // `Err` from the probe means it never ran, hence `None` rather than `Some(false)`.
+    let liveness = if health.is_ok() && context.is_none() {
+        run_cli_probe(&bin, &["-h"]).await.ok()
+    } else {
+        None
+    };
+
+    bundled_probe_verdict(
+        bin,
+        health,
+        context.as_ref().map(context_reason),
+        liveness,
+        // Re-asked after the probe: the profile can drop between the check above and
+        // the child actually starting.
+        working_directory_reason,
+    )
+}
+
+/// The whole decision table for a bundled runtime, with the three facts already
+/// gathered so it can be read -- and tested -- without a filesystem or a subprocess.
+fn bundled_probe_verdict(
+    bin: PathBuf,
+    health: Result<(), String>,
+    context: Option<String>,
+    liveness: Option<bool>,
+    late_context: impl Fn() -> Option<String>,
+) -> ManagedProbe {
+    // Unavailable, not Stale: there is nothing under the profile to repair, and
+    // `Stale` is the state a repair is offered for.
+    if health.is_err() {
+        return ManagedProbe::Unavailable {
+            reason: BUNDLED_RUNTIME_UNUSABLE.to_string(),
+        };
+    }
+    if let Some(reason) = context {
+        return ManagedProbe::Stale { bin, reason };
+    }
+    match liveness {
+        Some(true) => ManagedProbe::Ready { bin },
+        // The probe never ran, so the runtime was not found wanting.
+        None => ManagedProbe::Stale {
+            bin,
+            reason: late_context().unwrap_or_else(|| WORKING_DIRECTORY_UNAVAILABLE.to_string()),
+        },
+        Some(false) => match late_context() {
+            Some(reason) => ManagedProbe::Stale { bin, reason },
+            None => {
+                warn!("Managed preflight: the bundled runtime did not run");
+                ManagedProbe::Unavailable {
+                    reason: BUNDLED_RUNTIME_UNUSABLE.to_string(),
+                }
+            }
+        },
+    }
+}
+
 pub(super) async fn probe_managed_install() -> ManagedProbe {
+    if let Some(runtime) = crate::bundled_runtime::bundled_runtime() {
+        let started = Instant::now();
+        let result = probe_bundled_runtime(runtime).await;
+        info!(
+            "Managed preflight: bundled runtime probe result {:?} in {}ms",
+            result,
+            started.elapsed().as_millis()
+        );
+        return result;
+    }
+
     let started = Instant::now();
     let result = match crate::process::find_unsloth_binary() {
         Some(bin) => probe_managed_bin(bin).await,
@@ -976,5 +1089,78 @@ mod tests {
         assert!(is_context_reason(&bare));
         assert!(is_context_reason(WORKING_DIRECTORY_UNAVAILABLE));
         assert!(!is_context_reason("cli_unusable"));
+    }
+
+    #[test]
+    fn the_bundled_runtime_verdict_is_ready_broken_or_nowhere_to_run() {
+        let bin = PathBuf::from(
+            "/Applications/Unsloth.app/Contents/Resources/runtime/python/bin/python3",
+        );
+        let no_late_context = || None;
+        let late_context = || Some(WORKING_DIRECTORY_UNAVAILABLE.to_string());
+        let broken = || Err("BUNDLE_MANIFEST.json is missing".to_string());
+
+        // Whole payload that runs: ready, with no capability probe and no cache.
+        assert_eq!(
+            bundled_probe_verdict(bin.clone(), Ok(()), None, Some(true), no_late_context),
+            ManagedProbe::Ready { bin: bin.clone() }
+        );
+
+        // A payload that did not arrive whole, and one that did but cannot execute
+        // (quarantine, wrong architecture, botched relocation): both Unavailable,
+        // which is the state that carries no repair offer and no bin to repair.
+        for liveness in [None, Some(false)] {
+            assert_eq!(
+                bundled_probe_verdict(bin.clone(), broken(), None, liveness, no_late_context),
+                ManagedProbe::Unavailable {
+                    reason: BUNDLED_RUNTIME_UNUSABLE.to_string()
+                }
+            );
+        }
+        assert_eq!(
+            bundled_probe_verdict(bin.clone(), Ok(()), None, Some(false), no_late_context),
+            ManagedProbe::Unavailable {
+                reason: BUNDLED_RUNTIME_UNUSABLE.to_string()
+            }
+        );
+
+        // An unreachable profile is not a broken runtime, and its reason must
+        // survive: the data root still lives under the profile, and the fix is to
+        // reconnect it rather than to reinstall the app.
+        assert_eq!(
+            bundled_probe_verdict(
+                bin.clone(),
+                Ok(()),
+                Some(WORKING_DIRECTORY_UNAVAILABLE.to_string()),
+                None,
+                no_late_context
+            ),
+            ManagedProbe::Stale {
+                bin: bin.clone(),
+                reason: WORKING_DIRECTORY_UNAVAILABLE.to_string()
+            }
+        );
+        // ...including when the profile drops between the check and the child, in
+        // which case the probe result is discarded in favour of the context.
+        for liveness in [None, Some(false)] {
+            assert_eq!(
+                bundled_probe_verdict(bin.clone(), Ok(()), None, liveness, late_context),
+                ManagedProbe::Stale {
+                    bin: bin.clone(),
+                    reason: WORKING_DIRECTORY_UNAVAILABLE.to_string()
+                }
+            );
+        }
+        // A broken payload still outranks it: no working directory repairs a
+        // runtime that is not there.
+        assert_eq!(
+            bundled_probe_verdict(bin.clone(), broken(), None, None, late_context),
+            ManagedProbe::Unavailable {
+                reason: BUNDLED_RUNTIME_UNUSABLE.to_string()
+            }
+        );
+        // The reason is its own thing, so a context message can never be mistaken
+        // for a broken bundle by the repair guard.
+        assert!(!is_context_reason(BUNDLED_RUNTIME_UNUSABLE));
     }
 }

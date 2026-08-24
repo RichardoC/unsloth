@@ -35,6 +35,36 @@ const FAILURE_CONTEXT_LINE_BYTES: usize = 1_000;
 /// Clear labels are a small fixed set; this only bounds a pathological producer.
 const MAX_UNPAIRED_CLEARS: usize = 64;
 
+/// Why an installer must never run against a bundled runtime.
+///
+/// install.sh / install.ps1 build a mutable Python environment under `~/.unsloth`.
+/// With a runtime inside the app bundle that would leave the machine with two
+/// stacks, only one of which the app launches: the install would appear to succeed
+/// and change nothing the app uses, after a long download and a rewrite of a
+/// directory the user may share with a terminal install.
+///
+/// Enforced from [`run_install`] rather than only at the command layer, because two
+/// paths reach it -- first-run install and the repair fallback -- and this is the
+/// last place both pass through.
+pub(crate) const BUNDLED_RUNTIME_INSTALL_REFUSAL: &str =
+    "This copy of Unsloth ships its own Python runtime, so there is nothing to install. \
+     Reinstall the Unsloth app if it is damaged.";
+
+/// `Some(message)` when an installer must not run here.
+pub(crate) fn bundled_runtime_install_refusal() -> Option<String> {
+    install_refusal_for(crate::bundled_runtime::bundled_runtime())
+}
+
+fn install_refusal_for(bundled: Option<&crate::bundled_runtime::BundledRuntime>) -> Option<String> {
+    bundled.map(|runtime| {
+        warn!(
+            "Refusing to run the installer: this app bundles its runtime at {}",
+            runtime.root().display()
+        );
+        BUNDLED_RUNTIME_INSTALL_REFUSAL.to_string()
+    })
+}
+
 fn generic_failure_message(code: i32) -> String {
     format!(
         "Installation failed with exit code {}. Open the installer logs for details.",
@@ -583,6 +613,22 @@ fn spawn_script(
     cmd.env_remove("UNSLOTH_STUDIO_HOME");
     cmd.env_remove("STUDIO_HOME");
 
+    // Pin the backend to the version this build shipped with, so one .dmg always
+    // installs one Python stack: install.sh reads setup.sh and every requirements
+    // and constraints file out of the installed unsloth wheel, so fixing the wheel
+    // fixes the whole pin set. Deliberately `option_env!` on its own and NOT
+    // preflight::version::expected_backend_version(), whose `.unwrap_or(
+    // MIN_DESKTOP_BACKEND_VERSION)` floor is the right answer for staleness checks
+    // and the wrong one here: an unstamped local or CI build would get pinned to a
+    // long-stale floor instead of keeping today's track-the-newest behavior. Only
+    // release builds are stamped (.github/workflows/release-desktop.yml), and only
+    // they set this; every other build sets nothing at all.
+    // Scrubbed first so an inherited value can never out-rank the stamp.
+    cmd.env_remove("UNSLOTH_BACKEND_VERSION");
+    if let Some(backend_version) = option_env!("UNSLOTH_DESKTOP_BACKEND_VERSION") {
+        cmd.env("UNSLOTH_BACKEND_VERSION", backend_version);
+    }
+
     // We decode this child as UTF-8 below, so its Python descendants must emit
     // UTF-8 or the log fills with U+FFFD. The .ps1 entry points set these too;
     // this covers any path reaching Python without them.
@@ -847,6 +893,17 @@ fn run_install_with_event_mode(
     };
     if let Ok(mut install) = state.lock() {
         install.current_attempt = Some(attempt.clone());
+    }
+
+    // Before the first emit: a progress line for an installation that is refused
+    // reads as one that started.
+    if let Some(msg) = bundled_runtime_install_refusal() {
+        diagnostics::finish_attempt(&diagnostics, &attempt, None, false, Some(msg.clone()));
+        clear_current_attempt(&state);
+        if event_mode.emit_terminal_events() {
+            emit_failed(&app, &msg);
+        }
+        return Err(msg);
     }
 
     emit_mode_progress(&app, event_mode, "Starting installation...");
@@ -1936,5 +1993,19 @@ mod tests {
             .output_tail
             .iter()
             .all(|line| line.text.is_char_boundary(line.text.len())));
+    }
+
+    #[test]
+    fn an_installer_is_refused_when_the_app_bundles_its_runtime() {
+        // The refusal, not just the absence of an offer: nothing in the frontend
+        // stops a user reaching start_install, and install.sh under a bundled
+        // runtime builds a second Python stack the app never launches.
+        let payload = crate::bundled_runtime::payload("install-refusal");
+        let refusal = install_refusal_for(Some(&payload.runtime()))
+            .expect("an installer must be refused over a bundled runtime");
+        assert_eq!(refusal, BUNDLED_RUNTIME_INSTALL_REFUSAL);
+        // And no bundle means no refusal, so every build that still installs is
+        // untouched.
+        assert_eq!(install_refusal_for(None), None);
     }
 }

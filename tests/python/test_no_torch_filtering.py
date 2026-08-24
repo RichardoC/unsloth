@@ -495,6 +495,19 @@ class TestInstallPythonStackSubprocessMock:
         prefix = f".{Path(filename).stem}-filtered-"
         return any("-r" in cmd and prefix in cmd for cmd in cmds)
 
+    def _cmds_contain_locked_file(self, cmds: list[str], filename: str) -> bool:
+        """Check for the hash-verified lock installed in a requirements file's place.
+
+        A locked step installs `locks/<stem>.lock.txt` under --require-hashes instead of
+        naming the source file, and the NO_TORCH / Windows filters then run over the
+        LOCK, so the adjacent temp is named after `<stem>.lock` rather than `<stem>`.
+        The step still happens either way, which is what these tests assert.
+        """
+        stem = Path(filename).stem
+        return any(
+            f"{stem}.lock.txt" in cmd or f".{stem}.lock-filtered-" in cmd for cmd in cmds
+        )
+
     # -- NO_TORCH=True, IS_MACOS=True (Intel Mac scenario) --
 
     def test_no_torch_macos_skips_overrides(self):
@@ -522,9 +535,11 @@ class TestInstallPythonStackSubprocessMock:
     def test_no_torch_macos_extras_no_deps_called(self):
         """With NO_TORCH=True, extras-no-deps.txt is still called (but filtered)."""
         cmds = self._capture_install(no_torch = True, is_macos = True, is_windows = False)
-        has_extras_nd = self._cmds_contain_file(
-            cmds, "extras-no-deps.txt"
-        ) or self._cmds_contain_filtered_file(cmds, "extras-no-deps.txt")
+        has_extras_nd = (
+            self._cmds_contain_file(cmds, "extras-no-deps.txt")
+            or self._cmds_contain_filtered_file(cmds, "extras-no-deps.txt")
+            or self._cmds_contain_locked_file(cmds, "extras-no-deps.txt")
+        )
         assert has_extras_nd, "extras-no-deps.txt (or its filtered temp) should be called"
 
     # -- IS_WINDOWS=True + NO_TORCH=True (stacked) --
@@ -570,6 +585,8 @@ class TestInstallPythonStackSubprocessMock:
         """Normal Linux: extras-no-deps.txt IS called (no filtering)."""
         cmds = self._capture_install(no_torch = False, is_macos = False, is_windows = False)
         assert self._cmds_contain_file(
+            cmds, "extras-no-deps.txt"
+        ) or self._cmds_contain_locked_file(
             cmds, "extras-no-deps.txt"
         ), "extras-no-deps.txt should be called on normal Linux"
 

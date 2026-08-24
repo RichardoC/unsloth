@@ -30,8 +30,25 @@ use version::{
     managed_backend_version_stale_reason, MIN_DESKTOP_BACKEND_VERSION,
 };
 
+/// Whether preflight may offer to repair the install itself.
+///
+/// Debug builds never did. A bundled runtime never can: repair means "rewrite the
+/// Python environment", and that environment is inside a signed, read-only app
+/// bundle. Offering it would run `unsloth studio update` (and then the installer)
+/// against `~/.unsloth`, building a SECOND Python stack that the app does not
+/// launch -- the failure would look repaired and stay broken.
+///
+/// One predicate, so every caller is covered at once: `choose_preflight`'s
+/// `ManagedStale` arm, `stale_auto_repair` for a stale owned or ownerless backend,
+/// and the tests that assert against it. The commands enforce the same thing again
+/// at the door (`commands::start_managed_repair`, `commands::start_backend_update`),
+/// because the frontend can ask without having been offered.
 fn release_auto_repair() -> bool {
-    !cfg!(debug_assertions)
+    auto_repair_allowed(crate::bundled_runtime::bundled_runtime())
+}
+
+fn auto_repair_allowed(bundled: Option<&crate::bundled_runtime::BundledRuntime>) -> bool {
+    !cfg!(debug_assertions) && bundled.is_none()
 }
 
 /// Whether the managed install sits on a profile the app cannot reach:
@@ -1288,5 +1305,19 @@ exit 1
                 ..
             } if reason == "cap_false"
         ));
+    }
+
+    #[test]
+    fn repair_is_never_offered_for_a_runtime_inside_the_app_bundle() {
+        // A repair rewrites the Python environment. When it lives in a signed,
+        // read-only bundle the rewrite lands under ~/.unsloth instead, which the
+        // app does not launch: the failure would look repaired and stay broken.
+        let payload = crate::bundled_runtime::payload("preflight-repair");
+        let runtime = payload.runtime();
+        assert!(!auto_repair_allowed(Some(&runtime)));
+        // Unchanged without one: release builds still repair, debug builds still
+        // do not.
+        assert_eq!(auto_repair_allowed(None), !cfg!(debug_assertions));
+        assert_eq!(release_auto_repair(), auto_repair_allowed(None));
     }
 }

@@ -4314,9 +4314,16 @@ class TestInstallBnbWindowsRocm:
         )
 
     def test_calls_pip_install_try_with_win_amd64_url(self):
-        """Should call pip_install_try with the win_amd64 wheel URL via plain pip."""
-        with patch.object(stack_mod, "pip_install_try", return_value = True) as mock_pip:
-            stack_mod._install_bnb_windows_rocm()
+        """Should call pip_install_try with the win_amd64 wheel URL via plain pip.
+
+        The rolling continuous-release_main wheel is now reached only under
+        UNSLOTH_PREBUILT_ALLOW_LATEST=1 (the default installs the pinned release --
+        see TestBnbRocmPin), so the hatch is set here. Everything this asserted about
+        that path is unchanged.
+        """
+        with patch.dict(os.environ, {"UNSLOTH_PREBUILT_ALLOW_LATEST": "1"}):
+            with patch.object(stack_mod, "pip_install_try", return_value = True) as mock_pip:
+                stack_mod._install_bnb_windows_rocm()
         assert mock_pip.call_count == 1
         call_args = str(mock_pip.call_args_list[0])
         assert "bitsandbytes" in call_args
@@ -4357,17 +4364,28 @@ class TestInstallBnbWindowsRocm:
 
     def test_falls_back_to_pypi_when_win_amd64_url_missing(self):
         """No win_amd64 pre-release wheel must not mean no bitsandbytes: PyPI
-        >=0.50.0 ships libbitsandbytes_rocm{714,72}.dll, so it is a real ROCm build."""
-        with patch.object(stack_mod, "_BNB_ROCM_PRERELEASE_URLS", {}):
-            with patch.object(stack_mod, "pip_install_try", return_value = True) as mock_pip:
-                stack_mod._install_bnb_windows_rocm()
+        >=0.50.0 ships libbitsandbytes_rocm{714,72}.dll, so it is a real ROCm build.
+
+        An ALLOW_LATEST-only shape now: with the pin on there is always a first
+        attempt (the pinned release), so an empty wheel table cannot arise.
+        """
+        with patch.dict(os.environ, {"UNSLOTH_PREBUILT_ALLOW_LATEST": "1"}):
+            with patch.object(stack_mod, "_BNB_ROCM_PRERELEASE_URLS", {}):
+                with patch.object(stack_mod, "pip_install_try", return_value = True) as mock_pip:
+                    stack_mod._install_bnb_windows_rocm()
         assert mock_pip.call_count == 1
         assert stack_mod._BNB_ROCM_PYPI_FALLBACK in mock_pip.call_args.args
 
     def test_falls_back_to_pypi_when_prerelease_install_fails(self):
         """A blocked GitHub pre-release URL must fall through to the PyPI floor rather
-        than leaving Windows ROCm with no working bitsandbytes."""
-        with patch.object(stack_mod, "pip_install_try", side_effect = [False, True]) as mock_pip:
+        than leaving Windows ROCm with no working bitsandbytes.
+
+        ALLOW_LATEST=1, because the pre-release URL is only tried under that hatch now.
+        """
+        with (
+            patch.dict(os.environ, {"UNSLOTH_PREBUILT_ALLOW_LATEST": "1"}),
+            patch.object(stack_mod, "pip_install_try", side_effect = [False, True]) as mock_pip,
+        ):
             with patch.object(stack_mod, "_detect_bnb_rocm_dll_ver", return_value = "72"):
                 result = stack_mod._install_bnb_windows_rocm()
         assert result is True

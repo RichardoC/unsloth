@@ -32,7 +32,9 @@ dirs = "6"
 regex = "1"
 open = "5"
 process-wrap = { version = "9", features = ["std"] }
-fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
+# Pinned to the commit Cargo.lock already resolved: an unrevved git dependency
+# is whatever the branch points at the next time the lock is regenerated.
+fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", rev = "c4c45d503ea115a839aae718d02f79e7c7f0f673" }
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-updater = "2"
 tauri-plugin-clipboard-manager = "2"

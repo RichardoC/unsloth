@@ -66,10 +66,15 @@ _SHORTCUTS_ONLY=false
 _next_is_package=false
 _next_is_python=false
 _next_is_llama_cpp_dir=false
+_next_is_backend_version=false
 # Seed from the environment so a caller who exports UNSLOTH_LOCAL_LLAMA_CPP_DIR
 # (the documented piped-install style) is honored; the --with-llama-cpp-dir
 # flag below overrides it when given.
 _WITH_LLAMA_CPP_DIR="${UNSLOTH_LOCAL_LLAMA_CPP_DIR:-}"
+# Exact backend version to install. Same env-var-or-flag shape: the desktop app
+# exports UNSLOTH_BACKEND_VERSION (stamped at build time), a local run can pass
+# --backend-version. Empty = today's floating "install the newest" behavior.
+_BACKEND_VERSION="${UNSLOTH_BACKEND_VERSION:-}"
 for arg in "$@"; do
     if [ "$_next_is_package" = true ]; then
         PACKAGE_NAME="$arg"
@@ -86,6 +91,11 @@ for arg in "$@"; do
         _next_is_llama_cpp_dir=false
         continue
     fi
+    if [ "$_next_is_backend_version" = true ]; then
+        _BACKEND_VERSION="$arg"
+        _next_is_backend_version=false
+        continue
+    fi
     case "$arg" in
         --local) STUDIO_LOCAL_INSTALL=true ;;
         --package) _next_is_package=true ;;
@@ -95,6 +105,7 @@ for arg in "$@"; do
         --verbose|-v) _VERBOSE=true ;;
         --shortcuts-only) _SHORTCUTS_ONLY=true ;;
         --with-llama-cpp-dir) _next_is_llama_cpp_dir=true ;;
+        --backend-version) _next_is_backend_version=true ;;
     esac
 done
 
@@ -472,6 +483,10 @@ if [ "$_next_is_llama_cpp_dir" = true ]; then
     echo "❌ ERROR: --with-llama-cpp-dir requires a path argument." >&2
     exit 1
 fi
+if [ "$_next_is_backend_version" = true ]; then
+    echo "❌ ERROR: --backend-version requires a version argument (e.g. --backend-version 2026.8.18)." >&2
+    exit 1
+fi
 
 # Validate --package to prevent injection into shell/Python commands.
 # Must start with a letter/digit (rejects leading dashes that uv would parse as flags).
@@ -483,6 +498,61 @@ case "$PACKAGE_NAME" in
         echo "❌ ERROR: --package name contains invalid characters (allowed: a-z A-Z 0-9 . _ -)" >&2
         exit 1 ;;
 esac
+
+# ── Backend version pin ──
+# install.sh resolves setup.sh and every requirements/constraints file out of the
+# INSTALLED unsloth wheel (the importlib.resources.files('studio') lookups that pick
+# SETUP_SH and the packaged overrides), so whichever wheel this run
+# resolves is what decides the whole pin set. Left floating, the same .dmg installs
+# a different Python stack every month; pinning the wheel exactly pins the rest with
+# it. Only the desktop app sets this (release-desktop.yml stamps the version into the
+# binary, install.rs exports it); `curl | sh`, CI and unstamped dev builds leave it
+# empty and keep the >= floors below, i.e. today's track-latest-and-self-repair.
+if [ -n "$_BACKEND_VERSION" ]; then
+    # Two gates. The case rejects every character that is not part of a PEP 440
+    # version -- including whitespace and newlines -- so the value cannot smuggle
+    # anything into the `uv pip install` argv it is concatenated into; the regex
+    # then rejects anything that is not release[pre][post][dev].
+    case "$_BACKEND_VERSION" in
+        *[!0-9a-z.]*)
+            echo "❌ ERROR: --backend-version must be a PEP 440 release version (e.g. 2026.8.18); got: $_BACKEND_VERSION" >&2
+            exit 1 ;;
+    esac
+    if ! printf '%s' "$_BACKEND_VERSION" \
+        | grep -Eq '^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$'; then
+        echo "❌ ERROR: --backend-version must be a PEP 440 release version (e.g. 2026.8.18); got: $_BACKEND_VERSION" >&2
+        exit 1
+    fi
+fi
+
+# The specs every backend install site below uses. Built once so the pinned and
+# unpinned shapes cannot drift apart across the seven call sites.
+#   _UNSLOTH_SPEC      -- sites that install "$PACKAGE_NAME" (honors --package)
+#   _UNSLOTH_FLOOR_SPEC-- sites that spell out the literal unsloth floor
+#   _UNSLOTH_ZOO_SPEC  -- unsloth-zoo, floor-only (see the residual note below)
+# _UNSLOTH_UPGRADE_PKG / _UNSLOTH_UPGRADE_UNSLOTH carry the `--upgrade-package`
+# argument for the two spellings already in the file; empty means "omit the flag".
+_UNSLOTH_SPEC="$PACKAGE_NAME"
+_UNSLOTH_FLOOR_SPEC="unsloth>=2026.8.18"
+# Residual: there is no stamped unsloth-zoo version to pin to, so this stays a
+# floor. The exact unsloth above constrains it through its own metadata, which is
+# the closest thing to determinism available here -- do not invent a zoo pin.
+_UNSLOTH_ZOO_SPEC="unsloth-zoo>=2026.8.12"
+_UNSLOTH_UPGRADE_PKG="$PACKAGE_NAME"
+_UNSLOTH_UPGRADE_UNSLOTH="unsloth"
+if [ -n "$_BACKEND_VERSION" ]; then
+    _UNSLOTH_SPEC="$PACKAGE_NAME==$_BACKEND_VERSION"
+    _UNSLOTH_FLOOR_SPEC="unsloth==$_BACKEND_VERSION"
+    # --upgrade-package is dropped, not kept alongside the ==pin. It exists to tell
+    # uv "ignore the installed version and take the newest"; with an exact pin the
+    # requirement already admits exactly one version (uv only reuses an installed
+    # version when it satisfies the requirement), so the flag decides nothing and
+    # would leave a command line that reads as "upgrade" and "hold" at once. Note
+    # this is NOT --reinstall-package, which forces a clean reinstall of a version
+    # already resolved; those stay where the migrated branch needs them.
+    _UNSLOTH_UPGRADE_PKG=""
+    _UNSLOTH_UPGRADE_UNSLOTH=""
+fi
 
 # ── Tauri structured output ──
 tauri_log() {
@@ -1876,6 +1946,12 @@ echo ""
 printf "  ${C_TITLE}%s${C_RST}\n" "🦥 Unsloth Studio Installer"
 printf "  ${C_DIM}%s${C_RST}\n" "$RULE"
 echo ""
+# Reported once, right under the banner: an install that pins is a materially
+# different install, and tauri.log is where a support case starts. Derived far
+# above, next to the flag parsing; printed here so it lands after the banner.
+if [ -n "$_BACKEND_VERSION" ]; then
+    step "backend" "pinned to $_UNSLOTH_SPEC"
+fi
 
 # ── Detect platform ──
 tauri_log "STEP" "Detecting platform"
@@ -2137,6 +2213,10 @@ _maybe_reroute_strixhalo_to_2404() {
     # silently revert the child install to auto-detection.
     [ -n "${UNSLOTH_TORCH_INDEX_URL:-}" ] && _rr_exports="$_rr_exports; export UNSLOTH_TORCH_INDEX_URL=$(_rr_q "$UNSLOTH_TORCH_INDEX_URL")"
     [ -n "${UNSLOTH_TORCH_INDEX_FAMILY:-}" ] && _rr_exports="$_rr_exports; export UNSLOTH_TORCH_INDEX_FAMILY=$(_rr_q "$UNSLOTH_TORCH_INDEX_FAMILY")"
+    # Same for the backend pin: the rerouted distro runs a fresh install.sh fetched
+    # from main, so dropping it there would silently un-pin the install this one
+    # promised. Validated above, so it is a known-safe token by now.
+    [ -n "$_BACKEND_VERSION" ] && _rr_exports="$_rr_exports; export UNSLOTH_BACKEND_VERSION=$(_rr_q "$_BACKEND_VERSION")"
     [ "$_SKIP_AUTOSTART" = true ] && _rr_exports="$_rr_exports; export UNSLOTH_SKIP_AUTOSTART=1"
     _rr_args=""
     [ "$PACKAGE_NAME" != "unsloth" ] && _rr_args="$_rr_args --package $(_rr_q "$PACKAGE_NAME")"
@@ -4875,7 +4955,7 @@ _bootstrap_packaged_mlx_override() {
     substep "preparing Apple Silicon model support..."
     run_install_cmd_retry "prepare Apple Silicon dependencies" \
         uv pip install --python "$_VENV_PY" --no-deps \
-        --upgrade-package "$PACKAGE_NAME" -- "$PACKAGE_NAME"
+        ${_UNSLOTH_UPGRADE_PKG:+--upgrade-package "$_UNSLOTH_UPGRADE_PKG"} -- "$_UNSLOTH_SPEC"
 
     _PACKAGED_MLX_OVERRIDES=$("$_VENV_PY" -I -c "
 import importlib.resources
@@ -4952,7 +5032,7 @@ if [ "$_MIGRATED" = true ]; then
         # to prevent transitive torch resolution.
         run_install_cmd_retry "install unsloth (migrated no-torch)" uv pip install --python "$_VENV_PY" --no-deps \
             --reinstall-package unsloth --reinstall-package unsloth-zoo \
-            "unsloth>=2026.8.18" "unsloth-zoo>=2026.8.12"
+            "$_UNSLOTH_FLOOR_SPEC" "$_UNSLOTH_ZOO_SPEC"
         # Resolve pydantic WITH deps so pip pins pydantic-core to the
         # matching version (no-torch-runtime.txt below is --no-deps).
         # All transitive deps are torch-free.
@@ -4967,7 +5047,7 @@ if [ "$_MIGRATED" = true ]; then
         run_install_cmd_retry "install unsloth (migrated)" uv pip install --python "$_VENV_PY" \
             ${_UNSLOTH_TORCH_OVERRIDES:+--overrides "$_UNSLOTH_TORCH_OVERRIDES"} \
             --reinstall-package unsloth --reinstall-package unsloth-zoo \
-            "unsloth>=2026.8.18" "unsloth-zoo>=2026.8.12"
+            "$_UNSLOTH_FLOOR_SPEC" "$_UNSLOTH_ZOO_SPEC"
         [ -n "$_UNSLOTH_TORCH_OVERRIDES" ] && rm -f "$_UNSLOTH_TORCH_OVERRIDES"
         _UNSLOTH_TORCH_OVERRIDES=""
     fi
@@ -5200,8 +5280,8 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
         # No-torch: install unsloth + unsloth-zoo with --no-deps, then
         # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
         run_install_cmd_retry "install unsloth (no-torch)" uv pip install --python "$_VENV_PY" --no-deps \
-            --upgrade-package unsloth --upgrade-package unsloth-zoo \
-            "unsloth>=2026.8.18" "unsloth-zoo>=2026.8.12"
+            ${_UNSLOTH_UPGRADE_UNSLOTH:+--upgrade-package "$_UNSLOTH_UPGRADE_UNSLOTH"} --upgrade-package unsloth-zoo \
+            "$_UNSLOTH_FLOOR_SPEC" "$_UNSLOTH_ZOO_SPEC"
         # Same pydantic-with-deps trick as the migrated branch.
         run_install_cmd_retry "install pydantic (with deps for compatible core)" \
             uv pip install --python "$_VENV_PY" pydantic
@@ -5218,6 +5298,10 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                 "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
         fi
     elif [ "$STUDIO_LOCAL_INSTALL" = true ]; then
+        # --local ignores the backend pin on purpose: the editable overlay two lines
+        # down is the version the developer asked for, and an ==pin here would only
+        # decide which wheel gets thrown away. Floors stay spelled out so this stays
+        # obviously independent of _UNSLOTH_FLOOR_SPEC.
         run_install_cmd_retry "install unsloth (local)" uv pip install --python "$_VENV_PY" \
             ${_UNSLOTH_TORCH_OVERRIDES:+--overrides "$_UNSLOTH_TORCH_OVERRIDES"} \
             --upgrade-package unsloth "unsloth>=2026.8.18" "unsloth-zoo>=2026.8.12"
@@ -5228,9 +5312,10 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
             --no-deps --reinstall-package unsloth-zoo \
             "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
     else
+        # The default desktop path.
         run_install_cmd_retry "install unsloth" uv pip install --python "$_VENV_PY" \
             ${_UNSLOTH_TORCH_OVERRIDES:+--overrides "$_UNSLOTH_TORCH_OVERRIDES"} \
-            --upgrade-package unsloth -- "$PACKAGE_NAME"
+            ${_UNSLOTH_UPGRADE_UNSLOTH:+--upgrade-package "$_UNSLOTH_UPGRADE_UNSLOTH"} -- "$_UNSLOTH_SPEC"
     fi
     [ -n "$_UNSLOTH_TORCH_OVERRIDES" ] && rm -f "$_UNSLOTH_TORCH_OVERRIDES"
     _UNSLOTH_TORCH_OVERRIDES=""
@@ -5249,6 +5334,7 @@ else
     tauri_log "STEP" "Installing Unsloth"
     substep "installing unsloth (this may take a few minutes)..."
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
+        # --local: pin ignored, same reasoning as the local branch above.
         run_install_cmd_retry "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" "unsloth-zoo>=2026.8.12" "unsloth>=2026.8.18" --torch-backend=auto
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
@@ -5257,7 +5343,7 @@ else
             --no-deps --reinstall-package unsloth-zoo \
             "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
     else
-        run_install_cmd_retry "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" --torch-backend=auto -- "$PACKAGE_NAME"
+        run_install_cmd_retry "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" --torch-backend=auto -- "$_UNSLOTH_SPEC"
     fi
 fi
 

@@ -3,10 +3,10 @@
 
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { parseSync } from "oxc-parser";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const LANG_TO_EXT = {
   js: "js",
@@ -21,6 +21,30 @@ const SNIPPET_PREFIX = "(() => {\n";
 const SNIPPET_SUFFIX = "\n})();\nexport {};\n";
 const OXLINT_SUPPRESSED_RULES = ["no-unused-vars", "no-new-array"];
 const TOOL_DIR = dirname(fileURLToPath(import.meta.url));
+
+// Where this run's node_modules actually live.
+//
+// Normally: right here, installed beside this script, and both the bare
+// `oxc-parser` import and the oxlint binary find them by Node's own upward walk.
+//
+// Inside the macOS app bundle they are somewhere else -- `runtime/oxc-node-modules`,
+// above `site-packages` -- and nothing about that tree is reachable by walking up
+// from here. The Python caller passes the directory in `UNSLOTH_OXC_NODE_MODULES`
+// and also exports it as `NODE_PATH` (see local_callable_validators._run_oxc_batch).
+//
+// NODE_PATH alone is not enough, which is why this file changed at all: it is
+// consulted by CommonJS resolution and *not* by ESM's `node_modules` walk, so a
+// static `import "oxc-parser"` still fails with it set. Resolving the specifier
+// through `createRequire` and then importing the resulting file URL uses the CJS
+// resolver (NODE_PATH included) to find the package and the ESM loader to load it
+// -- which is what oxc-parser needs, being `"type": "module"`. Its own native
+// binding is loaded through `createRequire` inside the generated bindings.js, so
+// NODE_PATH is what carries THAT lookup; neither half works without the other.
+const BUNDLED_NODE_MODULES = (process.env.UNSLOTH_OXC_NODE_MODULES || "").trim();
+const MODULES_DIR = BUNDLED_NODE_MODULES || join(TOOL_DIR, "node_modules");
+const { parseSync } = await (BUNDLED_NODE_MODULES
+  ? import(pathToFileURL(createRequire(import.meta.url).resolve("oxc-parser")).href)
+  : import("oxc-parser"));
 
 function mapLang(value) {
   const normalized = String(value || "").trim().toLowerCase();
@@ -388,7 +412,7 @@ function runLintBatch(entries) {
       writeFileSync(filePath, entry.code, "utf8");
     }
 
-    const oxlintBin = join(TOOL_DIR, "node_modules", ".bin", "oxlint");
+    const oxlintBin = join(MODULES_DIR, ".bin", "oxlint");
     const oxlintArgs = [
       ...OXLINT_SUPPRESSED_RULES.flatMap((rule) => ["-A", rule]),
       "--format",
