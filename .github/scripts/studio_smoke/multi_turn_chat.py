@@ -89,8 +89,12 @@ def run_anthropic() -> list[str]:
             model = "default",
             max_tokens = MAX_TOKENS,
             messages = history,
-            temperature = 0.0,
-            extra_body = {"seed": SEED, "enable_thinking": False},
+            # temperature rides in extra_body, not as a kwarg: the anthropic SDK
+            # removed the typed sampling params (temperature/top_p/top_k) when current
+            # Claude models stopped accepting them, so passing one is a TypeError
+            # raised before the request is built. Unsloth's Anthropic-compatible
+            # endpoint still honours the field on the wire, like `seed` beside it.
+            extra_body = {"seed": SEED, "temperature": 0.0, "enable_thinking": False},
         )
         text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
         replies.append(text)
