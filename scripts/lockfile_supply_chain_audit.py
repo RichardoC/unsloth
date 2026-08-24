@@ -296,11 +296,20 @@ CARGO_REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 # Both must match verbatim; bumping the pinned SHA forces a re-review.
 # Unsloth's Tauri shell pulls `fix-path-env` from git because it is not
 # published to crates.io; commit c4c45d5 was reviewed when it landed.
+#
+# The `?rev=` in the URL is not decoration. Cargo.toml previously declared this
+# dependency with no `rev`, which meant the branch tip decided what was built and
+# only the lockfile held it still; the dependency now pins the commit, and cargo
+# writes the pin it was given into the source string. Same commit, same review --
+# a different string, so the entry has to say so. An entry for the unrevved form
+# is deliberately NOT kept beside it: that form would let the pin be dropped from
+# Cargo.toml and still pass this audit, which is the thing the pin exists to stop.
 CARGO_SOURCE_ALLOWLIST: tuple[tuple[str, str], ...] = (
     (
         "fix-path-env",
-        "git+https://github.com/tauri-apps/fix-path-env-rs#"
-        "c4c45d503ea115a839aae718d02f79e7c7f0f673",
+        "git+https://github.com/tauri-apps/fix-path-env-rs"
+        "?rev=c4c45d503ea115a839aae718d02f79e7c7f0f673"
+        "#c4c45d503ea115a839aae718d02f79e7c7f0f673",
     ),
 )
 

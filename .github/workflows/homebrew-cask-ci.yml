@@ -118,12 +118,35 @@ jobs:
       - name: brew style
         run: brew style "$TAP_DIR/Casks/$CASK_TOKEN.rb"
 
+      # HOMEBREW_GITHUB_API_TOKEN on the three steps that call the GitHub API, and
+      # nowhere else. `brew audit --online` resolves the release the url points at,
+      # and unauthenticated api.github.com allows 60 requests per hour per IP --
+      # shared with every other job on that runner's egress address, so the first
+      # audit failed with "API rate limit exceeded for 13.105.117.123" and reported
+      # it as an audit exception rather than as a rate limit. The workflow token
+      # raises the limit to 5000/hour.
+      #
+      # Deliberately not job-level `env:`: `brew install --cask` below downloads and
+      # mounts a disk image, and there is no reason for a token to be in the
+      # environment while that happens. `permissions: contents: read` above is the
+      # ceiling on what the token can do either way.
       - name: brew audit (strict, online)
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
         run: brew audit --cask --strict --online "$TAP/$CASK_TOKEN"
 
       # The acceptance gate for a brand-new cask. Kept required: if this cannot
       # pass, the cask is not submittable and this workflow should say so.
+      #
+      # This is also the step that catches a cask left behind by a release: it
+      # compares `version` against what livecheck reports and fails when they
+      # differ. That is a real defect for a submission (homebrew-cask would reject
+      # it), so it stays blocking rather than being downgraded to a warning. The
+      # paths filter means it only runs when someone touches the cask, which is
+      # exactly when a stale version should stop them.
       - name: brew audit --new
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
         run: brew audit --cask --new --online "$TAP/$CASK_TOKEN"
 
       # Proves the url the cask builds from `version` actually resolves and
@@ -173,6 +196,8 @@ jobs:
           spctl --assess --type execute --verbose=4 "$app"
 
       - name: brew livecheck
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
           # Reads latest.json, not the releases atom feed. Prints the newest

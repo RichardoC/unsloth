@@ -235,6 +235,28 @@ def test_audit_cargo_lockfile_direct_call(tmp_path):
     assert "non-registry-cargo-source" in kinds
 
 
+def test_this_repos_own_cargo_lockfile_passes_its_own_audit():
+    """The allowlist and the committed lockfile have to agree.
+
+    CARGO_SOURCE_ALLOWLIST matches `(name, source)` verbatim, and a Cargo.toml
+    edit can rewrite the lock's source string without touching the commit it
+    names: adding `rev = "..."` to the dependency turned
+    `git+…/fix-path-env-rs#c4c45d5` into `git+…/fix-path-env-rs?rev=c4c45d5#c4c45d5`,
+    same reviewed commit, allowlist entry no longer matching. That failed in Lint
+    CI rather than here, which is the wrong place to find it -- nothing local
+    audited the lockfile this repo actually ships.
+    """
+    lockfile = REPO_ROOT / "studio" / "src-tauri" / "Cargo.lock"
+    assert lockfile.is_file(), lockfile
+    findings = lsa.audit_cargo_lockfile(lockfile)
+    assert not findings, (
+        "the committed Cargo.lock trips this repo's own lockfile audit:\n"
+        + "\n".join(str(finding) for finding in findings)
+        + "\n\nIf a dependency's source string legitimately changed, update "
+        "CARGO_SOURCE_ALLOWLIST to the new verbatim string."
+    )
+
+
 # ---------------------------------------------------------------------------
 # GitHub Actions annotation escape: ::warning:: / ::error:: messages
 # are truncated at the first newline unless escaped, so the multi-line

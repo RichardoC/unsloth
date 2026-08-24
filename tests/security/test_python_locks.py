@@ -783,9 +783,15 @@ class TestHashRelaxationDoesNotDefeatTheLock:
     `require-hashes = true` cannot fail the pip FALLBACK on the unlocked steps (#8530).
     A hashed install must not inherit it."""
 
-    def test_a_hashed_pip_command_gets_no_hash_relaxation(self):
+    def test_a_hashed_pip_command_gets_no_hash_relaxation(self, monkeypatch):
         cmd = [sys.executable, "-m", "pip", "install", "--require-hashes", "-r", "lock.txt"]
         assert ips._relaxed_pip_policy_env(cmd) == {}
+        # Explicit about UV_OVERRIDE rather than assuming it is unset: this module sets
+        # it at import on macOS arm64, and a hashed command drops it (see
+        # TestAnOverrideCannotTravelWithALock), so "inherit unchanged" only holds when
+        # there is nothing to drop. Without the delenv this passed on Linux and failed
+        # on the platform the override exists for.
+        monkeypatch.delenv("UV_OVERRIDE", raising = False)
         assert ips._install_env_for_cmd(cmd) is None  # inherit, nothing overridden
 
     def test_an_unlocked_pip_command_still_gets_it(self):
@@ -834,3 +840,125 @@ class TestPipFallbackKeepsTheLock:
         assert len(recorded) == 1
         assert "--require-hashes" in recorded[0]
         assert recorded[0][recorded[0].index("-r") + 1].endswith("locks/studio.lock.txt")
+
+
+class TestAnOverrideCannotTravelWithALock:
+    """UV_OVERRIDE is exported process-wide on macOS arm64, and it must not reach a
+    hash-verified install.
+
+    The override exists so the MLX stack resolves: without it mlx-vlm's own
+    `transformers>=5.14.0` fights constraints.txt's pin and uv walks the whole MLX
+    stack backwards. But uv applies an override to EVERY install in the process, and an
+    override's entries are ranges by nature -- overriding a range with an exact pin
+    would just be a pin. Under --require-hashes uv rejects any unpinned requirement,
+    including the ones an override injects, so every macOS arm64 install died at the
+    first hash-verified step:
+
+        error: In `--require-hashes` mode, all requirements must have their versions
+        pinned with `==`, but found: transformers>=5.5.0 ; python_full_version >= '3.10'
+
+    That was step 1 of 11 -- the pip bootstrap -- so no macOS arm64 machine got as far
+    as installing anything. Windows, Linux and Intel Macs were unaffected, which is why
+    only the mac legs went red.
+
+    scripts/build_macos_runtime.sh states the same invariant for the payload: an
+    override belongs where resolution happens, not where a closure is placed.
+    """
+
+    OVERRIDE_PATH = "/tmp/overrides-darwin-arm64.txt"
+
+    # The real bootstrap command, from install_python_stack's pip bootstrap step.
+    HASHED = [
+        "uv", "pip", "install", "--python", sys.executable,
+        "--require-hashes", "-r", "locks/pip-bootstrap.lock.txt",
+    ]
+    UNLOCKED = ["uv", "pip", "install", "-r", "extras.txt"]
+    HASHED_PINNED_INDEX = HASHED + ["--index-url", "https://example.invalid/simple"]
+
+    @pytest.fixture(autouse = True)
+    def _override_is_set(self, monkeypatch):
+        monkeypatch.setenv("UV_OVERRIDE", self.OVERRIDE_PATH)
+
+    def test_a_hashed_install_does_not_carry_the_override(self):
+        env = ips._install_env_for_cmd(self.HASHED)
+        assert env is not None, (
+            "the override is set, so the environment cannot be inherited unchanged"
+        )
+        assert "UV_OVERRIDE" not in env
+
+    def test_a_hashed_pinned_index_install_does_not_carry_it_either(self):
+        """The pinned-index branch builds its own env and used to keep the override."""
+        env = ips._install_env_for_cmd(self.HASHED_PINNED_INDEX)
+        assert env is not None
+        assert "UV_OVERRIDE" not in env
+
+    def test_an_unlocked_install_keeps_it(self):
+        """Resolution is exactly where the override belongs. Only closures lose it, or
+        the MLX stack silently resolves backwards again."""
+        env = ips._install_env_for_cmd(self.UNLOCKED)
+        assert env is None or env.get("UV_OVERRIDE") == self.OVERRIDE_PATH
+
+    def test_the_pip_fallback_of_a_hashed_step_also_drops_it(self):
+        cmd = [sys.executable, "-m", "pip", "install", "--require-hashes", "-r", "lock.txt"]
+        env = ips._install_env_for_cmd(cmd)
+        assert env is not None
+        assert "UV_OVERRIDE" not in env
+        # The relaxation must still not appear on a hashed command.
+        assert env.get("PIP_REQUIRE_HASHES") != "0"
+
+    def test_the_removal_is_keyed_on_the_flag_not_on_a_list_of_steps(self):
+        """A hash-verified step added later inherits the guarantee without knowing it."""
+        assert ips._hash_verified_env_removals(self.HASHED) == ("UV_OVERRIDE",)
+        assert ips._hash_verified_env_removals(self.UNLOCKED) == ()
+
+    def test_nothing_is_removed_when_no_override_is_set(self, monkeypatch):
+        """Off the platform that sets it, a hashed command still inherits the env."""
+        monkeypatch.delenv("UV_OVERRIDE", raising = False)
+        assert ips._hash_verified_env_removals(self.HASHED) == ()
+        assert ips._install_env_for_cmd(self.HASHED) is None
+
+    def test_the_step_that_failed_runs_without_the_override(self, monkeypatch):
+        """Through run(), the function the pip bootstrap actually calls.
+
+        Asserting on _install_env_for_cmd alone would not have caught a bootstrap that
+        bypassed it -- the failure was in the wiring, not in the predicate.
+        """
+        seen: list[dict] = []
+
+        class _Ok:
+            returncode = 0
+            stdout = b""
+
+        def _fake_run(cmd, *args, **kwargs):
+            seen.append(kwargs.get("env") or {})
+            return _Ok()
+
+        monkeypatch.setattr(ips.subprocess, "run", _fake_run)
+        ips.run("Bootstrapping pip via uv", list(self.HASHED))
+        assert len(seen) == 1
+        assert "UV_OVERRIDE" not in seen[0]
+
+    def test_a_locked_pip_install_step_runs_without_the_override(self, monkeypatch):
+        """And through pip_install, which is how every other locked step gets there."""
+        seen: list[tuple[list[str], dict]] = []
+
+        class _Ok:
+            returncode = 0
+            stdout = b""
+
+        def _fake_run(cmd, *args, **kwargs):
+            seen.append((list(cmd), kwargs.get("env") or {}))
+            return _Ok()
+
+        monkeypatch.setattr(ips.subprocess, "run", _fake_run)
+        monkeypatch.setattr(ips, "USE_UV", True)
+        monkeypatch.setattr(ips, "UV_NEEDS_SYSTEM", False)
+        monkeypatch.setattr(ips, "IS_WINDOWS", False)
+        monkeypatch.setattr(ips, "NO_TORCH", False)
+        monkeypatch.setattr(ips, "PLATFORM_LACKS_TORCHCODEC_WHEEL", False)
+        monkeypatch.delenv(NO_LOCK_ENV, raising = False)
+        ips.pip_install("studio deps", "--no-cache-dir", req = REQ_ROOT / "studio.txt")
+        hashed = [(cmd, env) for cmd, env in seen if "--require-hashes" in cmd]
+        assert hashed, seen
+        for cmd, env in hashed:
+            assert "UV_OVERRIDE" not in env, cmd

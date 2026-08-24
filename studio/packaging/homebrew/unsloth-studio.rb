@@ -23,8 +23,8 @@
 # See ./README.md for the full submission and validation runbook.
 
 cask "unsloth-studio" do
-  version "0.1.800-beta"
-  sha256 "0cd2f2001b08df8bd4e47ea5784ccae9144ab80168f4964a2b89c9cd8e0b15ab"
+  version "0.1.801-beta"
+  sha256 "9d2156a6d80b540a501bba188318c8654ed1610fb49dd0a778931fa623dc961a"
 
   # release-desktop.yml derives the asset name from the tag with
   # ASSET_VERSION = re.sub(r'[^0-9A-Za-z]+', '_', app_version), so 0.1.800-beta
@@ -60,7 +60,8 @@ cask "unsloth-studio" do
   # Homebrew/OSDependsOn cop rejects the long form.
   #
   # RAISE THIS TO :sonoma WHEN BUMPING TO A BUNDLED RELEASE. It stays :big_sur
-  # only because `version` above still names 0.1.800-beta, which installs its
+  # only because `version` above still names a published release (0.1.801-beta at
+  # the time of writing), and every published release so far installs its
   # Python stack on first run and therefore genuinely runs on Big Sur. Builds
   # from this tree now ship the runtime inside the app, and that payload requires
   # macOS 14: every macOS arm64 bitsandbytes wheel from 0.49.0 is macosx_14_0, so

@@ -49,10 +49,10 @@ with a leading `v` (`release-desktop.yml:118–125`).
 
 | Piece | Value for the current release |
 | --- | --- |
-| Git tag | `v0.1.800-beta` |
-| `ASSET_VERSION` | `0_1_800_beta` |
-| DMG asset | `Unsloth-Desktop-0_1_800_beta-MacOS.dmg` |
-| DMG volume name | `Unsloth_0.1.800-beta_aarch64` |
+| Git tag | `v0.1.801-beta` |
+| `ASSET_VERSION` | `0_1_801_beta` |
+| DMG asset | `Unsloth-Desktop-0_1_801_beta-MacOS.dmg` |
+| DMG volume name | `Unsloth_0.1.801-beta_aarch64` |
 | Bundle | `Unsloth.app`, executable `Contents/MacOS/unsloth-studio` |
 | Bundle id | `ai.unsloth.studio` |
 
@@ -117,7 +117,7 @@ systems.
 For a new release tagged `vX.Y.Z-beta`:
 
 ```sh
-VERSION=0.1.801-beta
+VERSION=X.Y.Z-beta   # e.g. 0.1.802-beta
 ASSET_VERSION=$(printf '%s' "$VERSION" | tr '.-' '__')
 curl -fL "https://github.com/unslothai/unsloth/releases/download/v${VERSION}/Unsloth-Desktop-${ASSET_VERSION}-MacOS.dmg" \
   | shasum -a 256
@@ -128,8 +128,13 @@ changes — the `url` interpolates `version`.
 
 Current values, verified against the live release:
 
-* `version "0.1.800-beta"`
-* `sha256 "0cd2f2001b08df8bd4e47ea5784ccae9144ab80168f4964a2b89c9cd8e0b15ab"` (45041447 bytes)
+* `version "0.1.801-beta"`
+* `sha256 "9d2156a6d80b540a501bba188318c8654ed1610fb49dd0a778931fa623dc961a"` (45205134 bytes)
+
+`brew audit --new` compares `version` against what `livecheck` reports and fails when they
+differ, so a cask left behind a release is a red check, not a silent staleness. That is how
+the bump above was prompted: the cask was authored at `0.1.800-beta` and upstream published
+`0.1.801-beta`.
 
 ## `zap` stays in lockstep with `scripts/uninstall.sh`
 
@@ -163,8 +168,9 @@ contract test changes. It stages the cask into a throwaway tap (so `brew audit -
 `brew livecheck` resolve it by token, the way homebrew-cask will), then styles, audits,
 installs the published DMG for real, verifies the installed bundle, and zaps it.
 
-That run is the evidence a cask PR needs. From the first green run on
-`v0.1.800-beta`:
+That run is the evidence a cask PR needs. Recorded below from the first green run,
+which was on `v0.1.800-beta`; the cask now names `0.1.801-beta` (see *Refreshing* above)
+and the same workflow re-runs on that bump, since the cask file is in its paths filter.
 
 ```
 brew style                 no offenses

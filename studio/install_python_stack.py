@@ -3629,6 +3629,10 @@ LOCAL_DD_GITHUB_PLUGIN = SCRIPT_DIR / "backend" / "plugins" / "data-designer-git
 
 # Apple Silicon: override mlx-vlm/mlx-lm's transformers pin (see overrides).
 # _uv_safe_path: uv truncates UV_OVERRIDE at the first space too (issue #6503).
+#
+# This is process-wide, so uv applies it to every install below -- including the
+# hash-verified ones, where an override's range entries are rejected outright. The
+# env for those is built without it; see _HASH_VERIFIED_HOSTILE_ENV_VARS.
 _MLX_OVERRIDES = SINGLE_ENV / "overrides-darwin-arm64.txt"
 if IS_MAC_ARM and _MLX_OVERRIDES.is_file() and "UV_OVERRIDE" not in os.environ:
     os.environ["UV_OVERRIDE"] = _uv_safe_path(_MLX_OVERRIDES)
@@ -4424,6 +4428,38 @@ def _relaxed_pip_policy_env(cmd: "list[str]") -> "dict[str, str]":
     return {"PIP_REQUIRE_HASHES": "0"}
 
 
+# Env vars a hash-verified install must not carry, whoever set them.
+#
+# UV_OVERRIDE is exported process-wide further up this module on macOS arm64, because
+# resolving the MLX stack needs it: without it mlx-vlm's own `transformers>=5.14.0`
+# fights constraints.txt's pin and the resolver walks the whole MLX stack backwards.
+# But uv applies an override to EVERY install in the process, and an override file's
+# entries are ranges by nature -- overriding a range with an exact pin would just be a
+# pin. Under --require-hashes uv rejects any unpinned requirement, the ones an override
+# injects included, so the first hash-verified install in the process died on
+# `transformers>=5.5.0` before placing a single byte. Every macOS arm64 install did,
+# which is how it was found.
+#
+# scripts/build_macos_runtime.sh already states the invariant this restores, because
+# the payload builder hit the same wall and got it right: an override belongs where
+# resolution happens, not where a closure is placed. A lock has nothing left to
+# resolve, so it has nothing for an override to relax.
+_HASH_VERIFIED_HOSTILE_ENV_VARS = (
+    "UV_OVERRIDE",
+)
+
+
+def _hash_verified_env_removals(cmd: "list[str]") -> "tuple[str, ...]":
+    """Names to drop from the env of a --require-hashes install; () for anything else.
+
+    Keyed on the flag rather than on which lock is being installed, so a step added
+    later inherits the guarantee instead of having to know about it.
+    """
+    if "--require-hashes" not in cmd:
+        return ()
+    return tuple(name for name in _HASH_VERIFIED_HOSTILE_ENV_VARS if name in os.environ)
+
+
 def _install_env_for_cmd(cmd: "list[str]") -> "dict[str, str] | None":
     """Return an env with the uv index vars stripped for a pinned-index install.
 
@@ -4435,18 +4471,27 @@ def _install_env_for_cmd(cmd: "list[str]") -> "dict[str, str] | None":
     A non-pinned `pip` command also gets hash-required mode switched off, the one
     relaxation with no command-line equivalent; the wheel-less requirements go through
     the package-scoped --no-binary in _sdist_only_build_args() instead.
+
+    A --require-hashes command additionally loses the env vars in
+    _HASH_VERIFIED_HOSTILE_ENV_VARS, pinned index or not -- see there for why an
+    override cannot travel with a lock.
     """
+    removals = _hash_verified_env_removals(cmd)
     if not _is_pinned_index_cmd(cmd):
         relaxed = _relaxed_pip_policy_env(cmd)
-        if not relaxed:
+        if not relaxed and not removals:
             return None
         env = os.environ.copy()
         env.update(relaxed)
+        for name in removals:
+            env.pop(name, None)
         return env
     env = os.environ.copy()
     for name in _UV_INDEX_ENV_VARS:
         env.pop(name, None)
     for name in _PM_POLICY_ENV_VARS:
+        env.pop(name, None)
+    for name in removals:
         env.pop(name, None)
     env["UV_NO_CONFIG"] = "1"
     env["PIP_CONFIG_FILE"] = os.devnull
