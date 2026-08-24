@@ -435,6 +435,14 @@ async function loadModel(payload: any) {
   if (result instanceof Error) throw result;
   return result;
 }
+// chat-adapter.ts imports this from ../utils/mmproj-fallback to describe why a
+// vision model loaded without vision. The sliced region only ever passes it to a
+// toast, so the real message table is not what these scenarios test -- the stub
+// exists so a use of the name is a stub call and not a ReferenceError that would
+// surface as a wrong-model assertion.
+function mmprojFallbackMessage(reason: any): string {
+  return `mmproj fallback: ${reason}`;
+}
 """
 
 SCENARIO_HELPERS = """

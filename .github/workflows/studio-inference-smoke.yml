@@ -1126,8 +1126,15 @@ jobs:
           a_msg = anthropic.messages.create(
               model       = "default",
               max_tokens  = 80,
-              temperature = 0.0,
-              extra_body  = {"seed": SEED},
+              # temperature travels in extra_body, not as a kwarg. The anthropic SDK
+              # removed the typed sampling params (temperature/top_p/top_k) when
+              # current Claude models stopped accepting them, so passing one is now
+              # a TypeError raised before any request leaves the process:
+              #   Messages.create() got an unexpected keyword argument 'temperature'
+              # The target here is Unsloth's own Anthropic-compatible endpoint, where
+              # the field is still meaningful on the wire, so it is sent as an extra
+              # body key exactly as `seed` already is.
+              extra_body  = {"seed": SEED, "temperature": 0.0},
               messages    = [{
                   "role": "user",
                   "content": [

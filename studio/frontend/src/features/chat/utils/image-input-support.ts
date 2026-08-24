@@ -4,7 +4,11 @@
 import type { ChatModelSummary } from "../types/runtime";
 
 import type { MmprojFallbackReason } from "../types/api";
-import { isTextOnlyMmprojFallback } from "./mmproj-fallback";
+// Explicit .ts, as clipboard-payload.ts and parse-assistant-content.ts already are
+// in this directory: Vite resolves an extensionless specifier, but the test runner
+// (node --experimental-strip-types --test) is native ESM and does not, so a test
+// that reaches this module at runtime dies with ERR_MODULE_NOT_FOUND.
+import { isTextOnlyMmprojFallback } from "./mmproj-fallback.ts";
 
 function textOnlyMmprojUnavailableReason(
   activeModel: ChatModelSummary | undefined,

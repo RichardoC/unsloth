@@ -1238,8 +1238,10 @@ jobs:
               a_msg = anthropic.messages.create(
                   model       = "default",
                   max_tokens  = 80,
-                  temperature = TEMP,
-                  extra_body  = {"seed": SEED},
+                  # temperature travels in extra_body, not as a kwarg -- the anthropic
+                  # SDK dropped the typed sampling params. See the longer note in
+                  # studio-inference-smoke.yml.
+                  extra_body  = {"seed": SEED, "temperature": TEMP},
                   messages    = [{
                       "role": "user",
                       "content": [
