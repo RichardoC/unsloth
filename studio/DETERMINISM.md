@@ -20,7 +20,7 @@ release" at install time.
 
 | Component | Pinned to | Where |
 | --- | --- | --- |
-| `unsloth` backend | the exact version the desktop build was released with | stamped by `release-desktop.yml` into `UNSLOTH_DESKTOP_BACKEND_VERSION`, read via `option_env!` in `src-tauri/src/install.rs` and `update.rs`, applied by `install.sh` and `install_python_stack.py` |
+| `unsloth` backend | the exact version the desktop build was released with; on macOS, the exact *commit*, because the bundle ships a wheel built from it (see below) | stamped by `release-desktop.yml` into `UNSLOTH_DESKTOP_BACKEND_VERSION`, read via `option_env!` in `src-tauri/src/install.rs` and `update.rs`, applied by `install.sh` and `install_python_stack.py` |
 | llama.cpp | `b10472-mix-4b653db` | `prebuilt_release_pins.json` |
 | whisper.cpp | `v1.9.2-unsloth.11` | `prebuilt_release_pins.json` |
 | stable-diffusion.cpp | `master-813-bfbef5b-u13b9d92` | `install_sd_cpp_prebuilt.py` (`DEFAULT_TAG`) |
@@ -293,6 +293,38 @@ on a malformed or floor-violating version pin, on an MLX window that excludes th
 it was resolved against or admits the next minor, and — driving `install_python_stack()`
 and `_ensure_rocm_torch()` — on argv that reaches pip without the pinned values.
 The bump table above is only bookkeeping; those tests are what actually fails.
+
+## The macOS bundle ships this tag's backend, and says so
+
+The macOS app is self-contained: `Unsloth.app/Contents/Resources/runtime` holds CPython,
+the whole Python stack installed from `darwin-arm64-bundle.lock.txt` under
+`--require-hashes`, llama.cpp, whisper.cpp, stable-diffusion.cpp, Node and the OXC
+`node_modules`. Nothing is resolved on the user's machine at first run, so the version
+question moves entirely to build time.
+
+`unsloth` itself is the one deliberate exception to the lock: `scripts/build_macos_runtime.sh`
+builds a wheel from the checkout and removes the lock-installed copy through its own
+`RECORD` first, so the local wheel replaces it rather than landing beside it — the two
+version strings are usually identical, which is exactly when "landed beside" is invisible.
+The manifest records that honestly in `local_provenance` (`index_verified: false`, the
+commit, and whether the worktree was dirty) rather than letting `locks` imply the whole
+payload came hash-verified off an index.
+
+That makes the backend something the *build* decides, and `pypi_version` — which the app
+reads as its own backend version — only ever stamped an env var. The release leg now
+asserts the two agree before anything is signed: the payload's recorded commit must equal
+the tag being built (`git rev-parse HEAD`, not `GITHUB_SHA`, which is the dispatch ref),
+the worktree must have been clean, and a dispatched `pypi_version` must equal the version
+the payload actually ships. A blank `pypi_version` resolves to
+`MIN_DESKTOP_BACKEND_VERSION`, which is a floor rather than a claim, so a newer payload
+passes and the divergence is printed; an older one fails, because the app would reject its
+own bundled backend. Without these, a mismatched dispatch could ship a signed, notarized
+app reporting a backend version it does not contain and cannot install — the bundled path
+has no venv to upgrade.
+
+`tests/security/test_release_desktop_macos_runtime.py` runs that step against a stubbed
+builder and a real one-commit repo, so each rejection is exercised rather than asserted
+about.
 
 ## On the build itself
 

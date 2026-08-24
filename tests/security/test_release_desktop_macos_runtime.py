@@ -193,6 +193,222 @@ def test_an_incomplete_payload_never_reaches_a_signature():
     )
 
 
+# ────────────────── the payload's backend is the tag's, and the stamp agrees
+#
+# The macOS payload builds `unsloth` from the checkout rather than installing the
+# published wheel, which moved the backend from something a user's machine
+# resolved to something the release decided. `pypi_version` is what the app is
+# told its backend is (UNSLOTH_DESKTOP_BACKEND_VERSION, compiled in), and it only
+# ever stamped that env var -- it never influenced the payload. So the two could
+# disagree, in a signed and notarized app, with no venv to upgrade out of it.
+#
+# These run the real step against a stubbed builder and a real git repo, so the
+# commit comparison is exercised rather than asserted about.
+
+def _payload_entry(commit: str, **overrides) -> dict:
+    entry = {
+        "name": "unsloth",
+        "version": "2026.8.18",
+        "provenance": "local-checkout",
+        "index_verified": False,
+        "wheel": "unsloth-2026.8.18-py3-none-any.whl",
+        "wheel_sha256": "a" * 64,
+        "wheel_tag": "py3-none-any",
+        "repo_commit": commit,
+        "worktree_dirty": False,
+        "replaced_index_version": "2026.8.18",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _payload_manifest(entry: dict | None, *, wheel_commit: str, incomplete = ()) -> dict:
+    return {
+        "incomplete": list(incomplete),
+        "python": {"version": "3.13.14"},
+        "distribution_count": 262,
+        "total_bytes": 2_600_000_000,
+        "components": {"unsloth_local_wheel": {"repo_commit": wheel_commit}},
+        "local_provenance": {
+            "index_verified": False,
+            "distributions": ([entry] if entry else []),
+        },
+    }
+
+
+def _run_assemble_checks(
+    tmp_path: Path,
+    *,
+    manifest_for = None,
+    typed = "2026.8.18",
+    resolved = "2026.8.4",
+):
+    """Run the assemble step with a stubbed builder and a one-commit git repo.
+
+    The stub stands in for scripts/build_macos_runtime.sh, whose real output is a
+    2.6 GiB download; what is under test is what the step does with the manifest
+    that lands beside it. `git rev-parse HEAD` is the real command against a real
+    repo, so "the payload was built from the commit being released" is compared
+    the same way the release compares it.
+    """
+    work = tmp_path / "work"
+    (work / "scripts").mkdir(parents = True)
+    git_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+    (work / "seed").write_text("x", encoding = "utf-8")
+    for argv in (["init", "-q"], ["add", "seed"], ["commit", "-qm", "seed"]):
+        subprocess.run(["git", *argv], cwd = work, env = git_env, check = True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd = work, env = git_env,
+        text = True, capture_output = True, check = True,
+    ).stdout.strip()
+
+    manifest_for = manifest_for or (
+        lambda sha: _payload_manifest(_payload_entry(sha), wheel_commit = sha)
+    )
+    runner_temp = tmp_path / "runner-temp"
+    (runner_temp / "runtime").mkdir(parents = True)
+    (runner_temp / "runtime" / "BUNDLE_MANIFEST.json").write_text(
+        json.dumps(manifest_for(commit)), encoding = "utf-8"
+    )
+    (work / "scripts" / "build_macos_runtime.sh").write_text(
+        "#!/usr/bin/env bash\nexit 0\n", encoding = "utf-8"
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", _step(ASSEMBLE_STEP)["run"]],
+        cwd = work,
+        env = {
+            **git_env,
+            "RUNNER_TEMP": str(runner_temp),
+            "UV": "/nonexistent/uv",
+            "INPUT_PYPI_VERSION": typed,
+            "RESOLVED_PYPI_VERSION": resolved,
+        },
+        text = True,
+        capture_output = True,
+        check = False,
+    )
+    return result, commit
+
+
+def test_the_tag_commit_comes_from_the_checkout_and_not_the_dispatch_ref():
+    """GITHUB_SHA is the dispatch ref's commit; the build checks out the tag.
+
+    Comparing against GITHUB_SHA would pass while the payload was built from
+    whatever main happened to be, which is the exact thing being ruled out.
+    """
+    run = _step(ASSEMBLE_STEP)["run"]
+    assert 'TAG_COMMIT="$(git rev-parse HEAD)"' in run
+    # Code only: the step names GITHUB_SHA in a comment saying why it is wrong here.
+    code = [
+        line for line in run.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not [line for line in code if "GITHUB_SHA" in line], code
+
+
+def test_a_payload_built_from_the_released_tag_passes(tmp_path):
+    result, commit = _run_assemble_checks(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert f"unsloth 2026.8.18 built from {commit[:12]}" in result.stdout
+
+
+def test_a_payload_built_from_another_commit_stops_the_release(tmp_path):
+    result, _ = _run_assemble_checks(
+        tmp_path,
+        manifest_for = lambda sha: _payload_manifest(
+            _payload_entry("b" * 40), wheel_commit = "b" * 40
+        ),
+    )
+    assert result.returncode != 0
+    assert "not the tag being released" in result.stderr
+
+
+def test_a_dirty_worktree_stops_the_release(tmp_path):
+    """The recorded commit stops describing what shipped, so the release is
+    unreproducible by construction -- fine for a dev build, never for a signed one."""
+    result, _ = _run_assemble_checks(
+        tmp_path,
+        manifest_for = lambda sha: _payload_manifest(
+            _payload_entry(sha, worktree_dirty = True), wheel_commit = sha
+        ),
+    )
+    assert result.returncode != 0
+    assert "dirty worktree" in result.stderr
+
+
+def test_a_stamp_the_bundle_does_not_contain_stops_the_release(tmp_path):
+    """The gap this closes: pypi_version stamped the binary and never decided the
+    payload, so a mismatched dispatch shipped an app that reports a backend
+    version it does not hold -- and cannot install, because it has no venv."""
+    result, _ = _run_assemble_checks(tmp_path, typed = "2026.9.0")
+    assert result.returncode != 0
+    assert "2026.9.0" in result.stderr and "2026.8.18" in result.stderr
+    assert "does not contain" in result.stderr
+
+
+def test_a_published_wheel_in_the_payload_stops_the_release(tmp_path):
+    result, _ = _run_assemble_checks(
+        tmp_path,
+        manifest_for = lambda sha: _payload_manifest(None, wheel_commit = sha),
+    )
+    assert result.returncode != 0
+    assert "records no locally built unsloth" in result.stderr
+
+
+def test_a_payload_resolved_from_an_index_stops_the_release(tmp_path):
+    result, _ = _run_assemble_checks(
+        tmp_path,
+        manifest_for = lambda sha: _payload_manifest(
+            _payload_entry(sha, provenance = "index", index_verified = True),
+            wheel_commit = sha,
+        ),
+    )
+    assert result.returncode != 0
+    assert "not built from the checkout" in result.stderr
+
+
+def test_the_two_manifest_records_of_the_local_wheel_must_agree(tmp_path):
+    result, _ = _run_assemble_checks(
+        tmp_path,
+        manifest_for = lambda sha: _payload_manifest(
+            _payload_entry(sha), wheel_commit = "c" * 40
+        ),
+    )
+    assert result.returncode != 0
+    assert "disagree" in result.stderr
+
+
+def test_a_blank_pypi_version_treats_the_minimum_as_a_floor(tmp_path):
+    """Blank resolves to MIN_DESKTOP_BACKEND_VERSION, which is a floor rather than
+    a claim about what ships, so a newer payload passes -- and says so."""
+    result, _ = _run_assemble_checks(tmp_path, typed = "", resolved = "2026.8.4")
+    assert result.returncode == 0, result.stderr
+    assert "pypi_version was blank" in result.stdout
+
+
+def test_a_blank_pypi_version_still_rejects_a_backend_below_the_floor(tmp_path):
+    """A payload under the compiled-in minimum is a backend the app itself rejects."""
+    result, _ = _run_assemble_checks(tmp_path, typed = "", resolved = "2026.9.1")
+    assert result.returncode != 0
+    assert "below the desktop minimum" in result.stderr
+
+
+def test_the_floor_comparison_fails_closed_on_a_version_it_cannot_parse(tmp_path):
+    result, _ = _run_assemble_checks(tmp_path, typed = "", resolved = "not-a-version")
+    assert result.returncode != 0
+    assert "cannot compare" in result.stderr
+
+
 def test_the_notarization_step_keeps_its_contract():
     """It is the release's only notarization, and it must still read tauri's path.
 

@@ -1272,11 +1272,27 @@ jobs:
         shell: bash
         env:
           UV: ${{ steps.uv.outputs.bin }}
+          # What the dispatcher typed, and what prepare-version resolved it to.
+          # These are two different claims and the assertions below tell them
+          # apart: a value that was typed names the backend that was published,
+          # and the payload must BE it; a blank one resolved to
+          # MIN_DESKTOP_BACKEND_VERSION, which is a floor and not a claim about
+          # what ships.
+          INPUT_PYPI_VERSION: ${{ inputs.pypi_version }}
+          RESOLVED_PYPI_VERSION: ${{ needs.prepare-version.outputs.pypi_version }}
         run: |
           set -euo pipefail
           bash scripts/build_macos_runtime.sh --out "$RUNNER_TEMP/runtime"
+          # HEAD is the release tag: the checkout above pins `ref:` to it precisely
+          # so this is a property of the tag rather than of the dispatch ref.
+          # GITHUB_SHA is the dispatch ref's commit and would pass this check
+          # against the wrong source, which is why it is not used here.
+          TAG_COMMIT="$(git rev-parse HEAD)"
+          export TAG_COMMIT
           python3 - "$RUNNER_TEMP/runtime/BUNDLE_MANIFEST.json" <<'PY'
           import json
+          import os
+          import re
           import sys
 
           manifest = json.load(open(sys.argv[1]))
@@ -1285,10 +1301,112 @@ jobs:
           # one fails here rather than reaching a signature.
           if manifest["incomplete"]:
               sys.exit(f'the assembled payload is incomplete: {manifest["incomplete"]}')
+
+          # ── the payload's backend is this tag's code, and the release says so ──
+          #
+          # The macOS payload no longer installs `unsloth` from PyPI at first run:
+          # scripts/build_macos_runtime.sh builds a wheel from the checkout and
+          # replaces the lock-installed copy with it. That moved the backend from
+          # something a user's machine resolved to something this build decided, and
+          # nothing in this workflow checked what it decided.
+          #
+          # The gap that leaves is not theoretical. `pypi_version` is compiled into
+          # the binary as UNSLOTH_DESKTOP_BACKEND_VERSION and is what the app
+          # believes its backend to be, but it only ever stamped that env var -- it
+          # never influenced the payload. So a release dispatched with a
+          # `pypi_version` the tag's unsloth/_version.py does not match would ship a
+          # bundle holding one version while telling the app it holds another, and
+          # the bundled path cannot install its way out of that (there is no venv to
+          # upgrade: the payload IS the backend). It would reach a user as a signed,
+          # notarized app that reports it needs a backend it cannot obtain.
+          local = manifest["local_provenance"]
+          entry = next(
+              (item for item in local["distributions"] if item["name"] == "unsloth"),
+              None,
+          )
+          if entry is None:
+              sys.exit(
+                  "the payload records no locally built unsloth. The macOS bundle must "
+                  "ship this tag's backend, not the published wheel -- a payload built "
+                  "from an index is a payload nobody's release was tested in."
+              )
+          if entry["provenance"] != "local-checkout" or entry["index_verified"]:
+              sys.exit(f"unsloth was not built from the checkout: {entry}")
+
+          tag_commit = os.environ["TAG_COMMIT"]
+          if entry["repo_commit"] != tag_commit:
+              sys.exit(
+                  f"the payload unsloth was built from {entry['repo_commit']!r}, but this "
+                  f"release is building {tag_commit!r}. The bundle would ship code that is "
+                  f"not the tag being released."
+              )
+          wheel_commit = manifest["components"]["unsloth_local_wheel"]["repo_commit"]
+          if wheel_commit != tag_commit:
+              sys.exit(
+                  f"the manifest's two records of the local wheel disagree: components says "
+                  f"{wheel_commit!r}, local_provenance says {tag_commit!r}"
+              )
+
+          # A dirty worktree means the wheel holds edits that exist on no commit, so
+          # the recorded commit describes something other than what shipped and the
+          # release is unreproducible by construction. Fine for a dev build, never
+          # for a signed one.
+          if entry["worktree_dirty"]:
+              sys.exit(
+                  "the payload was built from a dirty worktree, so its recorded commit "
+                  "does not describe what it contains. A release must ship committed code."
+              )
+
+          payload_version = entry["version"]
+          typed = os.environ.get("INPUT_PYPI_VERSION", "").strip()
+          resolved = os.environ["RESOLVED_PYPI_VERSION"].strip()
+          if typed:
+              # The dispatcher named the exact backend version they published. The
+              # payload has to be that version, or the app's stamp is a lie about
+              # its own contents.
+              if payload_version != typed:
+                  sys.exit(
+                      f"pypi_version was dispatched as {typed!r}, but the payload ships "
+                      f"unsloth {payload_version!r} (from unsloth/_version.py at "
+                      f"{tag_commit[:12]}). The app would be stamped with a backend "
+                      f"version the bundle does not contain. Release the tag whose "
+                      f"_version.py is {typed}, or dispatch {payload_version} instead."
+                  )
+          else:
+              # Blank resolved to MIN_DESKTOP_BACKEND_VERSION, which is a floor: a
+              # payload at or above it is fine, one below it is a backend the app
+              # itself would reject as too old.
+              def release_tuple(text):
+                  match = re.match(r"(\d+)\.(\d+)\.(\d+)", text)
+                  return tuple(int(part) for part in match.groups()) if match else None
+
+              payload_key, floor_key = release_tuple(payload_version), release_tuple(resolved)
+              if payload_key is None or floor_key is None:
+                  sys.exit(
+                      f"cannot compare payload unsloth {payload_version!r} against the "
+                      f"desktop minimum {resolved!r}"
+                  )
+              if payload_key < floor_key:
+                  sys.exit(
+                      f"the payload ships unsloth {payload_version}, below the desktop "
+                      f"minimum {resolved} compiled into the app. The app would refuse "
+                      f"its own bundled backend."
+                  )
+              # Not an error, but the divergence is worth saying out loud: the stamp
+              # is the floor rather than the shipped version, because pypi_version
+              # was left blank.
+              if payload_version != resolved:
+                  print(
+                      f"note: pypi_version was blank, so the app is stamped with the "
+                      f"minimum {resolved} while the bundle ships {payload_version}"
+                  )
+
           print(
               f'payload ok: python {manifest["python"]["version"]}, '
               f'{manifest["distribution_count"]} distributions, '
-              f'{manifest["total_bytes"] / (1024 ** 3):.2f} GiB'
+              f'{manifest["total_bytes"] / (1024 ** 3):.2f} GiB, '
+              f'unsloth {payload_version} built from {tag_commit[:12]} '
+              f'(index copy {entry["replaced_index_version"]} replaced)'
           )
           PY
 
